@@ -103,6 +103,7 @@ LATE_STAGE_TIMING_LABELS = {
     "score": "Score",
     "validation": "Validation",
     "symbolic_guardrail": "Symbolic guardrail",
+    "structural_false_positive": "Structural sanity",
     "salvage": "Salvage",
     "adversarial": "Adversarial",
     "invariance": "Invariance",
@@ -7125,6 +7126,46 @@ def _evaluate_usefulness_proof_gate(
     }
 
 
+def _evaluate_structural_false_positive_gate(
+    connection: dict | None,
+    usefulness_proof: dict | None = None,
+) -> dict:
+    """Catch a small set of repeated structural false-positive shapes."""
+    payload = connection if isinstance(connection, dict) else {}
+    edge_analysis = normalize_edge_analysis(payload)
+    cheap_test = (
+        edge_analysis.get("cheap_test")
+        if isinstance(edge_analysis.get("cheap_test"), dict)
+        else {}
+    )
+
+    reasons: list[str] = []
+    reason_codes: list[str] = []
+
+    def add_reason(code: str, reason: str) -> None:
+        if code not in reason_codes:
+            reason_codes.append(code)
+        if reason not in reasons:
+            reasons.append(reason)
+
+    cheap_confirm = _usefulness_first_present(cheap_test.get("confirm"))
+    cheap_falsify = _usefulness_first_present(cheap_test.get("falsify"))
+    cheap_confirm_key = (_clean_inline_text(cheap_confirm) or "").lower()
+    cheap_falsify_key = (_clean_inline_text(cheap_falsify) or "").lower()
+
+    if cheap_confirm_key and cheap_falsify_key and cheap_confirm_key == cheap_falsify_key:
+        add_reason(
+            "cheap_test_same_outcome",
+            "cheap_test confirm/falsify collapses into the same practical outcome",
+        )
+
+    return {
+        "passes": not reason_codes,
+        "reasons": reasons,
+        "reason_codes": reason_codes,
+    }
+
+
 def _plan_phase6_salvage(
     *,
     total_score: float,
@@ -7545,6 +7586,9 @@ def _evaluate_connection_candidate(
     prediction_quality_ok = True
     symbolic_guardrail_ok = True
     symbolic_guardrail_result = None
+    structural_false_positive_ok = True
+    structural_false_positive_reasons: list[str] = []
+    structural_false_positive_reason_codes: list[str] = []
     adversarial_ok = True
     adversarial_rubric = None
     invariance_ok = True
@@ -7849,6 +7893,38 @@ def _evaluate_connection_candidate(
         and evidence_credibility_ok
         and symbolic_guardrail_ok
     ):
+        structural_started = time.monotonic()
+        structural_false_positive = _evaluate_structural_false_positive_gate(
+            connection,
+            usefulness_proof=usefulness_proof,
+        )
+        _record_late_stage_timing(
+            late_stage_timing,
+            "structural_false_positive",
+            structural_started,
+        )
+        structural_false_positive_ok = bool(structural_false_positive.get("passes"))
+        structural_false_positive_reasons = list(
+            structural_false_positive.get("reasons") or []
+        )
+        structural_false_positive_reason_codes = list(
+            structural_false_positive.get("reason_codes") or []
+        )
+        if validation_log is not None:
+            validation_log["structural_false_positive"] = structural_false_positive
+        if not structural_false_positive_ok:
+            print("  [Structural] Killed hypothesis - skipping transmission")
+            for reason in structural_false_positive_reasons:
+                print(f"  [Structural] - {reason}")
+
+    if (
+        passes_threshold
+        and validation_ok
+        and usefulness_ok
+        and evidence_credibility_ok
+        and symbolic_guardrail_ok
+        and structural_false_positive_ok
+    ):
         adversarial_started = time.monotonic()
         adversarial_ok, adversarial_rubric = run_adversarial_rubric(
             connection,
@@ -7869,6 +7945,7 @@ def _evaluate_connection_candidate(
         and usefulness_ok
         and evidence_credibility_ok
         and symbolic_guardrail_ok
+        and structural_false_positive_ok
         and adversarial_ok
     ):
         invariance_started = time.monotonic()
@@ -7892,6 +7969,7 @@ def _evaluate_connection_candidate(
         and usefulness_ok
         and evidence_credibility_ok
         and symbolic_guardrail_ok
+        and structural_false_positive_ok
         and adversarial_ok
         and invariance_ok
     ):
@@ -7916,6 +7994,7 @@ def _evaluate_connection_candidate(
         and usefulness_ok
         and evidence_credibility_ok
         and symbolic_guardrail_ok
+        and structural_false_positive_ok
         and adversarial_ok
         and invariance_ok
         and not boring
@@ -8012,6 +8091,7 @@ def _evaluate_connection_candidate(
         and usefulness_ok
         and evidence_credibility_ok
         and symbolic_guardrail_ok
+        and structural_false_positive_ok
         and adversarial_ok
         and invariance_ok
         and not boring
@@ -8057,6 +8137,12 @@ def _evaluate_connection_candidate(
             or "deterministic quantitative constraint failed"
         )
         stage_failures.append(f"symbolic_guardrail:{symbolic_failure}")
+    if not structural_false_positive_ok:
+        stage_failures.extend(
+            f"structural_false_positive:{code}"
+            for code in structural_false_positive_reason_codes
+            if code
+        )
     if not adversarial_ok:
         for reason in (adversarial_rubric or {}).get("kill_reasons", []):
             stage_failures.append(f"adversarial:{reason}")
@@ -8117,12 +8203,16 @@ def _evaluate_connection_candidate(
         "prediction_quality": prediction_quality,
         "prediction_quality_score": prediction_quality.get("score"),
         "claim_provenance": claim_provenance,
+        "mechanism_typing": mechanism_typing,
         "usefulness_ok": usefulness_ok,
         "usefulness_proof": usefulness_proof,
         "evidence_credibility_ok": evidence_credibility_ok,
         "evidence_credibility": evidence_credibility,
         "symbolic_guardrail_ok": symbolic_guardrail_ok,
         "symbolic_guardrail_result": symbolic_guardrail_result,
+        "structural_false_positive_ok": structural_false_positive_ok,
+        "structural_false_positive_reasons": structural_false_positive_reasons,
+        "structural_false_positive_reason_codes": structural_false_positive_reason_codes,
         "adversarial_ok": adversarial_ok,
         "adversarial_rubric": adversarial_rubric,
         "invariance_ok": invariance_ok,

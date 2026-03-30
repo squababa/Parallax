@@ -1941,6 +1941,9 @@ def test_evaluate_connection_candidate_prefers_connection_source_display_fields_
     )
 
     assert candidate["should_transmit"] is False
+    assert candidate["structural_false_positive_ok"] is True
+    assert candidate["structural_false_positive_reasons"] == []
+    assert candidate["structural_false_positive_reason_codes"] == []
     assert captured["seed_url"] == "https://source.test/perceptual-audio-coding"
     assert (
         captured["seed_excerpt"]

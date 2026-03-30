@@ -100,6 +100,19 @@ def test_symbolic_guardrail_failure_reaches_strong_rejection_scar_queue(
     monkeypatch.setattr(main, "validate_hypothesis", lambda _connection: (True, []))
     monkeypatch.setattr(
         main,
+        "summarize_evidence_map_provenance",
+        lambda connection: {
+            "passes": True,
+            "issues": [],
+            "evidence_map": connection.get("evidence_map"),
+            "supported_critical_mapping_count": 3,
+            "critical_mapping_count": 3,
+            "supported_mechanism_assertion_count": 1,
+            "required_mechanism_assertion_count": 1,
+        },
+    )
+    monkeypatch.setattr(
+        main,
         "_evaluate_usefulness_proof_gate",
         lambda **_kwargs: {"passes": True, "reasons": []},
     )

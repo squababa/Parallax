@@ -989,6 +989,289 @@ def test_evaluate_connection_candidate_keeps_strict_validation_after_salvage(
     assert candidate["validation_reasons"] == ["edge_analysis edge_if_right is too generic"]
 
 
+def test_evaluate_connection_candidate_blocks_same_outcome_cheap_test_before_adversarial(
+    monkeypatch,
+) -> None:
+    payload = _build_edge_first_payload()
+    payload["edge_analysis"]["cheap_test"]["confirm"] = (
+        "collision rate remains unchanged across the replay"
+    )
+    payload["edge_analysis"]["cheap_test"]["falsify"] = (
+        "collision rate remains unchanged across the replay"
+    )
+
+    adversarial_calls = {"count": 0}
+
+    monkeypatch.setattr(
+        main,
+        "score_connection",
+        lambda *_args, **_kwargs: {
+            "total": 0.931,
+            "depth": 0.84,
+            "distance": 0.81,
+            "novelty": 0.62,
+            "prediction_quality": {"passes": True, "score": 1.0},
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "summarize_evidence_map_provenance",
+        lambda connection: {
+            "passes": True,
+            "issues": [],
+            "evidence_map": connection.get("evidence_map"),
+            "supported_critical_mapping_count": 3,
+            "critical_mapping_count": 3,
+            "supported_mechanism_assertion_count": 1,
+            "required_mechanism_assertion_count": 1,
+            "core_target_evidence_strength": "strong_direct",
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "_extract_seed_provenance",
+        lambda _patterns: ("https://example.com/seed", "seed excerpt"),
+    )
+    monkeypatch.setattr(
+        main,
+        "_evaluate_transmit_evidence_gate",
+        lambda **_kwargs: {"passes": True, "reasons": []},
+    )
+    monkeypatch.setattr(
+        main,
+        "run_symbolic_guardrail",
+        lambda _connection: (
+            True,
+            {
+                "status": "skipped",
+                "failed_constraint": None,
+                "explanation": None,
+                "executed_checks": [],
+            },
+        ),
+    )
+
+    def fake_adversarial(*_args, **_kwargs):
+        adversarial_calls["count"] += 1
+        return True, {"kill_reasons": []}
+
+    monkeypatch.setattr(main, "run_adversarial_rubric", fake_adversarial)
+    monkeypatch.setattr(
+        main,
+        "run_invariance_check",
+        lambda *_args, **_kwargs: (True, {"invariance_score": 1.0}),
+    )
+    monkeypatch.setattr(
+        main,
+        "rewrite_transmission",
+        lambda **kwargs: {"boring": False, "rewritten": kwargs["raw_description"]},
+    )
+
+    candidate = main._evaluate_connection_candidate(
+        score_label="Structural Same Outcome",
+        source_domain="Juggling",
+        target_domain="Time-triggered scheduling",
+        patterns_payload=[],
+        connection=payload,
+        threshold=0.64,
+        dedup_enabled=False,
+    )
+
+    assert candidate["structural_false_positive_ok"] is False
+    assert candidate["structural_false_positive_reason_codes"] == [
+        "cheap_test_same_outcome"
+    ]
+    assert candidate["stage_failures"] == [
+        "structural_false_positive:cheap_test_same_outcome"
+    ]
+    assert adversarial_calls["count"] == 0
+
+
+def test_evaluate_connection_candidate_keeps_negated_outcome_pair_for_adversarial(
+    monkeypatch,
+) -> None:
+    payload = _build_edge_first_payload()
+    payload["edge_analysis"]["cheap_test"]["confirm"] = (
+        "lower collision rate is observed in the replay"
+    )
+    payload["edge_analysis"]["cheap_test"]["falsify"] = (
+        "lower collision rate is not observed in the replay"
+    )
+
+    adversarial_calls = {"count": 0}
+
+    monkeypatch.setattr(
+        main,
+        "score_connection",
+        lambda *_args, **_kwargs: {
+            "total": 0.931,
+            "depth": 0.84,
+            "distance": 0.81,
+            "novelty": 0.62,
+            "prediction_quality": {"passes": True, "score": 1.0},
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "summarize_evidence_map_provenance",
+        lambda connection: {
+            "passes": True,
+            "issues": [],
+            "evidence_map": connection.get("evidence_map"),
+            "supported_critical_mapping_count": 3,
+            "critical_mapping_count": 3,
+            "supported_mechanism_assertion_count": 1,
+            "required_mechanism_assertion_count": 1,
+            "core_target_evidence_strength": "strong_direct",
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "_extract_seed_provenance",
+        lambda _patterns: ("https://example.com/seed", "seed excerpt"),
+    )
+    monkeypatch.setattr(
+        main,
+        "_evaluate_transmit_evidence_gate",
+        lambda **_kwargs: {"passes": True, "reasons": []},
+    )
+    monkeypatch.setattr(
+        main,
+        "run_symbolic_guardrail",
+        lambda _connection: (
+            True,
+            {
+                "status": "skipped",
+                "failed_constraint": None,
+                "explanation": None,
+                "executed_checks": [],
+            },
+        ),
+    )
+
+    def fake_adversarial(*_args, **_kwargs):
+        adversarial_calls["count"] += 1
+        return True, {"kill_reasons": []}
+
+    monkeypatch.setattr(main, "run_adversarial_rubric", fake_adversarial)
+    monkeypatch.setattr(
+        main,
+        "run_invariance_check",
+        lambda *_args, **_kwargs: (True, {"invariance_score": 1.0}),
+    )
+    monkeypatch.setattr(
+        main,
+        "rewrite_transmission",
+        lambda **kwargs: {"boring": False, "rewritten": kwargs["raw_description"]},
+    )
+
+    candidate = main._evaluate_connection_candidate(
+        score_label="Structural Negated Outcome Pair",
+        source_domain="Juggling",
+        target_domain="Time-triggered scheduling",
+        patterns_payload=[],
+        connection=payload,
+        threshold=0.64,
+        dedup_enabled=False,
+    )
+
+    assert candidate["structural_false_positive_ok"] is True
+    assert candidate["structural_false_positive_reasons"] == []
+    assert candidate["structural_false_positive_reason_codes"] == []
+    assert candidate["adversarial_ok"] is True
+    assert candidate["should_transmit"] is True
+    assert adversarial_calls["count"] == 1
+
+
+def test_evaluate_connection_candidate_keeps_clean_edge_payload_for_adversarial(
+    monkeypatch,
+) -> None:
+    payload = _build_edge_first_payload()
+    adversarial_calls = {"count": 0}
+
+    monkeypatch.setattr(
+        main,
+        "score_connection",
+        lambda *_args, **_kwargs: {
+            "total": 0.931,
+            "depth": 0.84,
+            "distance": 0.81,
+            "novelty": 0.62,
+            "prediction_quality": {"passes": True, "score": 1.0},
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "summarize_evidence_map_provenance",
+        lambda connection: {
+            "passes": True,
+            "issues": [],
+            "evidence_map": connection.get("evidence_map"),
+            "supported_critical_mapping_count": 3,
+            "critical_mapping_count": 3,
+            "supported_mechanism_assertion_count": 1,
+            "required_mechanism_assertion_count": 1,
+            "core_target_evidence_strength": "strong_direct",
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "_extract_seed_provenance",
+        lambda _patterns: ("https://example.com/seed", "seed excerpt"),
+    )
+    monkeypatch.setattr(
+        main,
+        "_evaluate_transmit_evidence_gate",
+        lambda **_kwargs: {"passes": True, "reasons": []},
+    )
+    monkeypatch.setattr(
+        main,
+        "run_symbolic_guardrail",
+        lambda _connection: (
+            True,
+            {
+                "status": "skipped",
+                "failed_constraint": None,
+                "explanation": None,
+                "executed_checks": [],
+            },
+        ),
+    )
+
+    def fake_adversarial(*_args, **_kwargs):
+        adversarial_calls["count"] += 1
+        return True, {"kill_reasons": []}
+
+    monkeypatch.setattr(main, "run_adversarial_rubric", fake_adversarial)
+    monkeypatch.setattr(
+        main,
+        "run_invariance_check",
+        lambda *_args, **_kwargs: (True, {"invariance_score": 1.0}),
+    )
+    monkeypatch.setattr(
+        main,
+        "rewrite_transmission",
+        lambda **kwargs: {"boring": False, "rewritten": kwargs["raw_description"]},
+    )
+
+    candidate = main._evaluate_connection_candidate(
+        score_label="Structural Clean Candidate",
+        source_domain="Juggling",
+        target_domain="Time-triggered scheduling",
+        patterns_payload=[],
+        connection=payload,
+        threshold=0.64,
+        dedup_enabled=False,
+    )
+
+    assert candidate["structural_false_positive_ok"] is True
+    assert candidate["structural_false_positive_reasons"] == []
+    assert candidate["structural_false_positive_reason_codes"] == []
+    assert candidate["adversarial_ok"] is True
+    assert candidate["should_transmit"] is True
+    assert adversarial_calls["count"] == 1
+
+
 def test_should_launch_hop2_rejects_distance_or_score_gate_failures() -> None:
     assert (
         main._should_launch_hop2(
