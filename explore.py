@@ -12,6 +12,9 @@ from store import increment_tavily_calls, increment_llm_calls
 
 _tavily = TavilyClient(api_key=TAVILY_API_KEY)
 EXPLORE_MODEL = MODEL
+SEED_SEARCH_QUERY_LIMIT = 3
+SEED_SEARCH_MAX_RESULTS = 4
+SEED_SEARCH_ADVANCED_QUERY_COUNT = 1
 EXTRACT_PROMPT = """You are a pattern extraction engine. Your job is to extract up to 5 transferable, mechanism-level patterns from a domain.
 Domain: {domain}
 
@@ -601,13 +604,20 @@ def _search_seed(seed: dict) -> tuple[str, dict]:
     """Run Tavily searches for the seed domain and return combined content + provenance."""
     combined = []
     provenance = {"seed_url": None, "seed_excerpt": None}
-    for query in seed["seed_queries"][:2]:  # Max 2 searches per seed
+    for index, query in enumerate(seed.get("seed_queries", [])[:SEED_SEARCH_QUERY_LIMIT]):
+        query = " ".join(str(query or "").split()).strip()
+        if not query:
+            continue
         try:
             results = _tavily.search(
                 query=query,
-                max_results=3,
+                max_results=SEED_SEARCH_MAX_RESULTS,
                 include_answer=False,
-                search_depth="basic",
+                search_depth=(
+                    "advanced"
+                    if index < SEED_SEARCH_ADVANCED_QUERY_COUNT
+                    else "basic"
+                ),
             )
             increment_tavily_calls(1)
             for result in results.get("results", []):

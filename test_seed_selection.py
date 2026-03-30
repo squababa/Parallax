@@ -54,7 +54,7 @@ def test_expected_value_multiplier_downweights_confirmed_zero_ev_seed() -> None:
         metrics,
     )
 
-    assert multiplier == pytest.approx(0.8358640311688311)
+    assert multiplier == pytest.approx(0.8905760207792207)
     assert multiplier < 1.0
     assert "low EV" in reason
 
@@ -213,8 +213,132 @@ def test_pick_seed_returns_quality_diagnostics(monkeypatch) -> None:
     assert "selection_diagnostics" in selected
     assert selected["selection_diagnostics"]["mode"] == "weighted"
     assert "quality-screened pool" in selected["selection_reason"]
+    assert "retained 1 diversity-supported weak seeds" in selected["selection_reason"]
     assert "seed quality high" in selected["selection_reason"]
-    assert len(captured["weights"]) == 12
+    assert selected["selection_diagnostics"]["weak_seed_add_back_count"] == 1
+    assert selected["selection_diagnostics"]["candidate_pool_size"] == 13
+    assert len(captured["weights"]) == 13
+
+
+def test_pick_seed_retains_diversity_supported_weak_add_backs(monkeypatch) -> None:
+    strong_domains = [
+        {
+            "name": f"Strong Seed {index}",
+            "category": "Technology",
+            "seed_queries": [
+                f"queue routing latency control {index}",
+                f"load balancing failover schedule {index}",
+            ],
+        }
+        for index in range(12)
+    ]
+    weak_domains = [
+        {
+            "name": "Weak Seed A",
+            "category": "Communication",
+            "seed_queries": [
+                "narrative structure universal patterns",
+                "hero journey monomyth story",
+            ],
+        },
+        {
+            "name": "Weak Seed B",
+            "category": "Art",
+            "seed_queries": [
+                "beauty story phenomenology",
+                "narrative typography experience",
+            ],
+        },
+        {
+            "name": "Weak Seed C",
+            "category": "Philosophy",
+            "seed_queries": [
+                "consciousness possible worlds philosophy",
+                "unsolved problems universal patterns",
+            ],
+        },
+    ]
+    monkeypatch.setattr(seed, "_load_domains", lambda: [*strong_domains, *weak_domains])
+    monkeypatch.setattr(config, "PERSONALIZATION", False, raising=False)
+    monkeypatch.setattr(config, "SEED_EXCLUSION_WINDOW", 0, raising=False)
+    monkeypatch.setattr(store, "get_recent_domains", lambda _n=0: [])
+    monkeypatch.setattr(
+        store,
+        "get_recent_seed_selection_context",
+        lambda _n=0: {
+            "recent_categories": ["Technology"] * 12,
+            "category_recent_counts": {"Technology": 12},
+            "domain_last_seen": {},
+            "category_last_seen": {"Technology": 0},
+            "domain_low_yield_counts": {"Weak Seed C": 2},
+        },
+    )
+    monkeypatch.setattr(store, "get_seed_outcome_metrics", lambda: {})
+
+    captured = {}
+
+    def _capture_population(population, weights, k):
+        captured["names"] = [item["name"] for item in population]
+        captured["weights"] = dict(zip(captured["names"], weights))
+        assert k == 1
+        return [population[0]]
+
+    monkeypatch.setattr(seed.random, "choices", _capture_population)
+
+    selected = seed.pick_seed()
+
+    assert selected["selection_diagnostics"]["weak_seed_add_back_count"] == 2
+    assert selected["selection_diagnostics"]["candidate_pool_size"] == 14
+    assert "retained 2 diversity-supported weak seeds" in selected["selection_reason"]
+    assert "Weak Seed A" in captured["names"]
+    assert "Weak Seed B" in captured["names"]
+    assert "Weak Seed C" not in captured["names"]
+    assert captured["weights"]["Weak Seed A"] > 0.0
+    assert captured["weights"]["Weak Seed B"] > 0.0
+
+
+def test_pick_seed_random_floor_preserves_exploration_reason(monkeypatch) -> None:
+    domains = [
+        {
+            "name": "Strong Seed",
+            "category": "Technology",
+            "seed_queries": [
+                "queue routing latency control",
+                "load balancing failover schedule",
+            ],
+        },
+        {
+            "name": "Storytelling",
+            "category": "Communication",
+            "seed_queries": [
+                "narrative structure universal patterns",
+                "hero journey monomyth story",
+            ],
+        },
+    ]
+    monkeypatch.setattr(seed, "_load_domains", lambda: domains)
+    monkeypatch.setattr(config, "PERSONALIZATION", True, raising=False)
+    monkeypatch.setattr(config, "SEED_EXCLUSION_WINDOW", 0, raising=False)
+    monkeypatch.setattr(store, "get_recent_domains", lambda _n=0: [])
+    monkeypatch.setattr(store, "get_recent_seed_selection_context", lambda _n=0: {})
+    monkeypatch.setattr(
+        store,
+        "get_seed_outcome_metrics",
+        lambda: {
+            "global_metrics": {"raw_expected_value": 0.33},
+            "domain_metrics": {},
+            "category_metrics": {},
+        },
+    )
+    monkeypatch.setattr(seed.random, "random", lambda: 0.0)
+    monkeypatch.setattr(seed.random, "choice", lambda population: population[1])
+
+    selected = seed.pick_seed()
+
+    assert selected["name"] == "Storytelling"
+    assert selected["selection_diagnostics"]["mode"] == "random_floor"
+    assert "random exploration pick (20% diversity floor)" in selected["selection_reason"]
+    assert "weak-quality seed" in selected["selection_reason"]
 
 
 def test_seed_selection_metadata_round_trips_into_review_items(temp_db) -> None:

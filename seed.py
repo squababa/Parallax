@@ -19,6 +19,7 @@ SEED_DIVERSITY_HISTORY_WINDOW = 40
 SEED_QUALITY_HIGH_THRESHOLD = 0.68
 SEED_QUALITY_MEDIUM_THRESHOLD = 0.46
 SEED_QUALITY_MIN_ELIGIBLE_CANDIDATES = 12
+SEED_QUALITY_WEAK_ADD_BACK_COUNT = 2
 
 QUALITY_SIGNAL_GROUPS = {
     "concrete mechanisms": {
@@ -496,7 +497,7 @@ def _expected_value_multiplier(
     combined_ev = (0.7 * domain_ev) + (0.3 * category_ev)
     baseline_ev = float(global_stats.get("raw_expected_value", 0.0) or 0.0)
     delta = combined_ev - baseline_ev
-    multiplier = 1.0 + max(-0.55, min(0.8, delta * 1.35))
+    multiplier = 1.0 + max(-0.3, min(0.45, delta * 0.9))
 
     domain_attempts = int(domain_stats.get("attempts", 0) or 0)
     category_attempts = int(category_stats.get("attempts", 0) or 0)
@@ -625,9 +626,9 @@ def _quality_multiplier(quality_profile: dict) -> tuple[float, str]:
     if band == "high":
         multiplier = max(multiplier, 1.25)
     elif band == "weak":
-        multiplier = min(multiplier, 0.72)
+        multiplier = min(multiplier, 0.82)
     if concerns and not strengths:
-        multiplier *= 0.9
+        multiplier *= 0.95
 
     detail = strengths[:2] if band != "weak" else concerns[:2]
     detail_text = ", ".join(detail) if detail else "limited quality signal"
@@ -671,11 +672,31 @@ def pick_seed() -> dict:
         for d in candidates
         if quality_profiles_by_name[d["name"]]["band"] != "weak"
     ]
+    weak_candidates = [
+        d
+        for d in candidates
+        if quality_profiles_by_name[d["name"]]["band"] == "weak"
+    ]
+    weak_seed_add_back_count = 0
     if len(quality_eligible) >= SEED_QUALITY_MIN_ELIGIBLE_CANDIDATES:
-        candidates = quality_eligible
+        weak_add_back = sorted(
+            weak_candidates,
+            key=lambda domain: (
+                -_diversity_multiplier(
+                    domain["name"],
+                    domain["category"],
+                    selection_context,
+                )[0],
+                -float(quality_profiles_by_name[domain["name"]]["score"] or 0.0),
+                domain["name"],
+            ),
+        )[:SEED_QUALITY_WEAK_ADD_BACK_COUNT]
+        weak_seed_add_back_count = len(weak_add_back)
+        candidates = [*quality_eligible, *weak_add_back]
         candidate_pool_reason = (
-            "quality-screened pool: weak seeds withheld because "
-            f"{len(quality_eligible)} medium/high candidates remain"
+            "quality-screened pool: retained "
+            f"{weak_seed_add_back_count} diversity-supported weak seeds alongside "
+            f"{len(quality_eligible)} medium/high candidates"
         )
     else:
         candidate_pool_reason = "full pool: insufficient medium/high seed coverage"
@@ -742,6 +763,8 @@ def pick_seed() -> dict:
             "diversity_multiplier": round(softened_diversity, 4),
             "diversity_reason": diversity_reason,
             "candidate_pool_reason": candidate_pool_reason,
+            "weak_seed_add_back_count": weak_seed_add_back_count,
+            "candidate_pool_size": len(candidates),
             "quality_profile": quality_profile,
         }
 

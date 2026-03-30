@@ -568,6 +568,124 @@ def test_dive_keeps_stronger_patterns_and_attaches_quality_metadata(
     assert seed["pattern_diagnostics"]["high_quality_count"] >= 1
 
 
+def test_search_seed_uses_three_queries_with_bounded_richness(monkeypatch) -> None:
+    calls = []
+
+    def fake_search(**kwargs):
+        calls.append(kwargs)
+        query = kwargs["query"]
+        return {
+            "results": [
+                {
+                    "title": f"{query} source",
+                    "content": f"{query} mechanism evidence",
+                    "url": f"https://seed.test/{len(calls)}",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(explore._tavily, "search", fake_search)
+    monkeypatch.setattr(explore, "increment_tavily_calls", lambda _count: None)
+    monkeypatch.setattr(explore, "sanitize", lambda value: " ".join(value.split()).strip())
+
+    combined, provenance = explore._search_seed(
+        {
+            "name": "Distributed Systems",
+            "category": "Technology",
+            "seed_queries": [
+                "queue routing latency control",
+                "load balancing failover schedule",
+                "backpressure retry collapse",
+                "should not be queried",
+            ],
+        }
+    )
+
+    assert [call["query"] for call in calls] == [
+        "queue routing latency control",
+        "load balancing failover schedule",
+        "backpressure retry collapse",
+    ]
+    assert calls[0]["max_results"] == 4
+    assert calls[1]["max_results"] == 4
+    assert calls[2]["max_results"] == 4
+    assert calls[0]["search_depth"] == "advanced"
+    assert calls[1]["search_depth"] == "basic"
+    assert calls[2]["search_depth"] == "basic"
+    assert "should not be queried" not in combined
+    assert combined == (
+        "Source: queue routing latency control source\n"
+        "queue routing latency control mechanism evidence\n\n"
+        "Source: load balancing failover schedule source\n"
+        "load balancing failover schedule mechanism evidence\n\n"
+        "Source: backpressure retry collapse source\n"
+        "backpressure retry collapse mechanism evidence\n"
+    )
+    assert provenance["seed_url"] == "https://seed.test/1"
+    assert provenance["seed_excerpt"] == "queue routing latency control mechanism evidence"
+
+
+def test_search_seed_skips_empty_or_noisy_results_and_keeps_first_usable_provenance(
+    monkeypatch,
+) -> None:
+    responses = {
+        "noisy query": {
+            "results": [
+                {"title": "Empty", "content": "", "url": "https://seed.test/empty"},
+                {"title": "Noise", "content": "   ", "url": "https://seed.test/noise"},
+                {
+                    "title": "Useful",
+                    "content": "Signal threshold gating stabilizes queue delay.",
+                    "url": "https://seed.test/useful",
+                },
+            ]
+        },
+        "follow up": {
+            "results": [
+                {
+                    "title": "Discarded noise",
+                    "content": "IGNORE_ME",
+                    "url": "https://seed.test/ignore",
+                },
+                {
+                    "title": "Second useful",
+                    "content": "Retry budget limits resend storms.",
+                    "url": "https://seed.test/retry",
+                },
+            ]
+        },
+    }
+
+    monkeypatch.setattr(
+        explore._tavily,
+        "search",
+        lambda **kwargs: responses[kwargs["query"]],
+    )
+    monkeypatch.setattr(explore, "increment_tavily_calls", lambda _count: None)
+    monkeypatch.setattr(
+        explore,
+        "sanitize",
+        lambda value: "" if value == "IGNORE_ME" else " ".join(value.split()).strip(),
+    )
+
+    combined, provenance = explore._search_seed(
+        {
+            "name": "Protocols",
+            "category": "Technology",
+            "seed_queries": ["noisy query", "follow up"],
+        }
+    )
+
+    assert combined == (
+        "Source: Useful\n"
+        "Signal threshold gating stabilizes queue delay.\n\n"
+        "Source: Second useful\n"
+        "Retry budget limits resend storms.\n"
+    )
+    assert provenance["seed_url"] == "https://seed.test/useful"
+    assert provenance["seed_excerpt"] == "Signal threshold gating stabilizes queue delay."
+
+
 def test_finalize_pattern_diagnostics_marks_patterns_too_weak_for_jump() -> None:
     seed = {
         "name": "Genetic Algorithms",
