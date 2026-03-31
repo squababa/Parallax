@@ -38,6 +38,8 @@ Strict rules:
 - Look for a conserved causal structure, not shared topic words.
 - A real structural match usually preserves the same driver -> mechanism -> outcome shape, with similar control logic.
 - Strong structural clues include similar threshold behavior, routing, bottlenecks, feedback loops, switching conditions, or gating logic.
+- Treat titles, provenance labels, and snippets as evidence, but weight concrete mechanism-bearing snippets more heavily than broad topical overlap or generic titles.
+- Approve only when one candidate domain shows one concrete target-domain process, one concrete shared constraint/mechanism, and one concrete workaround or operating response in the same evidence cluster.
 - Approve only when the target domain shows both the shared causal structure and concrete evidence of an already engineered workaround, mitigation, or operating response to that constraint.
 - Reject vague analogies, keyword overlap, and broad theme matches without similar causal organization.
 - Reject universal principles that connect everything (generic feedback, emergence, optimization, networks).
@@ -729,6 +731,19 @@ WEAK_QUERY_TOKENS = {
     "triggered",
     "triggers",
 }
+AMBIGUOUS_JUMP_QUERY_TOKENS = {
+    "channel",
+    "channels",
+    "flow",
+    "load",
+    "promotion",
+    "queue",
+    "rate",
+    "routing",
+    "selection",
+    "switching",
+    "threshold",
+}
 MECHANISM_QUERY_TOKENS = {
     "accumulation",
     "amplification",
@@ -827,6 +842,10 @@ def _is_specific_jump_query_token(token: str) -> bool:
     return len(token) >= 7
 
 
+def _is_concrete_jump_query_token(token: str) -> bool:
+    return _is_specific_jump_query_token(token) and token not in AMBIGUOUS_JUMP_QUERY_TOKENS
+
+
 def _extract_jump_query_phrases(text: str, blocked_tokens: set[str]) -> list[str]:
     phrases: list[str] = []
     raw_tokens = _tokenize_query_terms(text)
@@ -914,6 +933,112 @@ def _looks_like_formal_jump_query_token_soup(
     if re.search(r"\b(?:AND|OR|NOT|XOR)\b", raw_candidate):
         return True
     return sum(token in FORMAL_QUERY_RED_FLAG_TOKENS for token in candidate_tokens) >= 2
+
+
+def _needs_jump_query_disambiguation(
+    query: str,
+    preferred_anchor_phrases: list[str],
+) -> bool:
+    lowered_query = str(query or "").lower()
+    query_tokens = _tokenize_query_terms(query)
+    if not query_tokens:
+        return False
+    has_preferred_phrase = any(phrase in lowered_query for phrase in preferred_anchor_phrases)
+    concrete_tokens = [
+        token for token in query_tokens if _is_concrete_jump_query_token(token)
+    ]
+    ambiguous_tokens = [
+        token for token in query_tokens if token in AMBIGUOUS_JUMP_QUERY_TOKENS
+    ]
+    generic_tokens = [
+        token
+        for token in query_tokens
+        if token in GENERIC_QUERY_TOKENS or token in WEAK_QUERY_TOKENS
+    ]
+    return (
+        len(concrete_tokens) < 2
+        and len(ambiguous_tokens) >= 2
+        and len(ambiguous_tokens) + len(generic_tokens) >= min(len(query_tokens), 3)
+        and (not has_preferred_phrase or len(concrete_tokens) < 2)
+    )
+
+
+def _disambiguate_jump_search_query(
+    query: str,
+    pattern: dict,
+    source_domain: str,
+    source_category: str,
+) -> str:
+    clean_query = re.sub(r"\s+", " ", str(query or "").strip())
+    if not clean_query:
+        return ""
+
+    blocked_tokens = set(_tokenize_query_terms(source_domain))
+    blocked_tokens.update(_tokenize_query_terms(source_category))
+    preferred_anchor_phrases = _preferred_jump_query_anchor_phrases(pattern, blocked_tokens)
+    if not _needs_jump_query_disambiguation(clean_query, preferred_anchor_phrases):
+        return clean_query
+
+    selected: list[str] = []
+    covered_tokens: set[str] = set()
+
+    def _append_part(part: str) -> None:
+        normalized = str(part or "").strip()
+        if not normalized or normalized in selected:
+            return
+        selected.append(normalized)
+        covered_tokens.update(_tokenize_query_terms(normalized))
+
+    anchor_phrase = next(
+        (
+            phrase
+            for phrase in preferred_anchor_phrases
+            if phrase not in clean_query.lower()
+        ),
+        preferred_anchor_phrases[0] if preferred_anchor_phrases else "",
+    )
+    if anchor_phrase:
+        _append_part(anchor_phrase)
+
+    def _append_token_group(tokens: list[str]) -> None:
+        for token in tokens:
+            if (
+                token in covered_tokens
+                or token in blocked_tokens
+                or token in GENERIC_QUERY_TOKENS
+                or token in WEAK_QUERY_TOKENS
+                or len(token) <= 2
+            ):
+                continue
+            _append_part(token)
+            if len(_tokenize_query_terms(" ".join(selected))) >= 6:
+                return
+
+    current_tokens = _tokenize_query_terms(clean_query)
+    _append_token_group(
+        [token for token in current_tokens if _is_concrete_jump_query_token(token)]
+    )
+
+    pattern_specific_tokens: list[str] = []
+    for text in (
+        str(pattern.get("control_lever", "") or ""),
+        str(pattern.get("abstract_structure", "") or ""),
+        str(pattern.get("measurable_signal", "") or ""),
+        str(pattern.get("pattern_name", "") or ""),
+        str(pattern.get("transfer_rationale", "") or ""),
+    ):
+        pattern_specific_tokens.extend(
+            token
+            for token in _tokenize_query_terms(text)
+            if _is_concrete_jump_query_token(token)
+        )
+    _append_token_group(pattern_specific_tokens)
+    _append_token_group(
+        [token for token in current_tokens if token in MECHANISM_QUERY_TOKENS]
+    )
+
+    refined_query = " ".join(selected)
+    return refined_query or clean_query
 
 
 def _build_jump_search_query_heuristic(
@@ -1056,7 +1181,10 @@ def _is_acceptable_llm_jump_query(
     lowered_candidate = candidate.lower()
     if preferred_anchor_phrases:
         if not any(phrase in lowered_candidate for phrase in preferred_anchor_phrases):
-            return False
+            if _needs_jump_query_disambiguation(candidate, preferred_anchor_phrases):
+                return False
+    elif _needs_jump_query_disambiguation(candidate, preferred_anchor_phrases):
+        return False
 
     anchor_texts = [
         str(pattern.get("control_lever", "") or ""),
@@ -1152,12 +1280,25 @@ def _build_jump_search_query(
         source_domain,
         source_category,
     )
+    heuristic_query = _disambiguate_jump_search_query(
+        heuristic_query,
+        pattern,
+        source_domain,
+        source_category,
+    )
     llm_query = _generate_llm_jump_search_query(
         pattern,
         source_domain,
         source_category,
         heuristic_query,
     )
+    if llm_query:
+        llm_query = _disambiguate_jump_search_query(
+            llm_query,
+            pattern,
+            source_domain,
+            source_category,
+        )
     return llm_query or heuristic_query
 
 
@@ -3885,7 +4026,7 @@ def lateral_jump_with_diagnostics(
         diagnostic["stage1_failure_hint"] = "search_error"
         return None, diagnostic
 
-    for merged_result in merged_results:
+    for index, merged_result in enumerate(merged_results, start=1):
         title_text = str(merged_result.get("title_text", "") or "").strip()
         clean = str(merged_result.get("clean", "") or "").strip()
         url = str(merged_result.get("url", "") or "").strip()
@@ -3903,11 +4044,14 @@ def lateral_jump_with_diagnostics(
         )
         if title_text and title_text not in top_titles and len(top_titles) < 3:
             top_titles.append(title_text)
+        search_content.append(f"Search result {index}:")
         search_content.append(
             f"Retrieved via: {', '.join(merged_result.get('query_labels', []))}"
         )
         search_content.append(f"Title: {title_text or 'Unknown'}")
-        search_content.append(clean)
+        if url:
+            search_content.append(f"URL: {url}")
+        search_content.append(f"Snippet: {clean}")
         search_content.append("")
 
     diagnostic["result_count"] = len(merged_results)
