@@ -5,6 +5,7 @@ Entry point. Runs the exploration loop.
 import argparse
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -821,6 +822,51 @@ def _parse_report_only_args():
     )
     args, _ = parser.parse_known_args()
     return args
+
+
+def _jump_benchmark_action_requested(args) -> bool:
+    """Return True when one of the replay benchmark actions is requested."""
+    return bool(
+        getattr(args, "run_jump_benchmark", False)
+        or getattr(args, "capture_jump_benchmark", None) is not None
+        or getattr(args, "capture_strong_rejection_benchmark", None) is not None
+    )
+
+
+def _configure_benchmark_llm_env(args) -> dict | None:
+    """Force benchmark actions onto a local Ollama-backed model by default."""
+    if not _jump_benchmark_action_requested(args):
+        return None
+
+    local_pref = str(os.getenv("BLACKCLAW_BENCHMARK_USE_LOCAL", "1")).strip().lower()
+    if local_pref in {"0", "false", "no", "off"}:
+        return None
+
+    provider = "ollama"
+    model = (
+        str(os.getenv("BLACKCLAW_BENCHMARK_MODEL", "qwen3:8b")).strip()
+        or "qwen3:8b"
+    )
+    base_url = (
+        str(
+            os.getenv(
+                "BLACKCLAW_BENCHMARK_OLLAMA_BASE_URL",
+                os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+            )
+        ).strip()
+        or "http://localhost:11434"
+    )
+
+    os.environ["LOCAL_LLM_ONLY"] = "1"
+    os.environ["LLM_PROVIDER"] = provider
+    os.environ["BLACKCLAW_MODEL"] = model
+    os.environ["OLLAMA_BASE_URL"] = base_url
+
+    return {
+        "provider": provider,
+        "model": model,
+        "base_url": base_url,
+    }
 
 
 def _print_rut_report(report: dict):
@@ -4764,6 +4810,14 @@ def _print_invalid_seed_error(seed_name: str, suggestions: list[str]):
 
 if __name__ == "__main__":
     _early_report_args = _parse_report_only_args()
+    _benchmark_llm_override = _configure_benchmark_llm_env(_early_report_args)
+    if _benchmark_llm_override is not None:
+        print(
+            "[BlackClaw] Benchmark mode forcing local LLM: "
+            f"{_benchmark_llm_override['provider']} / "
+            f"{_benchmark_llm_override['model']} via "
+            f"{_benchmark_llm_override['base_url']}"
+        )
     _early_prediction_action_count = sum(
         [
             _early_report_args.predictions,

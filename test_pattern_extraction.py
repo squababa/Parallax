@@ -2743,6 +2743,52 @@ def test_capture_jump_benchmark_case_writes_case_file(temp_db, tmp_path) -> None
     assert "Wireless scheduling paper" in cases[0]["search_results"]
 
 
+def test_configure_benchmark_llm_env_forces_local_qwen(monkeypatch) -> None:
+    monkeypatch.setenv("LLM_PROVIDER", "claude")
+    monkeypatch.setenv("BLACKCLAW_MODEL", "claude-sonnet-4-6")
+    monkeypatch.delenv("LOCAL_LLM_ONLY", raising=False)
+    monkeypatch.delenv("BLACKCLAW_BENCHMARK_MODEL", raising=False)
+    monkeypatch.delenv("BLACKCLAW_BENCHMARK_OLLAMA_BASE_URL", raising=False)
+
+    override = main._configure_benchmark_llm_env(
+        types.SimpleNamespace(
+            run_jump_benchmark=True,
+            capture_jump_benchmark=None,
+            capture_strong_rejection_benchmark=None,
+        )
+    )
+
+    assert override == {
+        "provider": "ollama",
+        "model": "qwen3:8b",
+        "base_url": "http://localhost:11434",
+    }
+    assert os.environ["LOCAL_LLM_ONLY"] == "1"
+    assert os.environ["LLM_PROVIDER"] == "ollama"
+    assert os.environ["BLACKCLAW_MODEL"] == "qwen3:8b"
+
+
+def test_configure_benchmark_llm_env_respects_custom_local_model(monkeypatch) -> None:
+    monkeypatch.setenv("BLACKCLAW_BENCHMARK_MODEL", "qwen2.5:14b")
+    monkeypatch.setenv("BLACKCLAW_BENCHMARK_OLLAMA_BASE_URL", "http://localhost:22434")
+
+    override = main._configure_benchmark_llm_env(
+        types.SimpleNamespace(
+            run_jump_benchmark=False,
+            capture_jump_benchmark="751:1",
+            capture_strong_rejection_benchmark=None,
+        )
+    )
+
+    assert override == {
+        "provider": "ollama",
+        "model": "qwen2.5:14b",
+        "base_url": "http://localhost:22434",
+    }
+    assert os.environ["BLACKCLAW_MODEL"] == "qwen2.5:14b"
+    assert os.environ["OLLAMA_BASE_URL"] == "http://localhost:22434"
+
+
 def test_run_jump_benchmark_marks_jump_case_improved(tmp_path, capsys, monkeypatch) -> None:
     benchmark_file = tmp_path / "jump_replay_benchmark.json"
     benchmark_file.write_text(
