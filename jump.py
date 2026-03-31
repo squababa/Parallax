@@ -4521,6 +4521,7 @@ def lateral_jump_with_diagnostics(
         "stage2_outcome": None,
         "stage2_target_domain": None,
         "stage2_failure_hint": None,
+        "benchmark_snapshot": None,
     }
 
     queries = _build_jump_search_queries(
@@ -4911,6 +4912,14 @@ def lateral_jump_with_diagnostics(
         diagnostic["stage1_outcome"] = "no_results"
         diagnostic["stage1_failure_hint"] = "no_usable_results"
         return None, diagnostic
+    diagnostic["benchmark_snapshot"] = {
+        "source_domain": source_domain,
+        "source_category": source_category,
+        "pattern_name": diagnostic["pattern_name"],
+        "abstract_structure": diagnostic["abstract_structure"],
+        "built_jump_query": query,
+        "search_results": combined,
+    }
 
     stage_one, stage_one_failure_hint = _stage_one_detect_with_diagnostics(
         source_domain=source_domain,

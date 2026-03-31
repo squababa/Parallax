@@ -99,6 +99,9 @@ API_USAGE_OUTPUT_COLUMNS = ("output_tokens", "completion_tokens")
 API_USAGE_MODEL_COLUMNS = ("model", "model_name")
 API_USAGE_TIME_COLUMNS = ("timestamp", "created_at", "recorded_at", "date")
 GOLDEN_EVALS_PATH = Path(__file__).with_name("golden_eval_pairs.json")
+JUMP_REPLAY_BENCHMARK_DEFAULT_PATH = Path(__file__).with_name(
+    "jump_replay_benchmark.json"
+)
 LATE_STAGE_TIMING_LABELS = {
     "score": "Score",
     "validation": "Validation",
@@ -538,6 +541,30 @@ def _parse_report_only_args():
         action="store_true",
     )
     parser.add_argument(
+        "--run-jump-benchmark",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--capture-jump-benchmark",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "--capture-strong-rejection-benchmark",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--benchmark-file",
+        type=str,
+        default=str(JUMP_REPLAY_BENCHMARK_DEFAULT_PATH),
+    )
+    parser.add_argument(
+        "--benchmark-label",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
         "--grade-transmission",
         type=int,
         default=None,
@@ -787,6 +814,10 @@ def _parse_report_only_args():
         "--seed",
         type=str,
         default=None,
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
     )
     args, _ = parser.parse_known_args()
     return args
@@ -1709,6 +1740,533 @@ def _print_jump_diagnostics(limit: int = 20) -> None:
     ):
         count = outcome_counts.get(label, 0)
         print(f"{label}\t{count}\t{_share(count)}")
+
+
+def _benchmark_case_id(label: object, fallback: str) -> str:
+    """Build one stable benchmark-case id from a label."""
+    clean = re.sub(r"[^a-z0-9]+", "-", str(label or "").strip().lower()).strip("-")
+    return clean or fallback
+
+
+def _load_jump_benchmark_cases(path: str | Path) -> list[dict]:
+    """Load benchmark cases from disk, tolerating either list or object payloads."""
+    benchmark_path = Path(path)
+    if not benchmark_path.exists():
+        return []
+    try:
+        payload = json.loads(benchmark_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"could not parse benchmark file: {exc}") from exc
+
+    if isinstance(payload, dict):
+        cases = payload.get("cases")
+    else:
+        cases = payload
+    if not isinstance(cases, list):
+        raise ValueError("benchmark file must contain a JSON list or an object with `cases`")
+    return [dict(case) for case in cases if isinstance(case, dict)]
+
+
+def _save_jump_benchmark_cases(path: str | Path, cases: list[dict]) -> None:
+    """Persist benchmark cases to disk in a stable wrapped JSON payload."""
+    benchmark_path = Path(path)
+    benchmark_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"version": 1, "cases": [dict(case) for case in cases if isinstance(case, dict)]}
+    benchmark_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _parse_jump_attempt_spec(value: str) -> tuple[int, int] | None:
+    """Parse one `exploration_id:attempt_index` selector."""
+    clean = str(value or "").strip()
+    if ":" not in clean:
+        return None
+    left, right = clean.split(":", 1)
+    try:
+        exploration_id = int(left)
+        attempt_index = int(right)
+    except ValueError:
+        return None
+    if exploration_id <= 0 or attempt_index <= 0:
+        return None
+    return exploration_id, attempt_index
+
+
+def _load_jump_attempt_for_benchmark(
+    exploration_id: int,
+    attempt_index: int,
+) -> tuple[dict | None, str | None]:
+    """Load one stored jump attempt plus its replay snapshot from an exploration row."""
+    conn = _connect()
+    row = conn.execute(
+        """SELECT id, timestamp, seed_domain, seed_category, pattern_diagnostics_json
+        FROM explorations
+        WHERE id = ?""",
+        (int(exploration_id),),
+    ).fetchone()
+    conn.close()
+    if row is None:
+        return None, f"exploration #{exploration_id} not found"
+
+    try:
+        pattern_diagnostics = (
+            json.loads(row["pattern_diagnostics_json"])
+            if row["pattern_diagnostics_json"]
+            else {}
+        )
+    except Exception:
+        pattern_diagnostics = {}
+    if not isinstance(pattern_diagnostics, dict):
+        pattern_diagnostics = {}
+    jump_attempts = (
+        pattern_diagnostics.get("jump_attempts")
+        if isinstance(pattern_diagnostics.get("jump_attempts"), list)
+        else []
+    )
+    zero_index = int(attempt_index) - 1
+    if zero_index < 0 or zero_index >= len(jump_attempts):
+        return None, (
+            f"exploration #{exploration_id} does not have jump attempt #{attempt_index}"
+        )
+    attempt = jump_attempts[zero_index]
+    if not isinstance(attempt, dict):
+        return None, f"jump attempt #{attempt_index} on exploration #{exploration_id} is invalid"
+
+    snapshot = (
+        attempt.get("benchmark_snapshot")
+        if isinstance(attempt.get("benchmark_snapshot"), dict)
+        else {}
+    )
+    search_results = str(snapshot.get("search_results") or "").strip()
+    abstract_structure = str(
+        snapshot.get("abstract_structure") or attempt.get("abstract_structure") or ""
+    ).strip()
+    source_domain = str(snapshot.get("source_domain") or row["seed_domain"] or "").strip()
+    if not search_results:
+        return None, (
+            f"exploration #{exploration_id} attempt #{attempt_index} has no replay snapshot; "
+            "rerun after the benchmark harness landed to capture it"
+        )
+    if not abstract_structure or not source_domain:
+        return None, (
+            f"exploration #{exploration_id} attempt #{attempt_index} is missing replay context"
+        )
+
+    return {
+        "exploration_id": int(row["id"]),
+        "timestamp": row["timestamp"],
+        "seed_domain": row["seed_domain"],
+        "seed_category": row["seed_category"],
+        "attempt_index": int(attempt_index),
+        "attempt": dict(attempt),
+        "snapshot": dict(snapshot),
+    }, None
+
+
+def _capture_jump_benchmark_case(
+    attempt_spec: str,
+    benchmark_file: str | Path,
+    *,
+    label: str | None = None,
+) -> bool:
+    """Append or replace one jump-attempt replay case in the benchmark file."""
+    parsed = _parse_jump_attempt_spec(attempt_spec)
+    if parsed is None:
+        print(
+            "  [!] --capture-jump-benchmark requires EXPLORATION_ID:ATTEMPT_INDEX, "
+            "for example `748:1`."
+        )
+        return False
+    exploration_id, attempt_index = parsed
+    loaded, error = _load_jump_attempt_for_benchmark(exploration_id, attempt_index)
+    if loaded is None:
+        print(f"  [!] {error}.")
+        return False
+
+    attempt = loaded["attempt"]
+    snapshot = loaded["snapshot"]
+    label_text = _clean_inline_text(label) or (
+        f"exploration-{exploration_id}-attempt-{attempt_index}"
+    )
+    case_id = _benchmark_case_id(
+        label_text,
+        fallback=f"exploration-{exploration_id}-attempt-{attempt_index}",
+    )
+    case = {
+        "id": case_id,
+        "label": label_text,
+        "type": "jump_attempt",
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "captured_from": {
+            "exploration_id": exploration_id,
+            "attempt_index": attempt_index,
+            "timestamp": loaded.get("timestamp"),
+        },
+        "source_domain": str(snapshot.get("source_domain") or loaded.get("seed_domain") or "").strip(),
+        "source_category": str(snapshot.get("source_category") or loaded.get("seed_category") or "").strip(),
+        "pattern_name": str(snapshot.get("pattern_name") or attempt.get("pattern_name") or "").strip(),
+        "abstract_structure": str(snapshot.get("abstract_structure") or "").strip(),
+        "built_jump_query": str(snapshot.get("built_jump_query") or attempt.get("built_jump_query") or "").strip(),
+        "search_results": str(snapshot.get("search_results") or "").strip(),
+        "expected": {
+            "stage1_outcome": str(attempt.get("stage1_outcome") or "").strip() or None,
+            "stage1_failure_hint": str(attempt.get("stage1_failure_hint") or "").strip() or None,
+            "stage1_target_domain": str(attempt.get("stage1_target_domain") or "").strip() or None,
+            "stage2_outcome": str(attempt.get("stage2_outcome") or "").strip() or None,
+            "stage2_failure_hint": str(attempt.get("stage2_failure_hint") or "").strip() or None,
+            "stage2_target_domain": str(attempt.get("stage2_target_domain") or "").strip() or None,
+            "stage2_incomplete_fields": [
+                str(field).strip()
+                for field in (attempt.get("stage2_incomplete_fields") or [])
+                if str(field).strip()
+            ],
+        },
+    }
+
+    try:
+        cases = _load_jump_benchmark_cases(benchmark_file)
+    except ValueError as exc:
+        print(f"  [!] {exc}.")
+        return False
+    replaced = False
+    for index, existing in enumerate(cases):
+        if str(existing.get("id") or "").strip() == case_id:
+            cases[index] = case
+            replaced = True
+            break
+    if not replaced:
+        cases.append(case)
+    _save_jump_benchmark_cases(benchmark_file, cases)
+    print(
+        f"[JumpBenchmark] {'Updated' if replaced else 'Captured'} "
+        f"jump case `{case_id}` from exploration #{exploration_id} attempt #{attempt_index}."
+    )
+    print(f"[JumpBenchmark] File: {Path(benchmark_file)}")
+    return True
+
+
+def _capture_strong_rejection_benchmark_case(
+    rejection_id: int,
+    benchmark_file: str | Path,
+    *,
+    label: str | None = None,
+) -> bool:
+    """Append or replace one strong-rejection replay case in the benchmark file."""
+    context = _load_strong_rejection_replay_context(int(rejection_id))
+    if context is None:
+        print(f"  [!] Strong rejection #{rejection_id} not found.")
+        return False
+    if context.get("error") is not None:
+        print(
+            f"  [!] Strong rejection #{rejection_id} cannot be benchmarked: "
+            f"{context.get('error')}."
+        )
+        return False
+    row = context["row"]
+    label_text = _clean_inline_text(label) or f"strong-rejection-{int(rejection_id)}"
+    case_id = _benchmark_case_id(
+        label_text,
+        fallback=f"strong-rejection-{int(rejection_id)}",
+    )
+    case = {
+        "id": case_id,
+        "label": label_text,
+        "type": "strong_rejection",
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "strong_rejection_id": int(rejection_id),
+        "source_domain": _clean_inline_text(context.get("source_domain")),
+        "target_domain": _clean_inline_text(context.get("target_domain")),
+        "original_rejection_stage": row.get("rejection_stage"),
+        "expected": {
+            "verdict": "still fail",
+        },
+    }
+    try:
+        cases = _load_jump_benchmark_cases(benchmark_file)
+    except ValueError as exc:
+        print(f"  [!] {exc}.")
+        return False
+    replaced = False
+    for index, existing in enumerate(cases):
+        if str(existing.get("id") or "").strip() == case_id:
+            cases[index] = case
+            replaced = True
+            break
+    if not replaced:
+        cases.append(case)
+    _save_jump_benchmark_cases(benchmark_file, cases)
+    print(
+        f"[JumpBenchmark] {'Updated' if replaced else 'Captured'} "
+        f"strong rejection case `{case_id}` from rejection #{int(rejection_id)}."
+    )
+    print(f"[JumpBenchmark] File: {Path(benchmark_file)}")
+    return True
+
+
+def _jump_benchmark_stage_rank(stage1_outcome: str | None, stage2_outcome: str | None) -> int:
+    """Rank jump outcomes so later progress counts as improvement."""
+    clean_stage2 = str(stage2_outcome or "").strip()
+    clean_stage1 = str(stage1_outcome or "").strip()
+    if clean_stage2 == "connection_found":
+        return 3
+    if clean_stage2 == "stage2_no_connection":
+        return 2
+    if clean_stage1 == "detect_signal":
+        return 2
+    if clean_stage1 == "detect_no_signal":
+        return 1
+    return 0
+
+
+def _strong_rejection_benchmark_rank(verdict: str | None) -> int:
+    """Rank strong-rejection replay verdicts so later survival counts as improvement."""
+    clean = str(verdict or "").strip().lower()
+    if clean == "would now transmit":
+        return 3
+    if clean == "salvage then fail later":
+        return 2
+    if clean == "salvage attempted but rewrite failed":
+        return 1
+    return 0
+
+
+def _run_jump_attempt_benchmark_case(case: dict) -> dict:
+    """Replay one stored jump-attempt case against current Stage 1/Stage 2 code."""
+    source_domain = _clean_inline_text(case.get("source_domain")) or "Unknown"
+    abstract_structure = _clean_inline_text(case.get("abstract_structure")) or ""
+    search_results = str(case.get("search_results") or "").strip()
+    expected = case.get("expected") if isinstance(case.get("expected"), dict) else {}
+    if not abstract_structure or not search_results:
+        return {
+            "status": "ERROR",
+            "case_id": case.get("id"),
+            "label": case.get("label"),
+            "message": "missing abstract_structure or search_results",
+        }
+
+    stage_one, stage_one_failure_hint = jump_module._stage_one_detect_with_diagnostics(
+        source_domain=source_domain,
+        abstract_structure=abstract_structure,
+        search_results=search_results,
+    )
+    if stage_one is None:
+        actual_stage1_outcome = (
+            "detect_no_signal"
+            if stage_one_failure_hint in ("no_connection", "missing_solution_evidence")
+            else "no_results"
+        )
+        actual_stage2_outcome = None
+        actual_stage2_failure_hint = None
+        actual_stage2_incomplete_fields: list[str] = []
+        actual_stage2_target_domain = None
+        actual_stage1_target_domain = None
+    else:
+        actual_stage1_outcome = "detect_signal"
+        actual_stage1_target_domain = _clean_inline_text(stage_one.get("target_domain"))
+        stage_two_data, stage_two_failure_hint, stage_two_incomplete_fields = (
+            jump_module._stage_two_hypothesize_with_diagnostics(
+                source_domain=source_domain,
+                abstract_structure=abstract_structure,
+                stage_one=stage_one,
+                search_results=search_results,
+            )
+        )
+        if stage_two_data is None:
+            actual_stage2_outcome = "stage2_no_connection"
+            actual_stage2_failure_hint = stage_two_failure_hint or "returned_no_connection"
+            actual_stage2_incomplete_fields = [
+                str(field).strip()
+                for field in (stage_two_incomplete_fields or [])
+                if str(field).strip()
+            ]
+            actual_stage2_target_domain = None
+        else:
+            actual_stage2_outcome = "connection_found"
+            actual_stage2_failure_hint = None
+            actual_stage2_incomplete_fields = []
+            actual_stage2_target_domain = _clean_inline_text(
+                stage_two_data.get("target_domain")
+            )
+
+    expected_stage1_outcome = str(expected.get("stage1_outcome") or "").strip() or None
+    expected_stage2_outcome = str(expected.get("stage2_outcome") or "").strip() or None
+    actual_rank = _jump_benchmark_stage_rank(
+        actual_stage1_outcome,
+        actual_stage2_outcome,
+    )
+    expected_rank = _jump_benchmark_stage_rank(
+        expected_stage1_outcome,
+        expected_stage2_outcome,
+    )
+    if actual_rank > expected_rank:
+        status = "IMPROVED"
+    elif actual_rank < expected_rank:
+        status = "REGRESSED"
+    else:
+        status = "MATCH"
+    return {
+        "type": "jump_attempt",
+        "case_id": case.get("id"),
+        "label": case.get("label"),
+        "status": status,
+        "expected_stage1_outcome": expected_stage1_outcome,
+        "expected_stage2_outcome": expected_stage2_outcome,
+        "actual_stage1_outcome": actual_stage1_outcome,
+        "actual_stage1_failure_hint": stage_one_failure_hint,
+        "actual_stage1_target_domain": actual_stage1_target_domain,
+        "actual_stage2_outcome": actual_stage2_outcome,
+        "actual_stage2_failure_hint": actual_stage2_failure_hint,
+        "actual_stage2_target_domain": actual_stage2_target_domain,
+        "actual_stage2_incomplete_fields": actual_stage2_incomplete_fields,
+        "pattern_name": _clean_inline_text(case.get("pattern_name")),
+    }
+
+
+def _run_strong_rejection_benchmark_case(case: dict, threshold: float) -> dict:
+    """Replay one stored strong rejection against the current late-stage path."""
+    rejection_id = int(case.get("strong_rejection_id") or 0)
+    context = _load_strong_rejection_replay_context(rejection_id)
+    if context is None:
+        return {
+            "type": "strong_rejection",
+            "case_id": case.get("id"),
+            "label": case.get("label"),
+            "status": "ERROR",
+            "message": f"strong rejection #{rejection_id} not found",
+        }
+    if context.get("error") is not None:
+        return {
+            "type": "strong_rejection",
+            "case_id": case.get("id"),
+            "label": case.get("label"),
+            "status": "ERROR",
+            "message": str(context.get("error")),
+        }
+
+    row = context["row"]
+    replay_context = _strong_rejection_replay_context(row)
+    candidate = _evaluate_connection_candidate(
+        score_label=f"StrongRejection Replay #{rejection_id}",
+        source_domain=_clean_inline_text(context.get("source_domain")) or "Unknown",
+        target_domain=_clean_inline_text(context.get("target_domain")) or "Unknown",
+        patterns_payload=context.get("patterns_payload") or [],
+        connection=context["connection"],
+        threshold=float(threshold),
+        replay_context=replay_context,
+    )
+    actual_verdict = _strong_rejection_replay_verdict(candidate)
+    expected = case.get("expected") if isinstance(case.get("expected"), dict) else {}
+    expected_verdict = str(expected.get("verdict") or "").strip() or None
+    actual_rank = _strong_rejection_benchmark_rank(actual_verdict)
+    expected_rank = _strong_rejection_benchmark_rank(expected_verdict)
+    if actual_rank > expected_rank:
+        status = "IMPROVED"
+    elif actual_rank < expected_rank:
+        status = "REGRESSED"
+    else:
+        status = "MATCH"
+    replay_diagnostics = (
+        candidate.get("replay_diagnostics")
+        if isinstance(candidate.get("replay_diagnostics"), dict)
+        else {}
+    )
+    return {
+        "type": "strong_rejection",
+        "case_id": case.get("id"),
+        "label": case.get("label"),
+        "status": status,
+        "expected_verdict": expected_verdict,
+        "actual_verdict": actual_verdict,
+        "remaining_blocker_category": replay_diagnostics.get("remaining_blocker_category"),
+        "original_rejection_stage": row.get("rejection_stage"),
+    }
+
+
+def _run_jump_benchmark(
+    benchmark_file: str | Path,
+    threshold: float | None,
+) -> bool:
+    """Run the stored jump benchmark cases against the current pipeline."""
+    threshold_value = _resolve_diagnostic_threshold(threshold)
+    try:
+        cases = _load_jump_benchmark_cases(benchmark_file)
+    except ValueError as exc:
+        print(f"  [!] {exc}.")
+        return False
+    if not cases:
+        print(f"[JumpBenchmark] No cases found in {Path(benchmark_file)}.")
+        return False
+
+    print(f"[JumpBenchmark] Running {len(cases)} case(s) from {Path(benchmark_file)}")
+    counts = {"MATCH": 0, "IMPROVED": 0, "REGRESSED": 0, "ERROR": 0}
+    for case in cases:
+        case_type = str(case.get("type") or "").strip()
+        if case_type == "jump_attempt":
+            result = _run_jump_attempt_benchmark_case(case)
+        elif case_type == "strong_rejection":
+            result = _run_strong_rejection_benchmark_case(case, threshold_value)
+        else:
+            result = {
+                "case_id": case.get("id"),
+                "label": case.get("label"),
+                "status": "ERROR",
+                "message": f"unknown case type: {case_type or '—'}",
+            }
+        status = str(result.get("status") or "ERROR").strip().upper()
+        counts[status] = counts.get(status, 0) + 1
+        label_text = _truncate_text(result.get("label"), 52)
+        print(
+            f"{status}\t{result.get('type') or case_type or 'case'}\t"
+            f"{result.get('case_id') or '—'}\t{label_text}"
+        )
+        if status == "ERROR":
+            print(f"  message={result.get('message') or 'unknown error'}")
+            continue
+        if result.get("type") == "jump_attempt":
+            print(
+                f"  expected={result.get('expected_stage1_outcome') or '—'} -> "
+                f"{result.get('expected_stage2_outcome') or '—'} | "
+                f"actual={result.get('actual_stage1_outcome') or '—'} -> "
+                f"{result.get('actual_stage2_outcome') or '—'}"
+            )
+            if result.get("pattern_name"):
+                print(f"  pattern={result.get('pattern_name')}")
+            if result.get("actual_stage2_failure_hint"):
+                print(
+                    "  stage2_failure_hint="
+                    + _truncate_text(result.get("actual_stage2_failure_hint"), 120)
+                )
+            elif result.get("actual_stage1_failure_hint"):
+                print(
+                    "  stage1_failure_hint="
+                    + _truncate_text(result.get("actual_stage1_failure_hint"), 120)
+                )
+            incomplete_fields = result.get("actual_stage2_incomplete_fields") or []
+            if incomplete_fields:
+                print(
+                    "  incomplete_fields="
+                    + ", ".join(_truncate_text(field, 32) for field in incomplete_fields[:6])
+                )
+        elif result.get("type") == "strong_rejection":
+            print(
+                f"  expected_verdict={result.get('expected_verdict') or '—'} | "
+                f"actual_verdict={result.get('actual_verdict') or '—'}"
+            )
+            if result.get("remaining_blocker_category"):
+                print(
+                    "  remaining_blocker_category="
+                    + str(result.get("remaining_blocker_category"))
+                )
+        print("")
+
+    total = sum(counts.values())
+    print("[JumpBenchmark] Summary")
+    print(f"total\t{total}")
+    for key in ("MATCH", "IMPROVED", "REGRESSED", "ERROR"):
+        print(f"{key.lower()}\t{counts.get(key, 0)}")
+    return counts.get("ERROR", 0) == 0 and counts.get("REGRESSED", 0) == 0
 
 
 def _map_suggested_grade_to_manual(row: dict) -> tuple[str | None, str | None]:
@@ -4248,6 +4806,13 @@ if __name__ == "__main__":
             _early_report_args.dismiss_strong_rejection is not None,
         ]
     )
+    _early_benchmark_action_count = sum(
+        [
+            _early_report_args.run_jump_benchmark,
+            _early_report_args.capture_jump_benchmark is not None,
+            _early_report_args.capture_strong_rejection_benchmark is not None,
+        ]
+    )
     _early_other_report_count = sum(
         [
             _early_report_args.kill_stats,
@@ -4338,10 +4903,16 @@ if __name__ == "__main__":
             "  [!] Use only one strong-rejection action at a time: --strong-rejections, --strong-rejection, --replay-strong-rejection, --mark-salvaged, or --dismiss-strong-rejection."
         )
         sys.exit(1)
+    if _early_benchmark_action_count > 1:
+        print(
+            "  [!] Use only one jump benchmark action at a time: --run-jump-benchmark, --capture-jump-benchmark, or --capture-strong-rejection-benchmark."
+        )
+        sys.exit(1)
     if _early_report_args.log_scar and (
         _early_transmission_review_action_count > 0
         or _early_prediction_action_count > 0
         or _early_strong_rejection_action_count > 0
+        or _early_benchmark_action_count > 0
         or _early_other_report_count > 0
     ):
         print(
@@ -4356,6 +4927,7 @@ if __name__ == "__main__":
     if _early_transmission_review_action_count > 0 and (
         _early_prediction_action_count > 0
         or _early_strong_rejection_action_count > 0
+        or _early_benchmark_action_count > 0
         or _early_other_report_count > 0
     ):
         print(
@@ -4363,10 +4935,34 @@ if __name__ == "__main__":
         )
         sys.exit(1)
     if _early_strong_rejection_action_count > 0 and (
-        _early_prediction_action_count > 0 or _early_other_report_count > 0
+        _early_prediction_action_count > 0
+        or _early_benchmark_action_count > 0
+        or _early_other_report_count > 0
     ):
         print(
             "  [!] Strong-rejection actions cannot be combined with other report-only actions."
+        )
+        sys.exit(1)
+    if _early_benchmark_action_count > 0 and (
+        _early_prediction_action_count > 0
+        or _early_other_report_count > 0
+        or _early_transmission_review_action_count > 0
+        or _early_strong_rejection_action_count > 0
+        or _early_report_args.export
+        or _early_report_args.run_eval
+        or _early_report_args.seed is not None
+        or _early_report_args.once
+    ):
+        print(
+            "  [!] Jump benchmark actions cannot be combined with other report-only, review, prediction, strong-rejection, export, eval, seed, or run-loop actions."
+        )
+        sys.exit(1)
+    if (
+        _early_report_args.benchmark_label is not None
+        and _early_benchmark_action_count == 0
+    ):
+        print(
+            "  [!] --benchmark-label can only be used with jump benchmark capture actions."
         )
         sys.exit(1)
     if (
@@ -4445,6 +5041,10 @@ if __name__ == "__main__":
         (
             "--replay-strong-rejection",
             _early_report_args.replay_strong_rejection,
+        ),
+        (
+            "--capture-strong-rejection-benchmark",
+            _early_report_args.capture_strong_rejection_benchmark,
         ),
         ("--grade-transmission", _early_report_args.grade_transmission),
         ("--mark-salvaged", _early_report_args.mark_salvaged),
@@ -4753,6 +5353,7 @@ from config import (
     MAX_PATTERNS_PER_CYCLE,
 )
 from explore import append_jump_attempt_diagnostic, dive, finalize_pattern_diagnostics
+import jump as jump_module
 from jump import lateral_jump, lateral_jump_with_diagnostics, salvage_high_value_candidate
 from score import (
     score_connection,
@@ -4885,6 +5486,42 @@ def parse_args():
         "--jump-diagnostics",
         action="store_true",
         help="Inspect stored jump-stage attempt diagnostics from recent explorations and exit",
+    )
+    parser.add_argument(
+        "--run-jump-benchmark",
+        action="store_true",
+        help="Replay stored jump benchmark cases against the current Stage 1/Stage 2 and late-stage paths, then exit",
+    )
+    parser.add_argument(
+        "--capture-jump-benchmark",
+        type=str,
+        default=None,
+        metavar="EXPLORATION_ID:ATTEMPT_INDEX",
+        help="Capture one stored jump attempt with replay snapshot into the benchmark file, then exit",
+    )
+    parser.add_argument(
+        "--capture-strong-rejection-benchmark",
+        type=int,
+        default=None,
+        metavar="ID",
+        help="Capture one strong rejection as a benchmark replay case, then exit",
+    )
+    parser.add_argument(
+        "--benchmark-file",
+        type=str,
+        default=str(JUMP_REPLAY_BENCHMARK_DEFAULT_PATH),
+        metavar="PATH",
+        help=(
+            "Path to the jump replay benchmark JSON file "
+            f"(default: {JUMP_REPLAY_BENCHMARK_DEFAULT_PATH.name})"
+        ),
+    )
+    parser.add_argument(
+        "--benchmark-label",
+        type=str,
+        default=None,
+        metavar="LABEL",
+        help="Optional stable label/id when capturing a benchmark case",
     )
     parser.add_argument(
         "--credibility-stats",
@@ -9025,6 +9662,13 @@ def main():
             args.dismiss_strong_rejection is not None,
         ]
     )
+    benchmark_action_count = sum(
+        [
+            args.run_jump_benchmark,
+            args.capture_jump_benchmark is not None,
+            args.capture_strong_rejection_benchmark is not None,
+        ]
+    )
     scar_feedback_action_count = 1 if args.log_scar else 0
     if args.eval_limit is not None and args.eval_limit <= 0:
         print("  [!] --eval-limit requires a positive integer.")
@@ -9074,6 +9718,11 @@ def main():
             "  [!] Use only one of --strong-rejections, --strong-rejection, --replay-strong-rejection, --strong-rejection-lineage, --backfill-lineage-scars, --populate-scar-summaries, --mark-salvaged, or --dismiss-strong-rejection at a time."
         )
         sys.exit(1)
+    if benchmark_action_count > 1:
+        print(
+            "  [!] Use only one of --run-jump-benchmark, --capture-jump-benchmark, or --capture-strong-rejection-benchmark at a time."
+        )
+        sys.exit(1)
     if args.log_scar and (clean_scar_id is None) == (clean_family_id is None):
         print("  [!] --log-scar requires exactly one of --scar-id or --family-id.")
         sys.exit(1)
@@ -9115,6 +9764,34 @@ def main():
     if prediction_action_count > 0 and strong_rejection_action_count > 0:
         print(
             "  [!] Strong-rejection actions cannot be combined with prediction or audit actions."
+        )
+        sys.exit(1)
+    if benchmark_action_count > 0 and (
+        feedback_action_count > 0
+        or scar_feedback_action_count > 0
+        or prediction_action_count > 0
+        or strong_rejection_action_count > 0
+        or args.run_eval
+        or args.export
+        or args.seed is not None
+        or args.dry_run
+        or args.once
+    ):
+        print(
+            "  [!] Jump benchmark actions cannot be combined with review, prediction, strong-rejection, eval, export, seed-selection, or run-loop actions."
+        )
+        sys.exit(1)
+    if args.benchmark_label is not None and benchmark_action_count == 0:
+        print(
+            "  [!] --benchmark-label can only be used with --capture-jump-benchmark or --capture-strong-rejection-benchmark."
+        )
+        sys.exit(1)
+    if (
+        args.benchmark_file != str(JUMP_REPLAY_BENCHMARK_DEFAULT_PATH)
+        and benchmark_action_count == 0
+    ):
+        print(
+            "  [!] --benchmark-file can only be used with jump benchmark actions."
         )
         sys.exit(1)
     if args.run_eval and (
@@ -9208,6 +9885,10 @@ def main():
         ("--mark-unknown", args.mark_unknown),
         ("--strong-rejection", args.strong_rejection),
         ("--replay-strong-rejection", args.replay_strong_rejection),
+        (
+            "--capture-strong-rejection-benchmark",
+            args.capture_strong_rejection_benchmark,
+        ),
         ("--strong-rejection-lineage", args.strong_rejection_lineage),
         ("--mark-salvaged", args.mark_salvaged),
         ("--dismiss-strong-rejection", args.dismiss_strong_rejection),
@@ -9309,6 +9990,29 @@ def main():
             limit=args.limit or 20,
             prediction_id=args.evidence_prediction,
         )
+        return
+
+    if args.run_jump_benchmark:
+        if not _run_jump_benchmark(args.benchmark_file, args.threshold):
+            sys.exit(1)
+        return
+
+    if args.capture_jump_benchmark is not None:
+        if not _capture_jump_benchmark_case(
+            args.capture_jump_benchmark,
+            args.benchmark_file,
+            label=args.benchmark_label,
+        ):
+            sys.exit(1)
+        return
+
+    if args.capture_strong_rejection_benchmark is not None:
+        if not _capture_strong_rejection_benchmark_case(
+            args.capture_strong_rejection_benchmark,
+            args.benchmark_file,
+            label=args.benchmark_label,
+        ):
+            sys.exit(1)
         return
 
     if args.prediction_evidence_stats:
