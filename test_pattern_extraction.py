@@ -165,6 +165,26 @@ def test_build_jump_search_query_preserves_concrete_raw_anchor_terms() -> None:
     assert query == "queue threshold throttling latency"
 
 
+def test_build_jump_search_query_disambiguates_generic_query_with_concrete_anchor() -> None:
+    query = jump._build_jump_search_query(
+        {
+            "search_query": "channel routing threshold switching",
+            "pattern_name": "Relay-gated mismatch suppression",
+            "abstract_structure": (
+                "relay gating suppresses mismatch faults before actuator switching"
+            ),
+            "measurable_signal": "mismatch fault rate during actuator startup",
+            "control_lever": "toggle relay gating before actuator switching",
+        },
+        "Network Protocols",
+        "Technology",
+    )
+
+    assert query != "channel routing threshold switching"
+    assert "relay gating" in query
+    assert "actuator" in query
+
+
 def test_build_jump_search_queries_returns_base_query_plus_solution_variant(
     monkeypatch,
 ) -> None:
@@ -398,6 +418,8 @@ def test_stage_one_detect_prompt_prefers_solution_bearing_analogues(
 
     assert data is None
     assert failure_hint == "no_connection"
+    assert "weight concrete mechanism-bearing snippets more heavily than broad topical overlap or generic titles" in captured["prompt"]
+    assert "one concrete target-domain process, one concrete shared constraint/mechanism, and one concrete workaround or operating response in the same evidence cluster" in captured["prompt"]
     assert "concrete evidence of an already engineered workaround" in captured["prompt"]
     assert "prefer the one with the clearest retrieved workaround or mitigation evidence" in captured["prompt"]
     assert "only restate the problem, constraint, or failure mode without concrete workaround evidence" in captured["prompt"]
@@ -1232,8 +1254,11 @@ def test_lateral_jump_with_diagnostics_merges_multi_query_results_for_both_stage
     assert stage_inputs["stage2_solution_evidence"] == (
         "actuation suppression during mismatch faults is the concrete workaround"
     )
+    assert "Search result 1:" in stage_inputs["stage1"]
     assert stage_inputs["stage1"].count("Title: Shared target paper") == 1
     assert "Retrieved via: base, solution-biased" in stage_inputs["stage1"]
+    assert "URL: https://target.test/shared" in stage_inputs["stage1"]
+    assert "Snippet: shared mechanism evidence for both queries" in stage_inputs["stage1"]
     assert "Retrieved via: base" in stage_inputs["stage1"]
     assert "Retrieved via: solution-biased" in stage_inputs["stage1"]
 
