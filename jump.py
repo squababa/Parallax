@@ -136,6 +136,8 @@ Requirements:
 - Provide a falsifiable test with metric + confirm + falsify.
 - A compelling comparison is not sufficient. If you cannot tie the hypothesis to one measurable target-domain operator or operator-driven outcome, return `no_connection`.
 - `test.metric` must name one concrete measurable metric explicitly. Use a standard reported metric name where possible, and keep it specific enough that a paper table, figure, or abstract result could report it directly.
+- `test.metric` must not use generic outcome placeholders such as `performance`, `efficiency`, `quality`, `improvement`, or `stability`.
+- If you cannot ground one specific `test.metric` from retrieved evidence or the strongest target-domain snippet wording, return `no_connection` instead of writing a vague metric.
 - `prediction.observable`, `test.metric`, `test.confirm`, and `test.falsify` must all evaluate the same named target-domain operator or its direct measurable outcome, with the same primary comparator.
 - `test.confirm` and `test.falsify` must each refer to that same named metric and its explicit comparator. Do not write vague test language like "check whether the effect happens."
 - Good confirm/falsify wording names the metric directly. Examples:
@@ -150,6 +152,7 @@ Requirements:
 - The first clause of `mechanism` must open with the named target-domain process noun phrase itself, not with a consequence sentence, threshold/result summary, or broad pattern description.
 - `mechanism` must open with exactly one target-domain process noun phrase and then follow with one explicit causal chain in target-domain terms: process/operator -> control, trigger, comparator, or bottleneck variable -> resulting measurable change.
 - Open `mechanism` with the exact target-domain process noun phrase used in the strongest supporting evidence snippet, or a very close paraphrase of that wording.
+- Do not open `mechanism` with broad framing such as `In this domain`, `The system`, `This process`, or `A mechanism where`.
 - Do not bridge into the process with wording like `operates by`, `works by`, `functions by`, or `acts by` when the process noun phrase itself is already available in the target evidence.
 - Do not use generic similarity wording in `mechanism` such as `mirrors`, `is analogous to`, `resembles`, `similar to`, or `shares dynamics with`.
 - Do not rename the target-domain process into a broader abstract label. If the evidence says `offset assignment`, `mode switching`, `atrial event detection`, or `token bucket refill saturation`, start from that wording.
@@ -218,11 +221,13 @@ Requirements:
 - `edge_analysis.actionable_lever` must reuse the current mechanism, metric, or operator context. Do not write advisory phrasing like `consider`, `explore`, `may help`, `investigate`, or other non-operational wording.
 - `edge_analysis.cheap_test` must include setup, metric, confirm, falsify, and optional time_to_signal. It must be a fast realistic validation path, not a multi-month research program by default.
 - `edge_analysis.cheap_test.setup` must read like one real operator move on a narrow slice of the target-domain workflow. Name one real operator move, dataset, simulation, or measurement path, reuse the same process, comparator, and metric from `mechanism`/`prediction`/`test`, and make the setup smaller, cheaper, and more decision-facing than the main test.
-- `edge_analysis.cheap_test.metric` must stay aligned with `test.metric`; reuse the same named metric or an immediately identical wording, not a generic proxy.
+- `edge_analysis.cheap_test.metric` must stay aligned with `test.metric`; name the same measurable quantity or a narrow comparator on that same quantity, not a generic proxy.
+- `edge_analysis.cheap_test.metric` must not drift into generic validation wording or a broad proxy metric.
 - `edge_analysis.cheap_test` must not merely restate `test.data` or say to validate the hypothesis. Avoid generic wording like `run a study`, `validate the hypothesis`, `collect more data`, or `see if the effect appears`. A good cheap test sounds like replaying one queue, filtering one candidate set, toggling one threshold, auditing one failure bucket, or comparing one narrow before/after operator intervention.
 - `edge_analysis.edge_if_right` must state one concrete operator advantage if the test confirms the claim. Keep it contingent and scoped to the retrieved evidence.
 - `edge_analysis.edge_if_right` must name exactly one operator, one decision change unlocked by the cheap test, and one concrete advantage if confirmed, not just say the result would be useful.
 - `edge_analysis.edge_if_right` must say what the operator will do differently if the cheap test confirms, not just that the result has novelty or value.
+- `edge_analysis.edge_if_right` must stay concise and operator-facing, with no extra generic value framing before or after the operator decision.
 - Do not use generic novelty or value phrasing in `edge_analysis.edge_if_right` such as `this could be useful`, `this may provide an edge`, `novel insight`, or `valuable perspective`.
 - `edge_analysis.primary_operator` must name the specific operator who would use the lever.
 - `edge_analysis.why_missed` must explain one concrete search, framing, workflow, metric, or discipline-boundary reason the target-domain problem or lever may be undernoticed.
@@ -3645,6 +3650,9 @@ def _repair_guidance_for_missing_fields(
             "- Rewrite `mechanism` as one process-first sentence that opens with the exact target-domain process noun phrase, then names the operator, monitored/control variable, and resulting measurable change. Do not start with `when`, `as`, `if`, or a result summary."
         )
         guidance.append(
+            "- Do not start `mechanism` with broad framing like `In this domain`, `The system`, `This process`, or `A mechanism where`. Open with the concrete process noun phrase itself."
+        )
+        guidance.append(
             "- Preserve the original target-domain claim/process and repair only the unsupported opening or process wording. Do not drift into a different problem framing, metric, comparator, or alternate mechanism."
         )
         if missing_field_set == {"mechanism"}:
@@ -3719,9 +3727,15 @@ def _repair_guidance_for_missing_fields(
                     + "; ".join(core_reasons[:3])
                     + "."
                 )
+        guidance.append(
+            "- If you cannot ground the opening process noun phrase in current target evidence or mechanism assertions, prefer `{\"no_connection\": true}` over generic mechanism filler."
+        )
     if any(field in {"test", "test.metric"} for field in missing_fields):
         guidance.append(
-            "- Rewrite `test` so `metric` names one concrete literature-facing quantity, not placeholders like `performance`, `efficiency`, or `outcomes`. Make `confirm` and `falsify` explicitly refer to that same metric."
+            "- Rewrite `test` so `metric` names one concrete literature-facing quantity, not placeholders like `performance`, `efficiency`, `quality`, `improvement`, `stability`, or `outcomes`. Make `confirm` and `falsify` explicitly refer to that same metric."
+        )
+        guidance.append(
+            "- If you cannot ground a specific literature-facing metric from the current payload and evidence, prefer `{\"no_connection\": true}` over a vague `test.metric`."
         )
     if any(field in {"test.confirm", "test.falsify"} for field in missing_fields):
         guidance.append(
@@ -3757,6 +3771,9 @@ def _repair_guidance_for_missing_fields(
         )
         guidance.append(
             "- Reuse the same metric/comparator wording as the current `test.metric`, and make `confirm`/`falsify` name that same metric explicitly."
+        )
+        guidance.append(
+            "- Keep `edge_analysis.cheap_test.metric` on the same measurable quantity as `test.metric`; only narrow to a comparator on that same quantity, and do not drift into generic validation wording or a broad proxy metric."
         )
         if cheap_test_setup_anchor:
             guidance.append(
@@ -3813,6 +3830,9 @@ def _repair_guidance_for_missing_fields(
         guidance.append(
             "- If the rest of the candidate is already sound, complete only `edge_analysis.cheap_test` rather than rewriting unrelated fields."
         )
+        guidance.append(
+            "- If the current payload and evidence cannot support a concrete cheap-test metric on the same quantity as `test.metric`, prefer `{\"no_connection\": true}` over generic cheap-test filler."
+        )
         if edge_alignment.get("cheap_test_generic_validation"):
             guidance.append(
                 "- The current cheap test sounds like generic validation rather than an operator move. Replace wording like `validate whether`, `run a study`, or `collect more data` with a concrete replay/filter/rerank/toggle/audit action."
@@ -3837,6 +3857,9 @@ def _repair_guidance_for_missing_fields(
         )
         guidance.append(
             "- Keep the same operator, the same decision unlocked by the cheap test, and the same measured advantage family already implied by the current metric/comparator. Do not introduce a new benefit axis, stakeholder, or unrelated KPI."
+        )
+        guidance.append(
+            "- Keep `edge_analysis.edge_if_right` concise and operator-facing. If the current payload and evidence do not support one operator, one decision change, and one concrete advantage, prefer `{\"no_connection\": true}` over generic value language."
         )
         if operator_anchor:
             guidance.append(

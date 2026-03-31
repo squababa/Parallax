@@ -135,11 +135,17 @@ def test_hypothesize_prompt_has_stronger_examples() -> None:
     assert "keep variable_mapping to exactly those 3" in prompt
     assert "`mechanism` must open with exactly one target-domain process noun phrase and then follow with one explicit causal chain" in prompt
     assert "Open `mechanism` with the exact target-domain process noun phrase used in the strongest supporting evidence snippet" in prompt
+    assert "Do not open `mechanism` with broad framing such as `In this domain`, `The system`, `This process`, or `A mechanism where`." in prompt
     assert "Do not use generic similarity wording in `mechanism` such as `mirrors`, `is analogous to`, `resembles`, `similar to`, or `shares dynamics with`." in prompt
     assert "Do not bridge into the process with wording like `operates by`, `works by`, `functions by`, or `acts by`" in prompt
     assert "Do not rename the target-domain process into a broader abstract label" in prompt
+    assert "`test.metric` must not use generic outcome placeholders such as `performance`, `efficiency`, `quality`, `improvement`, or `stability`." in prompt
+    assert "If you cannot ground one specific `test.metric` from retrieved evidence or the strongest target-domain snippet wording, return `no_connection` instead of writing a vague metric." in prompt
+    assert "`edge_analysis.cheap_test.metric` must stay aligned with `test.metric`; name the same measurable quantity or a narrow comparator on that same quantity, not a generic proxy." in prompt
+    assert "`edge_analysis.cheap_test.metric` must not drift into generic validation wording or a broad proxy metric." in prompt
     assert "`edge_analysis.edge_if_right` must name exactly one operator, one decision change unlocked by the cheap test, and one concrete advantage if confirmed" in prompt
     assert "`edge_analysis.edge_if_right` must say what the operator will do differently if the cheap test confirms" in prompt
+    assert "`edge_analysis.edge_if_right` must stay concise and operator-facing, with no extra generic value framing before or after the operator decision." in prompt
     assert "Do not use generic novelty or value phrasing in `edge_analysis.edge_if_right` such as `this could be useful`, `this may provide an edge`, `novel insight`, or `valuable perspective`." in prompt
     assert "Package the edge layer like an operator handoff: one hidden problem, one concrete lever, one cheap test, and one decision change if the cheap test confirms." in prompt
     assert "Avoid analogy-heavy framing, literature-summary phrasing, and padded connective filler." in prompt
@@ -230,7 +236,9 @@ def test_build_repair_prompt_includes_targeted_guidance() -> None:
     )
 
     assert "Rewrite `mechanism` as one process-first sentence" in repair_prompt
+    assert "Do not start `mechanism` with broad framing like `In this domain`, `The system`, `This process`, or `A mechanism where`." in repair_prompt
     assert "Rewrite `test` so `metric` names one concrete literature-facing quantity" in repair_prompt
+    assert "If you cannot ground a specific literature-facing metric from the current payload and evidence, prefer `{\"no_connection\": true}` over a vague `test.metric`." in repair_prompt
     assert "Rewrite `test.confirm` and `test.falsify` so each sentence literally names the same metric used in `test.metric`" in repair_prompt
     assert "Rewrite `edge_analysis.problem_statement` so it names one specific hidden target-domain failure mode" in repair_prompt
     assert "Tie `edge_analysis.problem_statement` to one concrete operator decision or one concrete failure mode already implied by the current claim, metric, or comparator." in repair_prompt
@@ -238,6 +246,9 @@ def test_build_repair_prompt_includes_targeted_guidance() -> None:
     assert "design choice" in repair_prompt
     assert "Rewrite `edge_analysis.edge_if_right` so it states one concrete operator gain" in repair_prompt
     assert "State what the operator will do differently if the cheap test confirms." in repair_prompt
+    assert "If you cannot ground the opening process noun phrase in current target evidence or mechanism assertions, prefer `{\"no_connection\": true}` over generic mechanism filler." in repair_prompt
+    assert "Keep `edge_analysis.edge_if_right` concise and operator-facing." in repair_prompt
+    assert "prefer `{\"no_connection\": true}` over generic value language." in repair_prompt
     assert "Rewrite `edge_analysis.why_missed` so it names one concrete search, framing, workflow, metric, or discipline-boundary reason" in repair_prompt
     assert "Rewrite `edge_analysis.expected_asymmetry` so it explains why the lever is plausibly underused rather than already standard target-domain wisdom" in repair_prompt
     assert "Rewrite the first 3 `evidence_map.variable_mappings` entries so each `evidence_snippet` is at least one self-contained technical sentence or clause" in repair_prompt
@@ -692,12 +703,15 @@ def test_build_repair_prompt_targets_usefulness_alignment_bottleneck() -> None:
     assert "Reuse the existing confirm-side comparator language instead of paraphrasing it" in repair_prompt
     assert "Reuse the existing falsify-side decision language" in repair_prompt
     assert "Keep `edge_analysis.cheap_test.metric` identical to `test.metric`" in repair_prompt
+    assert "Keep `edge_analysis.cheap_test.metric` on the same measurable quantity as `test.metric`" in repair_prompt
+    assert "do not drift into generic validation wording or a broad proxy metric." in repair_prompt
     assert "Rewrite `edge_analysis.cheap_test` so it includes `setup`, `metric`, `confirm`, `falsify`, and optional `time_to_signal`" in repair_prompt
     assert "Preserve the same current mechanism, target-domain process, operator decision, and target claim already grounded elsewhere in the payload." in repair_prompt
     assert "Reuse the existing `test.confirm` comparator wording as closely as possible" in repair_prompt
     assert "Reuse the existing `test.falsify` decision wording as closely as possible" in repair_prompt
     assert "Make `setup` one concrete operator move, replay, simulation, filter, audit, or measurement path" in repair_prompt
     assert "If the rest of the candidate is already sound, complete only `edge_analysis.cheap_test` rather than rewriting unrelated fields." in repair_prompt
+    assert "If the current payload and evidence cannot support a concrete cheap-test metric on the same quantity as `test.metric`, prefer `{\"no_connection\": true}` over generic cheap-test filler." in repair_prompt
     assert "Keep the same operator, the same decision unlocked by the cheap test, and the same measured advantage family already implied by the current metric/comparator." in repair_prompt
     assert "The current cheap test sounds like generic validation rather than an operator move." in repair_prompt
 
