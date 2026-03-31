@@ -566,6 +566,11 @@ def _parse_report_only_args():
         default=None,
     )
     parser.add_argument(
+        "--benchmark-case",
+        action="append",
+        default=None,
+    )
+    parser.add_argument(
         "--grade-transmission",
         type=int,
         default=None,
@@ -867,6 +872,55 @@ def _configure_benchmark_llm_env(args) -> dict | None:
         "model": model,
         "base_url": base_url,
     }
+
+
+def _benchmark_case_filters(args) -> list[str]:
+    """Normalize any requested benchmark case filters."""
+    raw_filters = getattr(args, "benchmark_case", None)
+    if not raw_filters:
+        return []
+    if isinstance(raw_filters, str):
+        raw_filters = [raw_filters]
+    normalized: list[str] = []
+    for item in raw_filters:
+        clean = str(item or "").strip()
+        if clean:
+            normalized.append(clean)
+    return normalized
+
+
+def _benchmark_max_clusters() -> int:
+    """Return how many candidate clusters to keep during jump replay."""
+    raw = str(os.getenv("BLACKCLAW_BENCHMARK_MAX_CLUSTERS", "4")).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 4
+    return max(0, value)
+
+
+def _truncate_benchmark_search_results(search_results: str, max_clusters: int) -> str:
+    """Keep only the first N candidate clusters from benchmark replay text."""
+    clean = str(search_results or "").strip()
+    if not clean or max_clusters <= 0:
+        return clean
+
+    cluster_starts = list(re.finditer(r"(?m)^Candidate cluster \d+:", clean))
+    if len(cluster_starts) <= max_clusters:
+        return clean
+
+    kept_blocks: list[str] = []
+    for index, match in enumerate(cluster_starts[:max_clusters]):
+        start = match.start()
+        end = (
+            cluster_starts[index + 1].start()
+            if index + 1 < len(cluster_starts)
+            else len(clean)
+        )
+        block = clean[start:end].strip()
+        if block:
+            kept_blocks.append(block)
+    return "\n\n".join(kept_blocks).strip()
 
 
 def _print_rut_report(report: dict):
@@ -2082,7 +2136,10 @@ def _run_jump_attempt_benchmark_case(case: dict) -> dict:
     """Replay one stored jump-attempt case against current Stage 1/Stage 2 code."""
     source_domain = _clean_inline_text(case.get("source_domain")) or "Unknown"
     abstract_structure = _clean_inline_text(case.get("abstract_structure")) or ""
-    search_results = str(case.get("search_results") or "").strip()
+    search_results = _truncate_benchmark_search_results(
+        case.get("search_results") or "",
+        _benchmark_max_clusters(),
+    )
     expected = case.get("expected") if isinstance(case.get("expected"), dict) else {}
     if not abstract_structure or not search_results:
         return {
@@ -2098,6 +2155,16 @@ def _run_jump_attempt_benchmark_case(case: dict) -> dict:
         search_results=search_results,
     )
     if stage_one is None:
+        if str(stage_one_failure_hint or "").strip() == "generation_failed":
+            return {
+                "type": "jump_attempt",
+                "case_id": case.get("id"),
+                "label": case.get("label"),
+                "status": "ERROR",
+                "message": "stage1_detect generation failed during benchmark replay",
+                "actual_stage1_failure_hint": stage_one_failure_hint,
+                "pattern_name": _clean_inline_text(case.get("pattern_name")),
+            }
         actual_stage1_outcome = (
             "detect_no_signal"
             if stage_one_failure_hint in ("no_connection", "missing_solution_evidence")
@@ -2120,6 +2187,18 @@ def _run_jump_attempt_benchmark_case(case: dict) -> dict:
             )
         )
         if stage_two_data is None:
+            if str(stage_two_failure_hint or "").strip() == "generation_failed":
+                return {
+                    "type": "jump_attempt",
+                    "case_id": case.get("id"),
+                    "label": case.get("label"),
+                    "status": "ERROR",
+                    "message": "stage2_hypothesize generation failed during benchmark replay",
+                    "actual_stage1_outcome": actual_stage1_outcome,
+                    "actual_stage1_target_domain": actual_stage1_target_domain,
+                    "actual_stage2_failure_hint": stage_two_failure_hint,
+                    "pattern_name": _clean_inline_text(case.get("pattern_name")),
+                }
             actual_stage2_outcome = "stage2_no_connection"
             actual_stage2_failure_hint = stage_two_failure_hint or "returned_no_connection"
             actual_stage2_incomplete_fields = [
@@ -2193,15 +2272,24 @@ def _run_strong_rejection_benchmark_case(case: dict, threshold: float) -> dict:
 
     row = context["row"]
     replay_context = _strong_rejection_replay_context(row)
-    candidate = _evaluate_connection_candidate(
-        score_label=f"StrongRejection Replay #{rejection_id}",
-        source_domain=_clean_inline_text(context.get("source_domain")) or "Unknown",
-        target_domain=_clean_inline_text(context.get("target_domain")) or "Unknown",
-        patterns_payload=context.get("patterns_payload") or [],
-        connection=context["connection"],
-        threshold=float(threshold),
-        replay_context=replay_context,
-    )
+    try:
+        candidate = _evaluate_connection_candidate(
+            score_label=f"StrongRejection Replay #{rejection_id}",
+            source_domain=_clean_inline_text(context.get("source_domain")) or "Unknown",
+            target_domain=_clean_inline_text(context.get("target_domain")) or "Unknown",
+            patterns_payload=context.get("patterns_payload") or [],
+            connection=context["connection"],
+            threshold=float(threshold),
+            replay_context=replay_context,
+        )
+    except Exception as exc:
+        return {
+            "type": "strong_rejection",
+            "case_id": case.get("id"),
+            "label": case.get("label"),
+            "status": "ERROR",
+            "message": f"late-stage replay failed: {exc}",
+        }
     actual_verdict = _strong_rejection_replay_verdict(candidate)
     expected = case.get("expected") if isinstance(case.get("expected"), dict) else {}
     expected_verdict = str(expected.get("verdict") or "").strip() or None
@@ -2233,6 +2321,7 @@ def _run_strong_rejection_benchmark_case(case: dict, threshold: float) -> dict:
 def _run_jump_benchmark(
     benchmark_file: str | Path,
     threshold: float | None,
+    case_filters: list[str] | None = None,
 ) -> bool:
     """Run the stored jump benchmark cases against the current pipeline."""
     threshold_value = _resolve_diagnostic_threshold(threshold)
@@ -2244,6 +2333,22 @@ def _run_jump_benchmark(
     if not cases:
         print(f"[JumpBenchmark] No cases found in {Path(benchmark_file)}.")
         return False
+
+    selected_filters = [str(item).strip() for item in (case_filters or []) if str(item).strip()]
+    if selected_filters:
+        normalized_filters = {item.casefold() for item in selected_filters}
+        cases = [
+            case
+            for case in cases
+            if str(case.get("id") or "").strip().casefold() in normalized_filters
+            or str(case.get("label") or "").strip().casefold() in normalized_filters
+        ]
+        if not cases:
+            print(
+                "[JumpBenchmark] No cases matched filters: "
+                + ", ".join(selected_filters)
+            )
+            return False
 
     print(f"[JumpBenchmark] Running {len(cases)} case(s) from {Path(benchmark_file)}")
     counts = {"MATCH": 0, "IMPROVED": 0, "REGRESSED": 0, "ERROR": 0}
@@ -5019,6 +5124,9 @@ if __name__ == "__main__":
             "  [!] --benchmark-label can only be used with jump benchmark capture actions."
         )
         sys.exit(1)
+    if _benchmark_case_filters(_early_report_args) and not _early_report_args.run_jump_benchmark:
+        print("  [!] --benchmark-case can only be used with --run-jump-benchmark.")
+        sys.exit(1)
     if (
         _early_report_args.evidence_prediction is not None
         and not _early_report_args.prediction_evidence
@@ -5576,6 +5684,13 @@ def parse_args():
         default=None,
         metavar="LABEL",
         help="Optional stable label/id when capturing a benchmark case",
+    )
+    parser.add_argument(
+        "--benchmark-case",
+        action="append",
+        default=None,
+        metavar="CASE_ID_OR_LABEL",
+        help="Run only the selected benchmark case id/label; repeatable with --run-jump-benchmark",
     )
     parser.add_argument(
         "--credibility-stats",
@@ -9840,6 +9955,9 @@ def main():
             "  [!] --benchmark-label can only be used with --capture-jump-benchmark or --capture-strong-rejection-benchmark."
         )
         sys.exit(1)
+    if _benchmark_case_filters(args) and not args.run_jump_benchmark:
+        print("  [!] --benchmark-case can only be used with --run-jump-benchmark.")
+        sys.exit(1)
     if (
         args.benchmark_file != str(JUMP_REPLAY_BENCHMARK_DEFAULT_PATH)
         and benchmark_action_count == 0
@@ -10047,7 +10165,11 @@ def main():
         return
 
     if args.run_jump_benchmark:
-        if not _run_jump_benchmark(args.benchmark_file, args.threshold):
+        if not _run_jump_benchmark(
+            args.benchmark_file,
+            args.threshold,
+            case_filters=_benchmark_case_filters(args),
+        ):
             sys.exit(1)
         return
 

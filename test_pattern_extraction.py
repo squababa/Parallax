@@ -2789,6 +2789,142 @@ def test_configure_benchmark_llm_env_respects_custom_local_model(monkeypatch) ->
     assert os.environ["OLLAMA_BASE_URL"] == "http://localhost:22434"
 
 
+def test_truncate_benchmark_search_results_keeps_first_clusters() -> None:
+    search_results = (
+        "Candidate cluster 1:\nTitle: one\n\n"
+        "Candidate cluster 2:\nTitle: two\n\n"
+        "Candidate cluster 3:\nTitle: three"
+    )
+
+    truncated = main._truncate_benchmark_search_results(search_results, 2)
+
+    assert "Candidate cluster 1:" in truncated
+    assert "Candidate cluster 2:" in truncated
+    assert "Candidate cluster 3:" not in truncated
+
+
+def test_run_jump_benchmark_marks_generation_failure_as_error(
+    tmp_path,
+    capsys,
+    monkeypatch,
+) -> None:
+    benchmark_file = tmp_path / "jump_replay_benchmark.json"
+    benchmark_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "cases": [
+                    {
+                        "id": "jump-case-timeout",
+                        "label": "jump timeout",
+                        "type": "jump_attempt",
+                        "source_domain": "Network Protocols",
+                        "pattern_name": "Queue-threshold congestion gating",
+                        "abstract_structure": "load compared against a queue threshold",
+                        "search_results": "Candidate cluster 1:\nTitle: Wireless scheduling paper",
+                        "expected": {
+                            "stage1_outcome": "detect_signal",
+                            "stage2_outcome": "connection_found",
+                        },
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        main.jump_module,
+        "_stage_one_detect_with_diagnostics",
+        lambda **_kwargs: (
+            {
+                "target_domain": "Wireless Scheduling",
+                "signal": "shared structural signal",
+                "evidence": "specific evidence",
+                "solution_evidence": "threshold gate lowers collision pressure",
+            },
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        main.jump_module,
+        "_stage_two_hypothesize_with_diagnostics",
+        lambda **_kwargs: (None, "generation_failed", None),
+    )
+
+    assert main._run_jump_benchmark(benchmark_file, 0.6) is False
+    output = capsys.readouterr().out
+    assert "ERROR\tjump_attempt\tjump-case-timeout" in output
+    assert "stage2_hypothesize generation failed during benchmark replay" in output
+
+
+def test_run_jump_benchmark_can_filter_single_case(tmp_path, capsys, monkeypatch) -> None:
+    benchmark_file = tmp_path / "jump_replay_benchmark.json"
+    benchmark_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "cases": [
+                    {
+                        "id": "jump-case-1",
+                        "label": "jump case 1",
+                        "type": "jump_attempt",
+                        "source_domain": "Network Protocols",
+                        "pattern_name": "Queue-threshold congestion gating",
+                        "abstract_structure": "load compared against a queue threshold",
+                        "search_results": "Candidate cluster 1:\nTitle: Wireless scheduling paper",
+                        "expected": {
+                            "stage1_outcome": "detect_signal",
+                            "stage2_outcome": "stage2_no_connection",
+                        },
+                    },
+                    {
+                        "id": "strong-case-1",
+                        "label": "strong case 1",
+                        "type": "strong_rejection",
+                        "strong_rejection_id": 12,
+                        "expected": {"verdict": "still fail"},
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        main.jump_module,
+        "_stage_one_detect_with_diagnostics",
+        lambda **_kwargs: (
+            {
+                "target_domain": "Wireless Scheduling",
+                "signal": "shared structural signal",
+                "evidence": "specific evidence",
+                "solution_evidence": "threshold gate lowers collision pressure",
+            },
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        main.jump_module,
+        "_stage_two_hypothesize_with_diagnostics",
+        lambda **_kwargs: (
+            {"target_domain": "Wireless Scheduling"},
+            None,
+            None,
+        ),
+    )
+
+    assert main._run_jump_benchmark(
+        benchmark_file,
+        0.6,
+        case_filters=["jump-case-1"],
+    ) is True
+    output = capsys.readouterr().out
+    assert "[JumpBenchmark] Running 1 case(s)" in output
+    assert "jump-case-1" in output
+    assert "strong-case-1" not in output
+
+
 def test_run_jump_benchmark_marks_jump_case_improved(tmp_path, capsys, monkeypatch) -> None:
     benchmark_file = tmp_path / "jump_replay_benchmark.json"
     benchmark_file.write_text(
