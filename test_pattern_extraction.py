@@ -2762,10 +2762,18 @@ def test_configure_benchmark_llm_env_forces_local_qwen(monkeypatch) -> None:
         "provider": "ollama",
         "model": "qwen3:8b",
         "base_url": "http://localhost:11434",
+        "timeout_s": "300",
+        "stage2_max_output_tokens": "2048",
+        "repair_max_output_tokens": "2048",
+        "disable_retry": "1",
     }
     assert os.environ["LOCAL_LLM_ONLY"] == "1"
     assert os.environ["LLM_PROVIDER"] == "ollama"
     assert os.environ["BLACKCLAW_MODEL"] == "qwen3:8b"
+    assert os.environ["OLLAMA_REQUEST_TIMEOUT_S"] == "300"
+    assert os.environ["BLACKCLAW_JUMP_STAGE2_MAX_OUTPUT_TOKENS"] == "2048"
+    assert os.environ["BLACKCLAW_JUMP_REPAIR_MAX_OUTPUT_TOKENS"] == "2048"
+    assert os.environ["BLACKCLAW_JUMP_DISABLE_JSON_RETRY"] == "1"
 
 
 def test_configure_benchmark_llm_env_respects_custom_local_model(monkeypatch) -> None:
@@ -2784,9 +2792,54 @@ def test_configure_benchmark_llm_env_respects_custom_local_model(monkeypatch) ->
         "provider": "ollama",
         "model": "qwen2.5:14b",
         "base_url": "http://localhost:22434",
+        "timeout_s": "300",
+        "stage2_max_output_tokens": "2048",
+        "repair_max_output_tokens": "2048",
+        "disable_retry": "1",
     }
     assert os.environ["BLACKCLAW_MODEL"] == "qwen2.5:14b"
     assert os.environ["OLLAMA_BASE_URL"] == "http://localhost:22434"
+
+
+def test_generate_json_with_retry_respects_stage2_output_budget(monkeypatch) -> None:
+    calls = []
+
+    class _CaptureClient:
+        def generate_content(self, prompt, generation_config=None):
+            calls.append(generation_config or {})
+            return types.SimpleNamespace(text='{"ok": true}')
+
+    monkeypatch.setenv("BLACKCLAW_JUMP_STAGE2_MAX_OUTPUT_TOKENS", "1234")
+    monkeypatch.delenv("BLACKCLAW_JUMP_DISABLE_JSON_RETRY", raising=False)
+    monkeypatch.setattr(jump, "_llm_client", _CaptureClient())
+    monkeypatch.setattr(jump, "check_llm_output", lambda text: text)
+    monkeypatch.setattr(jump, "log_gemini_output", lambda *args, **kwargs: None)
+    monkeypatch.setattr(jump, "increment_llm_calls", lambda *_args, **_kwargs: None)
+
+    extracted = jump._generate_json_with_retry("prompt", "stage2_hypothesize", 4096)
+
+    assert extracted == '{"ok": true}'
+    assert calls[0]["max_output_tokens"] == 1234
+
+
+def test_generate_json_with_retry_can_disable_retry(monkeypatch) -> None:
+    calls = []
+
+    class _CaptureClient:
+        def generate_content(self, prompt, generation_config=None):
+            calls.append(generation_config or {})
+            return types.SimpleNamespace(text="not json")
+
+    monkeypatch.setenv("BLACKCLAW_JUMP_DISABLE_JSON_RETRY", "1")
+    monkeypatch.setattr(jump, "_llm_client", _CaptureClient())
+    monkeypatch.setattr(jump, "check_llm_output", lambda text: text)
+    monkeypatch.setattr(jump, "log_gemini_output", lambda *args, **kwargs: None)
+    monkeypatch.setattr(jump, "increment_llm_calls", lambda *_args, **_kwargs: None)
+
+    extracted = jump._generate_json_with_retry("prompt", "stage2_hypothesize", 4096)
+
+    assert extracted is None
+    assert len(calls) == 1
 
 
 def test_truncate_benchmark_search_results_keeps_first_clusters() -> None:

@@ -6,6 +6,7 @@ Two-stage process:
 """
 import copy
 import json
+import os
 import re
 from urllib.parse import urlparse
 from tavily import TavilyClient
@@ -1916,11 +1917,28 @@ def _extract_json_substring(text: str) -> str | None:
 
 def _generate_json_with_retry(full_prompt: str, stage: str, max_output_tokens: int) -> str | None:
     """Generate JSON with one retry if parsing fails."""
+    env_key = {
+        "stage1_detect": "BLACKCLAW_JUMP_STAGE1_MAX_OUTPUT_TOKENS",
+        "stage2_hypothesize": "BLACKCLAW_JUMP_STAGE2_MAX_OUTPUT_TOKENS",
+    }.get(str(stage or "").strip())
+    effective_max_output_tokens = max_output_tokens
+    if env_key:
+        raw_override = str(os.getenv(env_key, "")).strip()
+        if raw_override:
+            try:
+                parsed_override = int(raw_override)
+            except ValueError:
+                parsed_override = max_output_tokens
+            if parsed_override > 0:
+                effective_max_output_tokens = parsed_override
+    disable_retry = str(
+        os.getenv("BLACKCLAW_JUMP_DISABLE_JSON_RETRY", "")
+    ).strip().lower() in {"1", "true", "yes", "on"}
     try:
         response = _llm_client.generate_content(
             full_prompt,
             generation_config={
-                "max_output_tokens": max_output_tokens,
+                "max_output_tokens": effective_max_output_tokens,
                 "response_mime_type": "application/json",
             },
         )
@@ -1934,12 +1952,14 @@ def _generate_json_with_retry(full_prompt: str, stage: str, max_output_tokens: i
         extracted = _extract_json_substring(checked)
         if extracted is not None:
             return extracted
+        if disable_retry:
+            return None
 
         retry_prompt = f"{JSON_RETRY_PROMPT}\n\n{full_prompt}"
         retry_response = _llm_client.generate_content(
             retry_prompt,
             generation_config={
-                "max_output_tokens": max_output_tokens,
+                "max_output_tokens": effective_max_output_tokens,
                 "response_mime_type": "application/json",
             },
         )
@@ -4237,11 +4257,20 @@ def _repair_missing_fields(
         missing_fields,
         original_data=original_data,
     )
+    repair_max_output_tokens = 4096
+    raw_override = str(os.getenv("BLACKCLAW_JUMP_REPAIR_MAX_OUTPUT_TOKENS", "")).strip()
+    if raw_override:
+        try:
+            parsed_override = int(raw_override)
+        except ValueError:
+            parsed_override = 4096
+        if parsed_override > 0:
+            repair_max_output_tokens = parsed_override
     try:
         response = _llm_client.generate_content(
             repair_prompt,
             generation_config={
-                "max_output_tokens": 4096,
+                "max_output_tokens": repair_max_output_tokens,
                 "response_mime_type": "application/json",
             },
         )

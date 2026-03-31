@@ -861,16 +861,40 @@ def _configure_benchmark_llm_env(args) -> dict | None:
         ).strip()
         or "http://localhost:11434"
     )
+    timeout_s = (
+        str(os.getenv("BLACKCLAW_BENCHMARK_OLLAMA_TIMEOUT_S", "300")).strip()
+        or "300"
+    )
+    stage2_max_output_tokens = (
+        str(os.getenv("BLACKCLAW_BENCHMARK_STAGE2_MAX_OUTPUT_TOKENS", "2048")).strip()
+        or "2048"
+    )
+    repair_max_output_tokens = (
+        str(os.getenv("BLACKCLAW_BENCHMARK_REPAIR_MAX_OUTPUT_TOKENS", "2048")).strip()
+        or "2048"
+    )
+    disable_retry = (
+        str(os.getenv("BLACKCLAW_BENCHMARK_DISABLE_JSON_RETRY", "1")).strip()
+        or "1"
+    )
 
     os.environ["LOCAL_LLM_ONLY"] = "1"
     os.environ["LLM_PROVIDER"] = provider
     os.environ["BLACKCLAW_MODEL"] = model
     os.environ["OLLAMA_BASE_URL"] = base_url
+    os.environ["OLLAMA_REQUEST_TIMEOUT_S"] = timeout_s
+    os.environ["BLACKCLAW_JUMP_STAGE2_MAX_OUTPUT_TOKENS"] = stage2_max_output_tokens
+    os.environ["BLACKCLAW_JUMP_REPAIR_MAX_OUTPUT_TOKENS"] = repair_max_output_tokens
+    os.environ["BLACKCLAW_JUMP_DISABLE_JSON_RETRY"] = disable_retry
 
     return {
         "provider": provider,
         "model": model,
         "base_url": base_url,
+        "timeout_s": timeout_s,
+        "stage2_max_output_tokens": stage2_max_output_tokens,
+        "repair_max_output_tokens": repair_max_output_tokens,
+        "disable_retry": disable_retry,
     }
 
 
