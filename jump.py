@@ -2720,6 +2720,15 @@ def _repair_guidance_for_missing_fields(
     cheap_test_metric_anchor = str(cheap_test_payload.get("metric") or "").strip()
     cheap_test_confirm_anchor = str(cheap_test_payload.get("confirm") or "").strip()
     cheap_test_falsify_anchor = str(cheap_test_payload.get("falsify") or "").strip()
+    problem_statement_anchor = str(normalized_edge.get("problem_statement") or "").strip()
+    lever_anchor = str(normalized_edge.get("actionable_lever") or "").strip()
+    edge_if_right_anchor = str(normalized_edge.get("edge_if_right") or "").strip()
+    operator_anchor = str(normalized_edge.get("primary_operator") or "").strip()
+    solution_evidence_anchor = (
+        str(original_data.get("solution_evidence") or "").strip()
+        if isinstance(original_data, dict)
+        else ""
+    )
     target_evidence_anchor = str(core_target_anchor.get("evidence_snippet") or "").strip()
     target_evidence_source = str(core_target_anchor.get("source_reference") or "").strip()
     if not target_evidence_anchor:
@@ -2807,8 +2816,6 @@ def _repair_guidance_for_missing_fields(
         guidance.append(
             "- Treat this as a repair-quality pass, not a reframing pass. Preserve the original target-domain claim and evidence grounding instead of drifting to a different problem, mechanism, metric, comparator, or stakeholder."
         )
-        lever_anchor = str(normalized_edge.get("actionable_lever") or "").strip()
-        operator_anchor = str(normalized_edge.get("primary_operator") or "").strip()
         if metric_anchor:
             guidance.append(
                 f"- Keep the edge layer tied to the current core metric: `{metric_anchor}`."
@@ -2835,6 +2842,119 @@ def _repair_guidance_for_missing_fields(
             )
         guidance.append(
             "- Prefer light-touch edge rewrites that reuse the same observable noun phrase, metric name, and comparison wording already present in `prediction` and `test`."
+        )
+    if {"edge_analysis.actionable_lever", "edge_analysis.cheap_test"}.issubset(
+        missing_field_set
+    ):
+        guidance.append(
+            "- Treat `edge_analysis.actionable_lever` + `edge_analysis.cheap_test` as one coordinated operator package. The lever should name the operator move, and the cheap test should be the cheapest grounded way to try, replay, filter, or audit that same move on the same workflow slice."
+        )
+        guidance.append(
+            "- Complete or tighten the lever and cheap test together around one shared mechanism, operator decision, metric, comparator, and workflow context. Do not let the lever describe one move while the cheap test evaluates a different intervention."
+        )
+        if lever_anchor:
+            guidance.append(
+                f"- Preserve the current grounded lever wording if usable and make the cheap test the smallest check of that same move: `{lever_anchor}`."
+            )
+        if cheap_test_setup_anchor:
+            guidance.append(
+                f"- Preserve the current grounded cheap-test move if usable and make `edge_analysis.actionable_lever` name that same move directly: `{cheap_test_setup_anchor}`."
+            )
+        if current_mechanism:
+            guidance.append(
+                f"- Keep the lever/test package tied to the current mechanism wording: `{current_mechanism}`."
+            )
+        if metric_anchor:
+            guidance.append(
+                f"- Keep both fields tied to the current metric and decision boundary: `{metric_anchor}`."
+            )
+        if solution_evidence_anchor:
+            guidance.append(
+                f"- Reuse the current workaround or operating-response anchor instead of inventing a different intervention: `{solution_evidence_anchor}`."
+            )
+        guidance.append(
+            "- If the current payload and evidence do not support both the lever and cheap test as one grounded operator package, return `{\"no_connection\": true}` instead of fabricating the missing half."
+        )
+    if {"test.confirm", "test.falsify"}.issubset(missing_field_set):
+        guidance.append(
+            "- Treat `test.confirm` + `test.falsify` as one coordinated decision-boundary pair. Rewrite them together so both sentences use the same `test.metric`, the same comparator or direction, and opposite outcomes for the same operator decision."
+        )
+        guidance.append(
+            "- Make `test.confirm` the positive side of the boundary and `test.falsify` the kill condition for that exact same metric/comparator pair. Do not let them drift to different metrics, baselines, or failure criteria."
+        )
+        if metric_anchor:
+            guidance.append(
+                f"- Keep the confirm/falsify pair tied to the current metric wording: `{metric_anchor}`."
+            )
+        if confirm_anchor:
+            guidance.append(
+                f"- Preserve any usable confirm-side comparator wording already present: `{confirm_anchor}`."
+            )
+        if falsify_anchor:
+            guidance.append(
+                f"- Preserve any usable falsify-side decision wording already present: `{falsify_anchor}`."
+            )
+        guidance.append(
+            "- If you cannot support both sides of the same metric boundary from the current payload and evidence, prefer `{\"no_connection\": true}` over unsupported confirm/falsify wording."
+        )
+    if {
+        "test.confirm",
+        "test.falsify",
+        "edge_analysis.actionable_lever",
+        "edge_analysis.cheap_test",
+    }.issubset(missing_field_set):
+        guidance.append(
+            "- Treat `test.confirm` + `test.falsify` + `edge_analysis.actionable_lever` + `edge_analysis.cheap_test` as one coordinated operator-metric package: one operator move, one cheap check of that move, and one shared metric boundary repeated consistently across all four fields."
+        )
+        guidance.append(
+            "- Preserve any grounded pieces already present and complete only the missing coupled fields. Do not rewrite `mechanism`, `prediction`, or unrelated evidence when the current grounded core is already usable."
+        )
+        if operator_anchor:
+            guidance.append(
+                f"- Keep the full operator-metric package tied to the current operator: `{operator_anchor}`."
+            )
+        if lever_anchor:
+            guidance.append(
+                f"- Keep the package centered on the current operator move where possible: `{lever_anchor}`."
+            )
+        if cheap_test_setup_anchor:
+            guidance.append(
+                f"- Keep the cheap-test portion centered on the current workflow move where possible: `{cheap_test_setup_anchor}`."
+            )
+        if metric_anchor:
+            guidance.append(
+                f"- Keep all four fields on the same metric/comparator boundary: `{metric_anchor}`."
+            )
+        guidance.append(
+            "- If the current payload and evidence cannot support all four fields as the same operator-metric package, return `{\"no_connection\": true}` instead of mixing partial guesses from different stories."
+        )
+    if {
+        "edge_analysis.problem_statement",
+        "edge_analysis.edge_if_right",
+    }.issubset(missing_field_set) and (
+        lever_anchor
+        or cheap_test_setup_anchor
+        or cheap_test_metric_anchor
+        or cheap_test_confirm_anchor
+        or operator_anchor
+        or metric_anchor
+    ):
+        guidance.append(
+            "- Treat `edge_analysis.problem_statement` + `edge_analysis.edge_if_right` as one coordinated operator-consequence package around the existing lever / cheap-test core. The problem should name the hidden miss on the current metric, and `edge_if_right` should say what that same operator does differently if the current cheap test confirms."
+        )
+        guidance.append(
+            "- Reuse the current operator, lever, cheap-test, metric, and comparator anchors rather than inventing a new workflow, stakeholder, or advantage axis for these two fields."
+        )
+        if problem_statement_anchor:
+            guidance.append(
+                f"- Preserve any grounded problem wording already present and tighten only what is generic: `{problem_statement_anchor}`."
+            )
+        if edge_if_right_anchor:
+            guidance.append(
+                f"- Preserve any grounded operator-advantage wording already present and keep it tied to the same operator decision: `{edge_if_right_anchor}`."
+            )
+        guidance.append(
+            "- If the existing operator/cheap-test core does not support both the hidden problem and the operator consequence cleanly, return `{\"no_connection\": true}` instead of inventing a broader story."
         )
     if any(field == "mechanism" for field in missing_fields):
         guidance.append(
@@ -3067,6 +3187,45 @@ def _repair_guidance_for_missing_fields(
             )
             guidance.append(
                 "- If only this field is missing, prefer returning only `{\"evidence_map\": {\"variable_mappings\": [...]}}` instead of rewriting the full candidate."
+            )
+        if (
+            current_mechanism
+            or mechanism_claim_anchor
+            or metric_anchor
+            or observable_anchor
+            or lever_anchor
+            or cheap_test_setup_anchor
+        ):
+            guidance.append(
+                "- Treat `evidence_map.variable_mappings` as one coordinated mapping package for the current mechanism/operator/metric story, not as permission to invent a broader remap."
+            )
+            guidance.append(
+                "- Reuse the existing mechanism, target-domain process, operator move, observable, metric, comparator, and strongest current target evidence when rewriting the first 3 critical mappings."
+            )
+            if current_mechanism:
+                guidance.append(
+                    f"- Keep the mapping package tied to the current mechanism wording: `{current_mechanism}`."
+                )
+            if lever_anchor:
+                guidance.append(
+                    f"- Keep the mapping package tied to the current operator move where relevant: `{lever_anchor}`."
+                )
+            if metric_anchor:
+                guidance.append(
+                    f"- Keep the mapping package tied to the current metric/comparator story: `{metric_anchor}`."
+                )
+            if target_evidence_anchor:
+                guidance.append(
+                    "- Use the current strongest target-domain evidence as the default remap anchor instead of broadening the claim: "
+                    f"`{target_evidence_anchor}`"
+                    + (f" (source: `{target_evidence_source}`)." if target_evidence_source else ".")
+                )
+            if solution_evidence_anchor:
+                guidance.append(
+                    f"- Reuse the current workaround/solution anchor where it already supports the remap: `{solution_evidence_anchor}`."
+                )
+            guidance.append(
+                "- If the current grounded mechanism/operator/metric core still cannot support 3 critical mappings directly, return `{\"no_connection\": true}` instead of broadening the claim or inventing extra mapped variables."
             )
         guidance.append(
             "- Rewrite the first 3 `evidence_map.variable_mappings` entries so each `evidence_snippet` is at least one self-contained technical sentence or clause with concrete overlapping terms from the claim or mapped variable. Do not use vague background snippets."
@@ -3548,11 +3707,20 @@ def _stage_two_hypothesize_with_diagnostics(
     data = _apply_normalized_mechanism_typing(data)
     missing_fields = _missing_required_fields(data)
     if missing_fields:
+        repair_original_data = data
+        stage_one_solution_evidence = str(stage_one.get("solution_evidence") or "").strip()
+        if stage_one_solution_evidence and not str(
+            data.get("solution_evidence") or ""
+        ).strip():
+            repair_original_data = {
+                **data,
+                "solution_evidence": stage_one_solution_evidence,
+            }
         repaired = _repair_missing_fields(
             prompt,
             extracted_json,
             missing_fields,
-            original_data=data,
+            original_data=repair_original_data,
         )
         if repaired is None or repaired.get("no_connection", True):
             return None, "repair_failed", None

@@ -694,6 +694,39 @@ def test_build_repair_prompt_targets_usefulness_alignment_bottleneck() -> None:
     assert "The current cheap test sounds like generic validation rather than an operator move." in repair_prompt
 
 
+def test_build_repair_prompt_treats_lever_and_cheap_test_as_one_operator_package() -> None:
+    payload = _valid_stage2_payload()
+
+    repair_prompt = jump._build_repair_prompt(
+        "full prompt",
+        json.dumps(payload),
+        ["edge_analysis.actionable_lever", "edge_analysis.cheap_test"],
+        original_data=payload,
+    )
+
+    assert "Treat `edge_analysis.actionable_lever` + `edge_analysis.cheap_test` as one coordinated operator package." in repair_prompt
+    assert "Complete or tighten the lever and cheap test together around one shared mechanism, operator decision, metric, comparator, and workflow context." in repair_prompt
+    assert "Preserve the current grounded lever wording if usable and make the cheap test the smallest check of that same move" in repair_prompt
+    assert "Keep both fields tied to the current metric and decision boundary" in repair_prompt
+    assert "If the current payload and evidence do not support both the lever and cheap test as one grounded operator package, return `{\"no_connection\": true}` instead of fabricating the missing half." in repair_prompt
+
+
+def test_build_repair_prompt_treats_confirm_and_falsify_as_one_metric_pair() -> None:
+    payload = _valid_stage2_payload()
+
+    repair_prompt = jump._build_repair_prompt(
+        "full prompt",
+        json.dumps(payload),
+        ["test.confirm", "test.falsify"],
+        original_data=payload,
+    )
+
+    assert "Treat `test.confirm` + `test.falsify` as one coordinated decision-boundary pair." in repair_prompt
+    assert "Make `test.confirm` the positive side of the boundary and `test.falsify` the kill condition for that exact same metric/comparator pair." in repair_prompt
+    assert "Keep the confirm/falsify pair tied to the current metric wording" in repair_prompt
+    assert "If you cannot support both sides of the same metric boundary from the current payload and evidence, prefer `{\"no_connection\": true}` over unsupported confirm/falsify wording." in repair_prompt
+
+
 def test_build_repair_prompt_prefers_coherent_multi_field_package_repair() -> None:
     payload = _valid_stage2_payload()
 
@@ -722,6 +755,23 @@ def test_build_repair_prompt_prefers_coherent_multi_field_package_repair() -> No
     assert "Keep the package tied to the current test metric" in repair_prompt
     assert "Package the repair coherently: one concrete hidden operator problem, one concrete operator lever, one cheap operator check on the same metric/comparator" in repair_prompt
     assert "Do not broaden the claim, do not add a new mechanism" in repair_prompt
+
+
+def test_build_repair_prompt_treats_variable_mappings_as_one_mapping_package() -> None:
+    payload = _valid_stage2_payload()
+
+    repair_prompt = jump._build_repair_prompt(
+        "full prompt",
+        json.dumps(payload),
+        ["evidence_map.variable_mappings"],
+        original_data=payload,
+    )
+
+    assert "Treat `evidence_map.variable_mappings` as one coordinated mapping package for the current mechanism/operator/metric story, not as permission to invent a broader remap." in repair_prompt
+    assert "Reuse the existing mechanism, target-domain process, operator move, observable, metric, comparator, and strongest current target evidence when rewriting the first 3 critical mappings." in repair_prompt
+    assert "Keep the mapping package tied to the current mechanism wording" in repair_prompt
+    assert "Keep the mapping package tied to the current operator move where relevant" in repair_prompt
+    assert "If the current grounded mechanism/operator/metric core still cannot support 3 critical mappings directly, return `{\"no_connection\": true}` instead of broadening the claim or inventing extra mapped variables." in repair_prompt
 
 
 def test_build_repair_prompt_prefers_no_connection_when_multi_field_support_is_thin() -> None:
@@ -795,6 +845,8 @@ def test_build_repair_prompt_prefers_no_connection_when_multi_field_support_is_t
         "full prompt",
         json.dumps(payload),
         [
+            "test.confirm",
+            "test.falsify",
             "edge_analysis.problem_statement",
             "edge_analysis.actionable_lever",
             "edge_analysis.cheap_test",
@@ -807,6 +859,8 @@ def test_build_repair_prompt_prefers_no_connection_when_multi_field_support_is_t
 
     assert "Multi-field coherent repair mode" in repair_prompt
     assert "Current core-target-evidence weakness:" in repair_prompt
+    assert "Treat `test.confirm` + `test.falsify` + `edge_analysis.actionable_lever` + `edge_analysis.cheap_test` as one coordinated operator-metric package" in repair_prompt
+    assert "If the current payload and evidence cannot support all four fields as the same operator-metric package, return `{\"no_connection\": true}` instead of mixing partial guesses from different stories." in repair_prompt
     assert "If the current payload plus retrieved evidence do not support a concrete operator problem, lever, cheap test, and mapping/mechanism-support set without unsupported extrapolation, return `{\"no_connection\": true}`." in repair_prompt
     assert "Prefer grounded repair or `{\"no_connection\": true}`." in repair_prompt
     assert "Do not invent a lever, operator advantage, variable mapping, or mechanism assertion just to satisfy required fields." in repair_prompt
@@ -1463,3 +1517,149 @@ def test_stage_two_hypothesize_prompt_reuses_stage_one_solution_evidence(
     assert incomplete_fields is None
     assert '"solution_evidence": "offset assignment with collision-avoidance constraints provides the working workaround"' in captured["prompt"]
     assert "treat it as a required anchor for the working solution or workaround" in captured["prompt"]
+
+
+def test_stage_two_hypothesize_repair_receives_stage_one_solution_evidence(
+    monkeypatch,
+) -> None:
+    payload = _valid_stage2_payload()
+    payload["edge_analysis"]["actionable_lever"] = "Investigate further."
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(jump, "_format_relevant_scars_for_prompt", lambda *_args: "")
+    monkeypatch.setattr(
+        jump,
+        "_generate_json_with_retry",
+        lambda *_args, **_kwargs: json.dumps(payload),
+    )
+
+    def fake_repair(
+        _full_prompt: str,
+        _original_json: str,
+        _missing_fields: list[str],
+        *,
+        original_data: dict | None = None,
+    ) -> dict:
+        captured["original_data"] = original_data
+        repaired = _valid_stage2_payload()
+        repaired["solution_evidence"] = str(
+            (original_data or {}).get("solution_evidence") or ""
+        )
+        return repaired
+
+    monkeypatch.setattr(jump, "_repair_missing_fields", fake_repair)
+
+    repaired, failure_hint, incomplete_fields = jump._stage_two_hypothesize_with_diagnostics(
+        source_domain="Juggling",
+        abstract_structure="load compared against a queue threshold",
+        stage_one={
+            "target_domain": "Time-triggered scheduling",
+            "signal": "shared structural signal",
+            "evidence": "specific evidence",
+            "solution_evidence": "filtered offset assignment is the grounded workaround",
+        },
+        search_results="Title: target paper\nconcrete target evidence",
+    )
+
+    assert repaired is not None
+    assert failure_hint is None
+    assert incomplete_fields is None
+    assert captured["original_data"]["solution_evidence"] == (
+        "filtered offset assignment is the grounded workaround"
+    )
+
+
+def test_stage_two_hypothesize_repair_prompt_includes_workaround_anchor_guidance(
+    monkeypatch,
+) -> None:
+    payload = _valid_stage2_payload()
+    payload["edge_analysis"]["actionable_lever"] = "Investigate further."
+    payload["edge_analysis"]["cheap_test"]["setup"] = (
+        "Run a study to validate whether the hypothesis is true."
+    )
+    captured: dict[str, str] = {}
+
+    monkeypatch.setattr(jump, "_format_relevant_scars_for_prompt", lambda *_args: "")
+    monkeypatch.setattr(
+        jump,
+        "_generate_json_with_retry",
+        lambda *_args, **_kwargs: json.dumps(payload),
+    )
+
+    def fake_repair(
+        full_prompt: str,
+        original_json: str,
+        missing_fields: list[str],
+        *,
+        original_data: dict | None = None,
+    ) -> dict:
+        captured["repair_prompt"] = jump._build_repair_prompt(
+            full_prompt,
+            original_json,
+            missing_fields,
+            original_data=original_data,
+        )
+        return _valid_stage2_payload()
+
+    monkeypatch.setattr(jump, "_repair_missing_fields", fake_repair)
+
+    repaired, failure_hint, incomplete_fields = jump._stage_two_hypothesize_with_diagnostics(
+        source_domain="Juggling",
+        abstract_structure="load compared against a queue threshold",
+        stage_one={
+            "target_domain": "Time-triggered scheduling",
+            "signal": "shared structural signal",
+            "evidence": "specific evidence",
+            "solution_evidence": "filtered offset assignment is the grounded workaround",
+        },
+        search_results="Title: target paper\nconcrete target evidence",
+    )
+
+    assert repaired is not None
+    assert failure_hint is None
+    assert incomplete_fields is None
+    assert "Reuse the current workaround or operating-response anchor instead of inventing a different intervention" in captured["repair_prompt"]
+    assert "filtered offset assignment is the grounded workaround" in captured["repair_prompt"]
+
+
+def test_stage_two_hypothesize_repair_context_stays_unchanged_without_solution_evidence(
+    monkeypatch,
+) -> None:
+    payload = _valid_stage2_payload()
+    payload["edge_analysis"]["actionable_lever"] = "Investigate further."
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(jump, "_format_relevant_scars_for_prompt", lambda *_args: "")
+    monkeypatch.setattr(
+        jump,
+        "_generate_json_with_retry",
+        lambda *_args, **_kwargs: json.dumps(payload),
+    )
+
+    def fake_repair(
+        _full_prompt: str,
+        _original_json: str,
+        _missing_fields: list[str],
+        *,
+        original_data: dict | None = None,
+    ) -> dict:
+        captured["original_data"] = original_data
+        return _valid_stage2_payload()
+
+    monkeypatch.setattr(jump, "_repair_missing_fields", fake_repair)
+
+    repaired, failure_hint, incomplete_fields = jump._stage_two_hypothesize_with_diagnostics(
+        source_domain="Juggling",
+        abstract_structure="load compared against a queue threshold",
+        stage_one={
+            "target_domain": "Time-triggered scheduling",
+            "signal": "shared structural signal",
+            "evidence": "specific evidence",
+        },
+        search_results="Title: target paper\nconcrete target evidence",
+    )
+
+    assert repaired is not None
+    assert failure_hint is None
+    assert incomplete_fields is None
+    assert "solution_evidence" not in captured["original_data"]
