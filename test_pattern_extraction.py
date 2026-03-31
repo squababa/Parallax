@@ -481,9 +481,12 @@ def test_stage_one_detect_prompt_prefers_solution_bearing_analogues(
     assert "reason cluster-by-cluster and prefer the strongest coherent cluster over isolated snippet overlap" in captured["prompt"]
     assert "one concrete target-domain process, one concrete shared constraint/mechanism, and one concrete workaround or operating response in the same evidence cluster" in captured["prompt"]
     assert "concrete evidence of an already engineered workaround" in captured["prompt"]
+    assert "Treat a concrete engineered intervention, operating adjustment, suppression/control response, or manipulated-condition change as valid solution-bearing evidence" in captured["prompt"]
+    assert "A paper can count as solution-bearing even without the literal word `workaround`" in captured["prompt"]
     assert "prefer the one with the clearest retrieved workaround or mitigation evidence" in captured["prompt"]
+    assert "Do not treat broad process description, descriptive operating context, or mechanism background alone as solution evidence" in captured["prompt"]
     assert "only restate the problem, constraint, or failure mode without concrete workaround evidence" in captured["prompt"]
-    assert '"solution_evidence": "specific retrieved workaround, mitigation, or operating response evidence"' in captured["prompt"]
+    assert '"solution_evidence": "specific retrieved workaround, mitigation, operating response, or engineered intervention evidence"' in captured["prompt"]
 
 
 def test_stage_one_detect_requires_solution_evidence_field_on_positive_payload(
@@ -1309,6 +1312,8 @@ def test_lateral_jump_with_diagnostics_merges_multi_query_results_for_both_stage
     assert diagnostic["filtered_result_count"] == 0
     assert diagnostic["filtered_result_reason_counts"] == {}
     assert diagnostic["cluster_count"] == 3
+    assert diagnostic["intervention_promoted_result_count"] == 0
+    assert diagnostic["top_cluster_intervention_scores"] == [0, 0, 0]
     assert set(diagnostic["top_result_titles"]) == {
         "Shared target paper",
         "Base-only target paper",
@@ -1644,6 +1649,142 @@ def test_lateral_jump_with_diagnostics_prefers_anchored_cluster_over_collision_p
         ) < stage_inputs["stage1"].index("Title: Overview of system solution")
     else:
         assert diagnostic["cluster_count"] == 1
+
+
+def test_lateral_jump_with_diagnostics_promotes_intervention_bearing_cluster(
+    monkeypatch,
+) -> None:
+    stage_inputs: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        jump,
+        "_build_jump_search_queries",
+        lambda *_args, **_kwargs: ["gas saturation routing suppression"],
+    )
+    monkeypatch.setattr(
+        jump._tavily,
+        "search",
+        lambda **_kwargs: {
+            "results": [
+                {
+                    "title": "Electrochemical gas phase suppression",
+                    "content": (
+                        "Operators suppress bubble carryover by adjusting flow rate "
+                        "during startup in two-phase electrochemical reactors."
+                    ),
+                    "url": "https://target.test/intervention",
+                },
+                {
+                    "title": "Electrochemical gas phase dynamics",
+                    "content": (
+                        "Two-phase electrochemical reactors exhibit bubble carryover "
+                        "and gas accumulation during operation."
+                    ),
+                    "url": "https://target.test/descriptive",
+                },
+            ]
+        },
+    )
+
+    def fake_stage_one(**kwargs):
+        stage_inputs["stage1"] = kwargs["search_results"]
+        return (
+            {
+                "target_domain": "Two-phase electrochemical reactors",
+                "signal": "shared saturation-routing structure",
+                "evidence": "specific evidence",
+                "solution_evidence": "operators adjust flow rate to suppress bubble carryover during startup",
+            },
+            None,
+        )
+
+    monkeypatch.setattr(jump, "_stage_one_detect_with_diagnostics", fake_stage_one)
+    monkeypatch.setattr(
+        jump,
+        "_stage_two_hypothesize_with_diagnostics",
+        lambda **_kwargs: (_safety_interlock_jump_payload(), None, None),
+    )
+
+    connection, diagnostic = jump.lateral_jump_with_diagnostics(
+        {
+            "pattern_name": "Saturation-triggered phase-routing",
+            "abstract_structure": "gas saturation changes phase routing under startup thresholds",
+            "search_query": "gas saturation routing suppression",
+        },
+        "Bread Making",
+        "Craft",
+    )
+
+    assert connection is not None
+    assert diagnostic["intervention_promoted_result_count"] == 1
+    assert diagnostic["top_cluster_intervention_scores"][0] > 0
+    assert "Intervention signal:" in stage_inputs["stage1"]
+    assert stage_inputs["stage1"].index(
+        "Title: Electrochemical gas phase suppression"
+    ) < stage_inputs["stage1"].index("Title: Electrochemical gas phase dynamics")
+
+
+def test_lateral_jump_with_diagnostics_does_not_promote_descriptive_process_paper_as_intervention(
+    monkeypatch,
+) -> None:
+    stage_inputs: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        jump,
+        "_build_jump_search_queries",
+        lambda *_args, **_kwargs: ["gas saturation routing suppression"],
+    )
+    monkeypatch.setattr(
+        jump._tavily,
+        "search",
+        lambda **_kwargs: {
+            "results": [
+                {
+                    "title": "Electrochemical gas phase dynamics",
+                    "content": (
+                        "Two-phase electrochemical reactors exhibit bubble carryover, "
+                        "gas accumulation, and pressure gradients during operation."
+                    ),
+                    "url": "https://target.test/descriptive-only",
+                }
+            ]
+        },
+    )
+
+    def fake_stage_one(**kwargs):
+        stage_inputs["stage1"] = kwargs["search_results"]
+        return (
+            {
+                "target_domain": "Two-phase electrochemical reactors",
+                "signal": "shared saturation-routing structure",
+                "evidence": "specific evidence",
+                "solution_evidence": "stage one accepts the cluster for prompt inspection only",
+            },
+            None,
+        )
+
+    monkeypatch.setattr(jump, "_stage_one_detect_with_diagnostics", fake_stage_one)
+    monkeypatch.setattr(
+        jump,
+        "_stage_two_hypothesize_with_diagnostics",
+        lambda **_kwargs: (_safety_interlock_jump_payload(), None, None),
+    )
+
+    connection, diagnostic = jump.lateral_jump_with_diagnostics(
+        {
+            "pattern_name": "Saturation-triggered phase-routing",
+            "abstract_structure": "gas saturation changes phase routing under startup thresholds",
+            "search_query": "gas saturation routing suppression",
+        },
+        "Bread Making",
+        "Craft",
+    )
+
+    assert connection is not None
+    assert diagnostic["intervention_promoted_result_count"] == 0
+    assert diagnostic["top_cluster_intervention_scores"] == [0]
+    assert "Intervention signal:" not in stage_inputs["stage1"]
+    assert "Intervention evidence: yes" not in stage_inputs["stage1"]
 
 
 def test_lateral_jump_with_diagnostics_prefers_better_solution_bearing_excerpt_for_duplicate_url(

@@ -45,9 +45,12 @@ Strict rules:
 - If SEARCH RESULTS are grouped into candidate clusters, reason cluster-by-cluster and prefer the strongest coherent cluster over isolated snippet overlap.
 - Approve only when one candidate domain shows one concrete target-domain process, one concrete shared constraint/mechanism, and one concrete workaround or operating response in the same evidence cluster.
 - Approve only when the target domain shows both the shared causal structure and concrete evidence of an already engineered workaround, mitigation, or operating response to that constraint.
+- Treat a concrete engineered intervention, operating adjustment, suppression/control response, or manipulated-condition change as valid solution-bearing evidence when it clearly manages the same constraint or failure mode.
+- A paper can count as solution-bearing even without the literal word `workaround` if it shows one concrete target-domain intervention that changes the same bottleneck, failure mode, or control problem.
 - Reject vague analogies, keyword overlap, and broad theme matches without similar causal organization.
 - Reject universal principles that connect everything (generic feedback, emergence, optimization, networks).
 - If multiple candidate domains appear, prefer the one with the clearest retrieved workaround or mitigation evidence.
+- Do not treat broad process description, descriptive operating context, or mechanism background alone as solution evidence unless it includes one concrete operator-relevant intervention or engineered response.
 - If the search results only restate the problem, constraint, or failure mode without concrete workaround evidence, return no_connection.
 
 Return ONLY valid JSON. No markdown.
@@ -58,7 +61,7 @@ If yes signal:
   "target_domain": "specific target field",
   "signal": "1-2 sentence mechanism-level signal",
   "evidence": "specific evidence from search results",
-  "solution_evidence": "specific retrieved workaround, mitigation, or operating response evidence"
+  "solution_evidence": "specific retrieved workaround, mitigation, operating response, or engineered intervention evidence"
 }}"""
 
 HYPOTHESIZE_PROMPT = """Stage 2: hypothesis only.
@@ -841,6 +844,39 @@ SOLUTION_EVIDENCE_MARKERS = (
     "solution",
     "response",
 )
+INTERVENTION_CONTROL_MARKERS = (
+    "adjust",
+    "bias",
+    "control",
+    "modulat",
+    "setpoint",
+    "tune",
+    "vary",
+)
+INTERVENTION_RESPONSE_MARKERS = (
+    "attenuat",
+    "gate",
+    "isolat",
+    "rout",
+    "stabiliz",
+    "suppress",
+    "switch",
+    "throttl",
+)
+INTERVENTION_CONDITION_PHRASES = (
+    "crosslink density",
+    "flow rate",
+    "residence time",
+)
+INTERVENTION_CONDITION_TOKENS = {
+    "concentration",
+    "configuration",
+    "loading",
+    "pressure",
+    "pulse",
+    "startup",
+    "temperature",
+}
 QUERY_PHRASE_STOPWORDS = {
     "a",
     "an",
@@ -922,6 +958,83 @@ def _build_jump_title_signature(
 def _jump_solution_marker_count(text: str) -> int:
     lowered = str(text or "").lower()
     return sum(1 for marker in SOLUTION_EVIDENCE_MARKERS if marker in lowered)
+
+
+def _match_jump_marker_stems(tokens: list[str], stems: tuple[str, ...]) -> list[str]:
+    matches: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        if token in seen:
+            continue
+        if any(token.startswith(stem) for stem in stems):
+            seen.add(token)
+            matches.append(token)
+    return matches
+
+
+def _classify_jump_intervention_evidence(
+    title_text: str,
+    clean: str,
+    *,
+    anchor_overlap: int,
+    preferred_phrase_match: bool,
+    strong_anchor_tokens: set[str],
+    solution_marker_count: int,
+    specificity_score: int,
+) -> dict[str, object]:
+    combined_text = " ".join(
+        part for part in (str(title_text or ""), str(clean or "")) if part
+    ).lower()
+    tokens = _tokenize_query_terms(f"{title_text} {clean}")
+    token_set = set(tokens)
+    matched_control = _match_jump_marker_stems(tokens, INTERVENTION_CONTROL_MARKERS)
+    matched_response = _match_jump_marker_stems(tokens, INTERVENTION_RESPONSE_MARKERS)
+    matched_condition_phrases = [
+        phrase for phrase in INTERVENTION_CONDITION_PHRASES if phrase in combined_text
+    ]
+    matched_condition_tokens = [
+        token for token in tokens if token in INTERVENTION_CONDITION_TOKENS
+    ]
+    mechanism_context_count = len(
+        token_set.intersection(strong_anchor_tokens.union(MECHANISM_QUERY_TOKENS))
+    )
+    strong_process_context = (
+        preferred_phrase_match
+        or anchor_overlap >= 2
+        or mechanism_context_count >= 3
+        or specificity_score >= 7
+    )
+    has_condition = bool(matched_condition_phrases or matched_condition_tokens)
+    intervention_evidence = (
+        bool(matched_response)
+        and strong_process_context
+        and (has_condition or solution_marker_count > 0 or mechanism_context_count >= 3)
+    ) or (
+        bool(matched_control)
+        and has_condition
+        and strong_process_context
+    )
+    signal_parts: list[str] = []
+    for part in (
+        matched_response[:1]
+        + matched_control[:1]
+        + matched_condition_phrases[:1]
+        + matched_condition_tokens[:1]
+    ):
+        if part and part not in signal_parts:
+            signal_parts.append(part)
+    return {
+        "intervention_marker_count": len(
+            set(
+                matched_control
+                + matched_response
+                + matched_condition_phrases
+                + matched_condition_tokens
+            )
+        ),
+        "intervention_evidence": intervention_evidence,
+        "intervention_signal": ", ".join(signal_parts[:3]),
+    }
 
 
 def _jump_query_support_context(
@@ -1716,11 +1829,21 @@ def _classify_weak_jump_result(
         }
     )
     reliable_solution_evidence = solution_marker_count > 0 and specificity_score >= 4
+    intervention_context = _classify_jump_intervention_evidence(
+        title_text,
+        clean,
+        anchor_overlap=anchor_overlap,
+        preferred_phrase_match=preferred_phrase_match,
+        strong_anchor_tokens=strong_anchor_tokens,
+        solution_marker_count=solution_marker_count,
+        specificity_score=specificity_score,
+    )
     should_drop = (
         (weak_source or broad_page)
         and anchor_overlap < 2
         and not preferred_phrase_match
         and not reliable_solution_evidence
+        and not bool(intervention_context.get("intervention_evidence"))
         and specificity_score < 5
     )
     reason_codes: list[str] = []
@@ -1738,6 +1861,15 @@ def _classify_weak_jump_result(
         "preferred_phrase_match": preferred_phrase_match,
         "solution_marker_count": solution_marker_count,
         "specificity_score": specificity_score,
+        "intervention_marker_count": int(
+            intervention_context.get("intervention_marker_count") or 0
+        ),
+        "intervention_evidence": bool(
+            intervention_context.get("intervention_evidence")
+        ),
+        "intervention_signal": str(
+            intervention_context.get("intervention_signal") or ""
+        ).strip(),
         "reason_codes": reason_codes,
     }
 
@@ -4328,6 +4460,8 @@ def lateral_jump_with_diagnostics(
         "filtered_result_reason_counts": {},
         "cluster_count": 0,
         "top_cluster_hints": [],
+        "top_cluster_intervention_scores": [],
+        "intervention_promoted_result_count": 0,
         "top_result_titles": [],
         "stage1_outcome": None,
         "stage1_target_domain": None,
@@ -4442,6 +4576,15 @@ def lateral_jump_with_diagnostics(
             solution_marker_count = int(
                 weak_result_context.get("solution_marker_count") or 0
             )
+            intervention_marker_count = int(
+                weak_result_context.get("intervention_marker_count") or 0
+            )
+            intervention_evidence = bool(
+                weak_result_context.get("intervention_evidence")
+            )
+            intervention_signal = str(
+                weak_result_context.get("intervention_signal") or ""
+            ).strip()
             dedupe_key = (url or title_text or clean).lower()
             existing_index = merged_result_index.get(dedupe_key)
             if existing_index is None:
@@ -4455,6 +4598,9 @@ def lateral_jump_with_diagnostics(
                         "anchor_overlap": anchor_overlap,
                         "preferred_phrase_match": preferred_phrase_match,
                         "solution_marker_count": solution_marker_count,
+                        "intervention_marker_count": intervention_marker_count,
+                        "intervention_evidence": intervention_evidence,
+                        "intervention_signal": intervention_signal,
                     }
                 )
             else:
@@ -4473,17 +4619,36 @@ def lateral_jump_with_diagnostics(
                     existing_result["anchor_overlap"] = anchor_overlap
                     existing_result["preferred_phrase_match"] = preferred_phrase_match
                     existing_result["solution_marker_count"] = solution_marker_count
+                    existing_result["intervention_marker_count"] = intervention_marker_count
+                    existing_result["intervention_evidence"] = intervention_evidence
+                    existing_result["intervention_signal"] = intervention_signal
+                else:
+                    existing_result["intervention_marker_count"] = max(
+                        int(existing_result.get("intervention_marker_count") or 0),
+                        intervention_marker_count,
+                    )
+                    existing_result["intervention_evidence"] = bool(
+                        existing_result.get("intervention_evidence")
+                    ) or intervention_evidence
+                    if (
+                        intervention_signal
+                        and not str(existing_result.get("intervention_signal") or "").strip()
+                    ):
+                        existing_result["intervention_signal"] = intervention_signal
                 if query_label not in existing_result["query_labels"]:
                     existing_result["query_labels"].append(query_label)
 
     diagnostic["filtered_result_reason_counts"] = filtered_result_reason_counts
+    diagnostic["intervention_promoted_result_count"] = sum(
+        1 for result in merged_results if result.get("intervention_evidence")
+    )
 
     if query_error_count == len(queries):
         diagnostic["stage1_outcome"] = "no_results"
         diagnostic["stage1_failure_hint"] = "search_error"
         return None, diagnostic
 
-    def _clustered_result_rank(result: dict) -> tuple[int, int, int, int, int, int, int, int]:
+    def _clustered_result_rank(result: dict) -> tuple[int, int, int, int, int, int, int, int, int, int]:
         clean = str(result.get("clean", "") or "").strip()
         query_labels = [
             str(label).strip()
@@ -4492,9 +4657,12 @@ def lateral_jump_with_diagnostics(
         ]
         title_signature = tuple(result.get("title_signature") or ())
         excerpt_rank = _excerpt_rank(clean, query_labels)
+        intervention_evidence = bool(result.get("intervention_evidence"))
         return (
             int(result.get("anchor_overlap") or 0),
             1 if result.get("preferred_phrase_match") else 0,
+            1 if intervention_evidence else 0,
+            int(result.get("intervention_marker_count") or 0) if intervention_evidence else 0,
             1 if "solution-biased" in query_labels else 0,
             int(result.get("solution_marker_count") or excerpt_rank[0]),
             len(title_signature),
@@ -4576,7 +4744,28 @@ def lateral_jump_with_diagnostics(
         preferred_phrase_matches = sum(
             1 for result in cluster_results if result.get("preferred_phrase_match")
         )
+        intervention_hits = sum(
+            1 for result in cluster_results if result.get("intervention_evidence")
+        )
+        intervention_score = sum(
+            int(result.get("intervention_marker_count") or 0)
+            for result in cluster_results
+            if result.get("intervention_evidence")
+        ) + intervention_hits * 2
+        cluster_intervention_signal = next(
+            (
+                str(result.get("intervention_signal") or "").strip()
+                for result in cluster_results
+                if result.get("intervention_evidence")
+                and str(result.get("intervention_signal") or "").strip()
+            ),
+            "",
+        )
+        cluster["intervention_score"] = intervention_score
+        cluster["intervention_signal"] = cluster_intervention_signal
         best_result_rank = _clustered_result_rank(best_result) if cluster_results else (
+            0,
+            0,
             0,
             0,
             0,
@@ -4588,6 +4777,8 @@ def lateral_jump_with_diagnostics(
         )
         cluster["rank"] = (
             len(cluster_results),
+            intervention_hits,
+            intervention_score,
             anchor_overlap_total,
             preferred_phrase_matches,
             1
@@ -4597,14 +4788,14 @@ def lateral_jump_with_diagnostics(
             )
             else 0,
             marker_density,
-            len(cluster_signature),
             best_result_rank[3],
             best_result_rank[4],
             best_result_rank[5],
+            len(cluster_signature),
         )
 
     clustered_results.sort(
-        key=lambda cluster: cluster.get("rank") or (0, 0, 0, 0, 0, 0, 0, 0, 0),
+        key=lambda cluster: cluster.get("rank") or (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
         reverse=True,
     )
 
@@ -4615,6 +4806,10 @@ def lateral_jump_with_diagnostics(
         for cluster in clustered_results[:3]
         if str(cluster.get("cluster_hint", "") or "").strip()
     ]
+    diagnostic["top_cluster_intervention_scores"] = [
+        int(cluster.get("intervention_score") or 0)
+        for cluster in clustered_results[:3]
+    ]
 
     for cluster_index, cluster in enumerate(clustered_results, start=1):
         cluster_hint = str(cluster.get("cluster_hint", "") or "").strip() or "Unknown"
@@ -4622,6 +4817,12 @@ def lateral_jump_with_diagnostics(
         search_content.append(f"Candidate cluster {cluster_index}:")
         search_content.append(f"Cluster hint: {cluster_hint}")
         search_content.append(f"Supporting results: {len(cluster_results)}")
+        if str(cluster.get("intervention_signal", "") or "").strip():
+            search_content.append(
+                f"Intervention signal: {str(cluster.get('intervention_signal') or '').strip()}"
+            )
+        elif int(cluster.get("intervention_score") or 0) > 0:
+            search_content.append("Intervention evidence: yes")
         for result_index, merged_result in enumerate(cluster_results, start=1):
             title_text = str(merged_result.get("title_text", "") or "").strip()
             clean = str(merged_result.get("clean", "") or "").strip()
