@@ -145,6 +145,14 @@ def test_hypothesize_prompt_has_stronger_examples() -> None:
     assert "Avoid analogy-heavy framing, literature-summary phrasing, and padded connective filler." in prompt
 
 
+def test_detect_prompt_accepts_engineered_interventions_as_solution_evidence() -> None:
+    prompt = jump.DETECT_PROMPT
+
+    assert "Treat a concrete engineered intervention, operating adjustment, suppression/control response, or manipulated-condition change as valid solution-bearing evidence" in prompt
+    assert "A paper can count as solution-bearing even without the literal word `workaround`" in prompt
+    assert "Do not treat broad process description, descriptive operating context, or mechanism background alone as solution evidence" in prompt
+
+
 def test_phase6_salvage_prompt_stays_selective() -> None:
     prompt = jump.PHASE6_SALVAGE_PROMPT
 
