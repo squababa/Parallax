@@ -107,8 +107,11 @@ def test_hypothesize_prompt_has_stronger_examples() -> None:
     assert "Reduce analogy-style phrasing, decorative transitions, and explanatory padding." in prompt
     assert "Keep the workaround, mitigation, or engineered operating response grounded in retrieved target-domain evidence." in prompt
     assert "Good problem statements name one concrete hidden failure mode" in prompt
-    assert "`edge_analysis.problem_statement` must describe one hidden or underexploited operational problem, not a broad summary of the field." in prompt
-    assert "Tie `edge_analysis.problem_statement` to one concrete operator decision or one concrete failure mode on the same observable or metric already used in `prediction` / `test`." in prompt
+    assert "`edge_analysis.problem_statement` must describe exactly one hidden or underexploited operational problem, not a broad summary of the field." in prompt
+    assert "`edge_analysis.problem_statement` must name exactly one specific target-domain problem, blind spot, hidden failure mode, or missed control point." in prompt
+    assert "Tie `edge_analysis.problem_statement` to the same process, the same metric/comparator, and the same operator decision already used in `prediction` / `test`." in prompt
+    assert "Make `edge_analysis.problem_statement` read like a missed operator problem, not an essay." in prompt
+    assert "Reject field-summary prose, restatements of the whole domain, and generic `systems are complex` wording in `edge_analysis.problem_statement`." in prompt
     assert "Bad problem statements are generic or essay-like" in prompt
     assert "Good actionable levers name one concrete operator action or design choice" in prompt
     assert "`edge_analysis.actionable_lever` must reuse the current mechanism, metric, or operator context." in prompt
@@ -127,6 +130,11 @@ def test_hypothesize_prompt_has_stronger_examples() -> None:
     assert "`edge_analysis.why_missed` must explain one concrete search, framing, workflow, metric, or discipline-boundary reason" in prompt
     assert "`edge_analysis.expected_asymmetry` must explain why the lever is plausibly underused rather than already standard target-domain wisdom." in prompt
     assert "For the first 3 critical mappings, the evidence_snippet must be specific enough to stand on its own" in prompt
+    assert "make each mapping narrow, directly supported, aligned to the mapped variables, and stated at the same specificity as the snippet itself." in prompt
+    assert "Prefer exactly 3 strong critical mappings over padded weak mappings." in prompt
+    assert "Do not pad the first 3 mappings with abstract correspondences or nearby-but-not-exact analogs just to reach 3." in prompt
+    assert "If fewer than 3 mappings are directly supportable at that narrow variable level, return `no_connection`." in prompt
+    assert "If a snippet only supports mechanism-level logic without a direct variable-level claim, put it in `mechanism_assertions`, not in `variable_mappings`." in prompt
     assert "Treat the evidence_snippet itself as the core proof." in prompt
     assert "Prefer direct core target evidence over broad contextual target evidence." in prompt
     assert "Good direct core target evidence explicitly names the same process or metric used in `mechanism` or `test.metric`." in prompt
@@ -240,8 +248,11 @@ def test_build_repair_prompt_includes_targeted_guidance() -> None:
     assert "Rewrite `test` so `metric` names one concrete literature-facing quantity" in repair_prompt
     assert "If you cannot ground a specific literature-facing metric from the current payload and evidence, prefer `{\"no_connection\": true}` over a vague `test.metric`." in repair_prompt
     assert "Rewrite `test.confirm` and `test.falsify` so each sentence literally names the same metric used in `test.metric`" in repair_prompt
-    assert "Rewrite `edge_analysis.problem_statement` so it names one specific hidden target-domain failure mode" in repair_prompt
-    assert "Tie `edge_analysis.problem_statement` to one concrete operator decision or one concrete failure mode already implied by the current claim, metric, or comparator." in repair_prompt
+    assert "Rewrite `edge_analysis.problem_statement` so it names exactly one specific hidden target-domain failure mode" in repair_prompt
+    assert "Tie `edge_analysis.problem_statement` to the same process, the same measurable quantity/comparator, and the same operator decision already implied by the current claim, metric, or comparator." in repair_prompt
+    assert "Rewrite only `edge_analysis.problem_statement` or the minimal coupled edge layer needed to keep it coherent." in repair_prompt
+    assert "Preserve the current metric, operator, cheap-test, and `edge_analysis.edge_if_right` anchors." in repair_prompt
+    assert "Make it read like one hidden decision-relevant operator problem on that same measurable quantity." in repair_prompt
     assert "Rewrite `edge_analysis.actionable_lever` so it names one concrete operator action" in repair_prompt
     assert "design choice" in repair_prompt
     assert "Rewrite `edge_analysis.edge_if_right` so it states one concrete operator gain" in repair_prompt
@@ -252,6 +263,9 @@ def test_build_repair_prompt_includes_targeted_guidance() -> None:
     assert "Rewrite `edge_analysis.why_missed` so it names one concrete search, framing, workflow, metric, or discipline-boundary reason" in repair_prompt
     assert "Rewrite `edge_analysis.expected_asymmetry` so it explains why the lever is plausibly underused rather than already standard target-domain wisdom" in repair_prompt
     assert "Rewrite the first 3 `evidence_map.variable_mappings` entries so each `evidence_snippet` is at least one self-contained technical sentence or clause" in repair_prompt
+    assert "Rebuild only the first 3 critical mappings." in repair_prompt
+    assert "Do not pad with abstract correspondences, nearby downstream effects, or mechanism-level filler." in repair_prompt
+    assert "If only 1 or 2 critical mappings can be directly supported from the current payload and evidence, prefer `{\"no_connection\": true}` over weak padding or malformed partial JSON." in repair_prompt
 
 
 def test_missing_required_fields_requests_repair_for_provenance_bottlenecks() -> None:
@@ -790,7 +804,7 @@ def test_build_repair_prompt_treats_variable_mappings_as_one_mapping_package() -
     )
 
     assert "Treat `evidence_map.variable_mappings` as one coordinated mapping package for the current mechanism/operator/metric story, not as permission to invent a broader remap." in repair_prompt
-    assert "Reuse the existing mechanism, target-domain process, operator move, observable, metric, comparator, and strongest current target evidence when rewriting the first 3 critical mappings." in repair_prompt
+    assert "Treat this as a narrow direct-support repair." in repair_prompt
     assert "Keep the mapping package tied to the current mechanism wording" in repair_prompt
     assert "Keep the mapping package tied to the current operator move where relevant" in repair_prompt
     assert "If the current grounded mechanism/operator/metric core still cannot support 3 critical mappings directly, return `{\"no_connection\": true}` instead of broadening the claim or inventing extra mapped variables." in repair_prompt
@@ -886,6 +900,7 @@ def test_build_repair_prompt_prefers_no_connection_when_multi_field_support_is_t
     assert "If the current payload plus retrieved evidence do not support a concrete operator problem, lever, cheap test, and mapping/mechanism-support set without unsupported extrapolation, return `{\"no_connection\": true}`." in repair_prompt
     assert "Prefer grounded repair or `{\"no_connection\": true}`." in repair_prompt
     assert "Do not invent a lever, operator advantage, variable mapping, or mechanism assertion just to satisfy required fields." in repair_prompt
+    assert "prefer an explicit `{\"no_connection\": true}` path over malformed partial JSON, placeholder text, or generic filler." in repair_prompt
 
 
 def test_build_repair_prompt_marks_cheap_test_only_completion_as_narrow() -> None:
@@ -974,10 +989,48 @@ def test_build_repair_prompt_marks_variable_mapping_completion_as_narrow() -> No
         "instead of rewriting the full candidate."
     ) in repair_prompt
     assert "Complete the missing critical variable mappings from the current payload one supported entry at a time." in repair_prompt
-    assert "Prioritize only the first 3 critical mappings." in repair_prompt
+    assert "Prefer exactly 3 strong mappings over padded weak ones." in repair_prompt
+    assert "If only 1 or 2 critical mappings can be directly supported from the current payload and evidence, prefer `{\"no_connection\": true}` over weak padding or malformed partial JSON." in repair_prompt
     assert "Keep the critical pair wording exactly aligned to the current payload: `throw_offset -> task_offset`." in repair_prompt
     assert "Reuse this current mapping claim as the starting point and narrow it only if needed: `Periodic tasks are assigned offsets within a shared hyperperiod.`." in repair_prompt
     assert "Reuse this current evidence wording where possible and keep the repaired claim as a narrow paraphrase of it: `Tasks are assigned offsets within the hyperperiod to determine activation times.`." in repair_prompt
+
+
+def test_stage_two_hypothesize_repair_no_connection_surfaces_as_no_connection(
+    monkeypatch,
+) -> None:
+    payload = _valid_stage2_payload()
+    payload["edge_analysis"]["problem_statement"] = "Complex systems may hide inefficiencies."
+
+    monkeypatch.setattr(jump, "_format_relevant_scars_for_prompt", lambda *_args: "")
+    monkeypatch.setattr(
+        jump,
+        "_generate_json_with_retry",
+        lambda *_args, **_kwargs: json.dumps(payload),
+    )
+    monkeypatch.setattr(
+        jump,
+        "_repair_missing_fields",
+        lambda *_args, **_kwargs: {
+            "no_connection": True,
+            "failure_hint": "support-layer fields cannot be grounded directly",
+        },
+    )
+
+    repaired, failure_hint, incomplete_fields = jump._stage_two_hypothesize_with_diagnostics(
+        source_domain="Juggling",
+        abstract_structure="load compared against a queue threshold",
+        stage_one={
+            "target_domain": "Time-triggered scheduling",
+            "signal": "shared structural signal",
+            "evidence": "specific evidence",
+        },
+        search_results="Title: target paper\nconcrete target evidence",
+    )
+
+    assert repaired is None
+    assert failure_hint == "support-layer fields cannot be grounded directly"
+    assert incomplete_fields is None
 
 
 def test_build_repair_prompt_marks_edge_if_right_only_completion_as_narrow() -> None:

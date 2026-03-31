@@ -109,16 +109,20 @@ Requirements:
 - For critical mappings, write the claim as a direct restatement of what the evidence_snippet literally supports. Do not let the claim become broader, more abstract, or more mechanistic than the snippet itself.
 - For the first 3 critical mappings, keep the claim as a narrow paraphrase of the snippet and reuse concrete target-domain wording from the snippet where possible.
 - For critical mappings, prefer direct support over inferential support whenever possible.
+- For the first 3 critical mappings, make each mapping narrow, directly supported, aligned to the mapped variables, and stated at the same specificity as the snippet itself.
 - For the first 3 critical mappings, the evidence_snippet must be specific enough to stand on its own: prefer 8+ words, at least one or two concrete overlapping terms with the claim/mapped variable, and enough local detail that it does not read like generic background context.
-- Prefer fewer, better-supported critical mappings over extra weak ones. If support is thin, keep the first 3 mappings narrow and well-supported instead of inventing broader weak critical mappings. Non-critical mappings are lower priority.
+- Prefer exactly 3 strong critical mappings over padded weak mappings. If support is thin, keep the first 3 mappings narrow and well-supported instead of inventing broader weak critical mappings. Non-critical mappings are lower priority.
   - If a snippet supports only a weaker, local correspondence, keep the mapping claim equally weak and local.
   - Write each claim at the same level of specificity as the mapped variables. Do not make the claim broader than the mapping itself.
   - Each variable mapping snippet must directly bear on the mapped target-domain variable, not just the broader target-domain story or a nearby downstream effect.
   - Do not use vague evidence_snippet text that only supports the broader domain, the general story, or the overall mechanism.
   - Do not cite a broad mechanism sentence as support for a narrow variable-level mapping.
+  - Do not pad the first 3 mappings with abstract correspondences or nearby-but-not-exact analogs just to reach 3.
   - For the first 3 critical mappings, choose snippets that mention the mapped variable, threshold, process, or operator directly when possible.
   - If exact support is unavailable, weaken or omit the mapping rather than overstating what the snippet proves.
+  - If fewer than 3 mappings are directly supportable at that narrow variable level, return `no_connection`.
   - If a snippet only supports the overall causal story but not the exact mapped-variable claim, use it for mechanism_assertions instead of variable_mappings.
+  - If a snippet only supports mechanism-level logic without a direct variable-level claim, put it in `mechanism_assertions`, not in `variable_mappings`.
   - evidence_map.mechanism_assertions must include at least 1 entry with mechanism_claim, evidence_snippet, and source_reference.
   - mechanism_assertions must support the actual causal operator or control logic in the mechanism (what triggers, routes, switches, inhibits, amplifies, or accumulates), not just background context about the target domain.
   - At least one target-domain snippet or mechanism_assertion must directly support the named target-domain process or the exact metric/immediate observable consequence used in the test.
@@ -214,9 +218,11 @@ Requirements:
 - Prefer narrower predictions that can be falsified or supported by one literature result family over elegant but broad claims that only retrieve domain-adjacent evidence.
 - The prediction must include a measurable observable, a time horizon, a falsification condition, and why the prediction is useful.
 - Provide `edge_analysis` as a grounded operator layer tied to the exact same primary target-domain claim as `connection`, `mechanism`, `prediction`, and `test`.
-- `edge_analysis.problem_statement` must name one specific target-domain problem, blind spot, hidden failure mode, or missed control point.
-- `edge_analysis.problem_statement` must describe one hidden or underexploited operational problem, not a broad summary of the field.
-- Tie `edge_analysis.problem_statement` to one concrete operator decision or one concrete failure mode on the same observable or metric already used in `prediction` / `test`.
+- `edge_analysis.problem_statement` must name exactly one specific target-domain problem, blind spot, hidden failure mode, or missed control point.
+- `edge_analysis.problem_statement` must describe exactly one hidden or underexploited operational problem, not a broad summary of the field.
+- Tie `edge_analysis.problem_statement` to the same process, the same metric/comparator, and the same operator decision already used in `prediction` / `test`.
+- Make `edge_analysis.problem_statement` read like a missed operator problem, not an essay.
+- Reject field-summary prose, restatements of the whole domain, and generic `systems are complex` wording in `edge_analysis.problem_statement`.
 - `edge_analysis.actionable_lever` must name one concrete operator action, heuristic, filter, design change, or search direction that follows from the mechanism.
 - `edge_analysis.actionable_lever` must reuse the current mechanism, metric, or operator context. Do not write advisory phrasing like `consider`, `explore`, `may help`, `investigate`, or other non-operational wording.
 - `edge_analysis.cheap_test` must include setup, metric, confirm, falsify, and optional time_to_signal. It must be a fast realistic validation path, not a multi-month research program by default.
@@ -3498,6 +3504,9 @@ def _repair_guidance_for_missing_fields(
         guidance.append(
             "- Prefer grounded repair or `{\"no_connection\": true}`. Do not invent a lever, operator advantage, variable mapping, or mechanism assertion just to satisfy required fields."
         )
+        guidance.append(
+            "- If support-layer fields cannot be concretely grounded from the current payload and evidence, prefer an explicit `{\"no_connection\": true}` path over malformed partial JSON, placeholder text, or generic filler."
+        )
     if any(field in usefulness_bottleneck_fields for field in missing_fields):
         guidance.append(
             "- Phase 5 usefulness-alignment bottleneck: keep `connection`, `mechanism`, `prediction`, `test`, and `evidence_map` stable unless they are empty. Rewrite the edge layer so it points to the exact same core claim, process, comparator, and metric already named elsewhere."
@@ -3743,10 +3752,19 @@ def _repair_guidance_for_missing_fields(
         )
     if "edge_analysis.problem_statement" in missing_fields:
         guidance.append(
-            "- Rewrite `edge_analysis.problem_statement` so it names one specific hidden target-domain failure mode, bottleneck, blind spot, or measurable miss tied to the same observable or metric as the test, not a broad field summary."
+            "- Rewrite `edge_analysis.problem_statement` so it names exactly one specific hidden target-domain failure mode, bottleneck, blind spot, or measurable miss tied to the same observable or metric as the test, not a broad field summary."
         )
         guidance.append(
-            "- Tie `edge_analysis.problem_statement` to one concrete operator decision or one concrete failure mode already implied by the current claim, metric, or comparator."
+            "- Tie `edge_analysis.problem_statement` to the same process, the same measurable quantity/comparator, and the same operator decision already implied by the current claim, metric, or comparator."
+        )
+        guidance.append(
+            "- Rewrite only `edge_analysis.problem_statement` or the minimal coupled edge layer needed to keep it coherent. Preserve the current metric, operator, cheap-test, and `edge_analysis.edge_if_right` anchors."
+        )
+        guidance.append(
+            "- Make it read like one hidden decision-relevant operator problem on that same measurable quantity. Reject field-summary prose, broad domain restatements, and generic `systems are complex` filler."
+        )
+        guidance.append(
+            "- If the current payload and evidence cannot ground one concrete hidden operator problem on the same metric/decision boundary, prefer `{\"no_connection\": true}` over generic support-layer filler."
         )
     if "edge_analysis.actionable_lever" in missing_fields:
         guidance.append(
@@ -3907,7 +3925,7 @@ def _repair_guidance_for_missing_fields(
                 "- Treat `evidence_map.variable_mappings` as one coordinated mapping package for the current mechanism/operator/metric story, not as permission to invent a broader remap."
             )
             guidance.append(
-                "- Reuse the existing mechanism, target-domain process, operator move, observable, metric, comparator, and strongest current target evidence when rewriting the first 3 critical mappings."
+                "- Treat this as a narrow direct-support repair. Preserve the current claim, mechanism, test/operator anchors, target-domain process, observable, metric, comparator, and strongest current target evidence while rewriting only the first 3 critical mappings."
             )
             if current_mechanism:
                 guidance.append(
@@ -3944,7 +3962,16 @@ def _repair_guidance_for_missing_fields(
             "- Complete the missing critical variable mappings from the current payload one supported entry at a time. Reuse the existing source-variable / target-variable pairs, target claim wording, and target evidence wording wherever they are already grounded."
         )
         guidance.append(
-            "- Prioritize only the first 3 critical mappings. Do not invent extra mappings, broaden the mechanism, or expand beyond the current grounded claim."
+            "- Prioritize only the first 3 critical mappings. Prefer exactly 3 strong mappings over padded weak ones. Do not invent extra mappings, broaden the mechanism, or expand beyond the current grounded claim."
+        )
+        guidance.append(
+            "- Rebuild only the first 3 critical mappings. Keep each repaired claim narrowly aligned to its source_variable/target_variable pair and at the same specificity as the supporting snippet."
+        )
+        guidance.append(
+            "- Do not pad with abstract correspondences, nearby downstream effects, or mechanism-level filler. If a snippet supports only the mechanism story, move that support to `evidence_map.mechanism_assertions` instead of forcing it into `evidence_map.variable_mappings`."
+        )
+        guidance.append(
+            "- If only 1 or 2 critical mappings can be directly supported from the current payload and evidence, prefer `{\"no_connection\": true}` over weak padding or malformed partial JSON."
         )
         current_variable_mapping = (
             original_data.get("variable_mapping")
@@ -4429,8 +4456,10 @@ def _stage_two_hypothesize_with_diagnostics(
             missing_fields,
             original_data=repair_original_data,
         )
-        if repaired is None or repaired.get("no_connection", True):
+        if repaired is None:
             return None, "repair_failed", None
+        if repaired.get("no_connection", False):
+            return None, _short_stage_two_failure_hint(repaired) or "returned_no_connection", None
         repaired = _apply_mechanism_naming_precision(repaired)
         repaired = _apply_normalized_mechanism_typing(repaired)
         incomplete_fields = _missing_required_fields(repaired)
