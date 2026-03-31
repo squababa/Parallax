@@ -185,6 +185,65 @@ def test_build_jump_search_query_disambiguates_generic_query_with_concrete_ancho
     assert "actuator" in query
 
 
+def test_build_jump_search_query_rebuilds_unanchored_overloaded_terms(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        jump,
+        "_generate_llm_jump_search_query",
+        lambda *_args, **_kwargs: "backtesting policy priority shared resource",
+    )
+
+    query = jump._build_jump_search_query(
+        {
+            "search_query": "backtesting policy priority shared resource",
+            "pattern_name": "Relay-gated mismatch suppression",
+            "abstract_structure": (
+                "relay gating suppresses mismatch faults before actuator switching"
+            ),
+            "measurable_signal": "mismatch fault rate during actuator startup",
+            "control_lever": "toggle relay gating before actuator switching",
+        },
+        "Network Protocols",
+        "Technology",
+    )
+
+    tokens = set(query.split())
+    assert "relay gating" in query
+    assert "actuator" in query
+    assert "backtesting" not in tokens
+    assert "policy" not in tokens
+    assert "priority" not in tokens
+    assert "shared" not in tokens
+    assert "resource" not in tokens
+
+
+def test_build_jump_search_query_keeps_anchored_overloaded_term_when_supported(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        jump,
+        "_generate_llm_jump_search_query",
+        lambda *_args, **_kwargs: "priority scheduling latency gating saturation",
+    )
+
+    query = jump._build_jump_search_query(
+        {
+            "search_query": "priority scheduling latency gating saturation",
+            "pattern_name": "Priority scheduling under queue saturation",
+            "abstract_structure": (
+                "priority scheduling gates queue admission when latency saturation rises"
+            ),
+            "measurable_signal": "queue latency and saturation rate",
+            "control_lever": "tune priority scheduling and latency gating",
+        },
+        "Network Protocols",
+        "Technology",
+    )
+
+    assert query == "priority scheduling latency gating saturation"
+
+
 def test_build_jump_search_queries_returns_base_query_plus_solution_variant(
     monkeypatch,
 ) -> None:
@@ -419,6 +478,7 @@ def test_stage_one_detect_prompt_prefers_solution_bearing_analogues(
     assert data is None
     assert failure_hint == "no_connection"
     assert "weight concrete mechanism-bearing snippets more heavily than broad topical overlap or generic titles" in captured["prompt"]
+    assert "reason cluster-by-cluster and prefer the strongest coherent cluster over isolated snippet overlap" in captured["prompt"]
     assert "one concrete target-domain process, one concrete shared constraint/mechanism, and one concrete workaround or operating response in the same evidence cluster" in captured["prompt"]
     assert "concrete evidence of an already engineered workaround" in captured["prompt"]
     assert "prefer the one with the clearest retrieved workaround or mitigation evidence" in captured["prompt"]
@@ -1244,16 +1304,26 @@ def test_lateral_jump_with_diagnostics_merges_multi_query_results_for_both_stage
         "queue threshold throttling latency",
         "queue threshold throttling latency workaround",
     ]
+    assert diagnostic["query_collision_guard_applied"] is False
     assert diagnostic["result_count"] == 3
-    assert diagnostic["top_result_titles"] == [
+    assert diagnostic["filtered_result_count"] == 0
+    assert diagnostic["filtered_result_reason_counts"] == {}
+    assert diagnostic["cluster_count"] == 3
+    assert set(diagnostic["top_result_titles"]) == {
         "Shared target paper",
         "Base-only target paper",
         "Solution-only target paper",
-    ]
+    }
+    assert set(diagnostic["top_cluster_hints"]) == {
+        "Shared target paper",
+        "Base-only target paper",
+        "Solution-only target paper",
+    }
     assert stage_inputs["stage1"] == stage_inputs["stage2"]
     assert stage_inputs["stage2_solution_evidence"] == (
         "actuation suppression during mismatch faults is the concrete workaround"
     )
+    assert "Candidate cluster 1:" in stage_inputs["stage1"]
     assert "Search result 1:" in stage_inputs["stage1"]
     assert stage_inputs["stage1"].count("Title: Shared target paper") == 1
     assert "Retrieved via: base, solution-biased" in stage_inputs["stage1"]
@@ -1261,6 +1331,319 @@ def test_lateral_jump_with_diagnostics_merges_multi_query_results_for_both_stage
     assert "Snippet: shared mechanism evidence for both queries" in stage_inputs["stage1"]
     assert "Retrieved via: base" in stage_inputs["stage1"]
     assert "Retrieved via: solution-biased" in stage_inputs["stage1"]
+
+
+def test_lateral_jump_with_diagnostics_clusters_coherent_results_ahead_of_generic_singleton(
+    monkeypatch,
+) -> None:
+    stage_inputs: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        jump,
+        "_build_jump_search_queries",
+        lambda *_args, **_kwargs: [
+            "queue threshold throttling latency",
+            "queue threshold throttling latency workaround",
+        ],
+    )
+
+    def fake_search(**kwargs):
+        if kwargs["query"] == "queue threshold throttling latency":
+            return {
+                "results": [
+                    {
+                        "title": "Safety interlock mismatch suppression",
+                        "content": (
+                            "Interlock suppression isolates the mismatched redundant lane "
+                            "before actuator startup."
+                        ),
+                        "url": "https://target.test/interlock-1",
+                    },
+                    {
+                        "title": "Modern systems overview",
+                        "content": "General systems background overview without a concrete workaround.",
+                        "url": "https://other.test/overview",
+                    },
+                ]
+            }
+        return {
+            "results": [
+                {
+                    "title": "Safety interlock mismatch response",
+                    "content": (
+                        "A practical workaround isolates the mismatched redundant lane "
+                        "and suppresses actuation on mismatch response."
+                    ),
+                    "url": "https://target.test/interlock-2",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(jump._tavily, "search", fake_search)
+
+    def fake_stage_one(**kwargs):
+        stage_inputs["stage1"] = kwargs["search_results"]
+        return (
+            {
+                "target_domain": "Safety Interlock Monitoring",
+                "signal": "shared structural signal",
+                "evidence": "specific clustered evidence",
+                "solution_evidence": "mismatch suppression is the concrete workaround",
+            },
+            None,
+        )
+
+    def fake_stage_two(**kwargs):
+        stage_inputs["stage2"] = kwargs["search_results"]
+        return (_safety_interlock_jump_payload(), None, None)
+
+    monkeypatch.setattr(jump, "_stage_one_detect_with_diagnostics", fake_stage_one)
+    monkeypatch.setattr(jump, "_stage_two_hypothesize_with_diagnostics", fake_stage_two)
+
+    connection, diagnostic = jump.lateral_jump_with_diagnostics(
+        {
+            "pattern_name": "Queue-threshold congestion gating",
+            "abstract_structure": "load compared against a queue threshold",
+            "search_query": "queue threshold throttling latency",
+        },
+        "Network Protocols",
+        "Technology",
+    )
+
+    assert connection is not None
+    assert diagnostic["cluster_count"] in {1, 2}
+    assert diagnostic["top_cluster_hints"]
+    assert "interlock" in diagnostic["top_cluster_hints"][0]
+    assert "mismatch" in diagnostic["top_cluster_hints"][0]
+    assert stage_inputs["stage1"] == stage_inputs["stage2"]
+    assert "Candidate cluster 1:" in stage_inputs["stage1"]
+    assert "Supporting results: 2" in stage_inputs["stage1"]
+    assert "Title: Safety interlock mismatch suppression" in stage_inputs["stage1"]
+    if "Title: Modern systems overview" in stage_inputs["stage1"]:
+        assert diagnostic["cluster_count"] == 2
+        assert stage_inputs["stage1"].index(
+            "Title: Safety interlock mismatch suppression"
+        ) < stage_inputs["stage1"].index("Title: Modern systems overview")
+    else:
+        assert diagnostic["cluster_count"] == 1
+
+
+def test_lateral_jump_with_diagnostics_filters_weak_broad_results_before_stage_one(
+    monkeypatch,
+) -> None:
+    stage_inputs: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        jump._tavily,
+        "search",
+        lambda **_kwargs: {
+            "results": [
+                {
+                    "title": "What is actuator routing",
+                    "content": "broad background context only",
+                    "url": "https://medium.com/overview",
+                },
+                {
+                    "title": "Relay gating mismatch suppression",
+                    "content": (
+                        "A practical workaround isolates the mismatched redundant lane "
+                        "before actuator switching."
+                    ),
+                    "url": "https://target.test/relay-gating",
+                },
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        jump,
+        "_generate_llm_jump_search_query",
+        lambda *_args, **_kwargs: "backtesting policy priority shared resource",
+    )
+
+    def fake_stage_one(**kwargs):
+        stage_inputs["stage1"] = kwargs["search_results"]
+        return (
+            {
+                "target_domain": "Safety Interlock Monitoring",
+                "signal": "shared structural signal",
+                "evidence": "specific evidence",
+                "solution_evidence": "concrete workaround",
+            },
+            None,
+        )
+
+    monkeypatch.setattr(jump, "_stage_one_detect_with_diagnostics", fake_stage_one)
+    monkeypatch.setattr(
+        jump,
+        "_stage_two_hypothesize_with_diagnostics",
+        lambda **_kwargs: (_safety_interlock_jump_payload(), None, None),
+    )
+
+    connection, diagnostic = jump.lateral_jump_with_diagnostics(
+        {
+            "pattern_name": "Queue-threshold congestion gating",
+            "abstract_structure": "load compared against a queue threshold",
+            "search_query": "queue threshold throttling latency",
+        },
+        "Network Protocols",
+        "Technology",
+    )
+
+    assert connection is not None
+    assert diagnostic["query_collision_guard_applied"] is True
+    assert diagnostic["filtered_result_count"] == 1
+    assert diagnostic["filtered_result_reason_counts"] == {
+        "weak_source": 1,
+        "broad_page": 1,
+        "low_anchor_overlap": 1,
+    }
+    assert diagnostic["result_count"] == 1
+    assert diagnostic["cluster_count"] == 1
+    assert stage_inputs["stage1"].count("Candidate cluster") == 1
+    assert "What is actuator routing" not in stage_inputs["stage1"]
+    assert "Relay gating mismatch suppression" in stage_inputs["stage1"]
+
+
+def test_lateral_jump_with_diagnostics_keeps_broad_result_with_anchor_overlap(
+    monkeypatch,
+) -> None:
+    stage_inputs: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        jump,
+        "_build_jump_search_queries",
+        lambda *_args, **_kwargs: ["relay gating mismatch suppression"],
+    )
+    monkeypatch.setattr(
+        jump._tavily,
+        "search",
+        lambda **_kwargs: {
+            "results": [
+                {
+                    "title": "Overview of relay gating mismatch suppression",
+                    "content": (
+                        "Relay gating mismatch suppression isolates the mismatched lane "
+                        "before actuator switching."
+                    ),
+                    "url": "https://target.test/overview",
+                }
+            ]
+        },
+    )
+
+    def fake_stage_one(**kwargs):
+        stage_inputs["stage1"] = kwargs["search_results"]
+        return (
+            {
+                "target_domain": "Safety Interlock Monitoring",
+                "signal": "shared structural signal",
+                "evidence": "specific evidence",
+                "solution_evidence": "concrete workaround",
+            },
+            None,
+        )
+
+    monkeypatch.setattr(jump, "_stage_one_detect_with_diagnostics", fake_stage_one)
+    monkeypatch.setattr(
+        jump,
+        "_stage_two_hypothesize_with_diagnostics",
+        lambda **_kwargs: (_safety_interlock_jump_payload(), None, None),
+    )
+
+    connection, diagnostic = jump.lateral_jump_with_diagnostics(
+        {
+            "pattern_name": "Relay-gated mismatch suppression",
+            "abstract_structure": "relay gating suppresses mismatch faults before actuator switching",
+            "search_query": "relay gating mismatch suppression",
+        },
+        "Network Protocols",
+        "Technology",
+    )
+
+    assert connection is not None
+    assert diagnostic["filtered_result_count"] == 0
+    assert "Overview of relay gating mismatch suppression" in stage_inputs["stage1"]
+
+
+def test_lateral_jump_with_diagnostics_prefers_anchored_cluster_over_collision_prone_result(
+    monkeypatch,
+) -> None:
+    stage_inputs: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        jump,
+        "_build_jump_search_queries",
+        lambda *_args, **_kwargs: ["relay gating mismatch suppression"],
+    )
+
+    monkeypatch.setattr(
+        jump._tavily,
+        "search",
+        lambda **_kwargs: {
+            "results": [
+                {
+                    "title": "Relay gating mismatch suppression",
+                    "content": (
+                        "Relay gating mismatch suppression isolates the mismatched lane "
+                        "before actuator switching."
+                    ),
+                    "url": "https://target.test/relay-1",
+                },
+                {
+                    "title": "Relay gating mismatch response",
+                    "content": (
+                        "A practical workaround isolates the mismatched lane "
+                        "before actuator startup."
+                    ),
+                    "url": "https://target.test/relay-2",
+                },
+                {
+                    "title": "Overview of system solution",
+                    "content": "generic solution overview for system performance",
+                    "url": "https://other.test/overview",
+                },
+            ]
+        },
+    )
+
+    def fake_stage_one(**kwargs):
+        stage_inputs["stage1"] = kwargs["search_results"]
+        return (
+            {
+                "target_domain": "Safety Interlock Monitoring",
+                "signal": "shared structural signal",
+                "evidence": "specific evidence",
+                "solution_evidence": "concrete workaround",
+            },
+            None,
+        )
+
+    monkeypatch.setattr(jump, "_stage_one_detect_with_diagnostics", fake_stage_one)
+    monkeypatch.setattr(
+        jump,
+        "_stage_two_hypothesize_with_diagnostics",
+        lambda **_kwargs: (_safety_interlock_jump_payload(), None, None),
+    )
+
+    connection, diagnostic = jump.lateral_jump_with_diagnostics(
+        {
+            "pattern_name": "Relay-gated mismatch suppression",
+            "abstract_structure": "relay gating suppresses mismatch faults before actuator switching",
+            "search_query": "relay gating mismatch suppression",
+        },
+        "Network Protocols",
+        "Technology",
+    )
+
+    assert connection is not None
+    assert "Title: Relay gating mismatch suppression" in stage_inputs["stage1"]
+    if "Title: Overview of system solution" in stage_inputs["stage1"]:
+        assert diagnostic["cluster_count"] == 2
+        assert stage_inputs["stage1"].index(
+            "Title: Relay gating mismatch suppression"
+        ) < stage_inputs["stage1"].index("Title: Overview of system solution")
+    else:
+        assert diagnostic["cluster_count"] == 1
 
 
 def test_lateral_jump_with_diagnostics_prefers_better_solution_bearing_excerpt_for_duplicate_url(

@@ -7,9 +7,12 @@ Two-stage process:
 import copy
 import json
 import re
+from urllib.parse import urlparse
 from tavily import TavilyClient
 from config import TAVILY_API_KEY
 from hypothesis_validation import (
+    CORE_TARGET_BROAD_PAGE_MARKERS,
+    CORE_TARGET_WEAK_SOURCE_MARKERS,
     MECHANISM_TYPE_V1_VOCAB,
     PROCESS_CONNECTORS,
     normalize_edge_analysis,
@@ -39,6 +42,7 @@ Strict rules:
 - A real structural match usually preserves the same driver -> mechanism -> outcome shape, with similar control logic.
 - Strong structural clues include similar threshold behavior, routing, bottlenecks, feedback loops, switching conditions, or gating logic.
 - Treat titles, provenance labels, and snippets as evidence, but weight concrete mechanism-bearing snippets more heavily than broad topical overlap or generic titles.
+- If SEARCH RESULTS are grouped into candidate clusters, reason cluster-by-cluster and prefer the strongest coherent cluster over isolated snippet overlap.
 - Approve only when one candidate domain shows one concrete target-domain process, one concrete shared constraint/mechanism, and one concrete workaround or operating response in the same evidence cluster.
 - Approve only when the target domain shows both the shared causal structure and concrete evidence of an already engineered workaround, mitigation, or operating response to that constraint.
 - Reject vague analogies, keyword overlap, and broad theme matches without similar causal organization.
@@ -744,6 +748,31 @@ AMBIGUOUS_JUMP_QUERY_TOKENS = {
     "switching",
     "threshold",
 }
+OVERLOADED_JUMP_QUERY_TOKENS = {
+    "arbitration",
+    "backtesting",
+    "policy",
+    "priority",
+    "resource",
+    "resources",
+    "shared",
+}
+JUMP_TITLE_SIGNATURE_NOISE_TOKENS = {
+    "checklist",
+    "guide",
+    "guides",
+    "introduction",
+    "modern",
+    "overview",
+    "paper",
+    "papers",
+    "review",
+    "reviews",
+    "study",
+    "studies",
+    "tutorial",
+    "wikipedia",
+}
 MECHANISM_QUERY_TOKENS = {
     "accumulation",
     "amplification",
@@ -803,6 +832,15 @@ FORMAL_QUERY_RED_FLAG_TOKENS = {
     "simultaneous",
     "verification",
 }
+SOLUTION_EVIDENCE_MARKERS = (
+    "workaround",
+    "mitigat",
+    "correct",
+    "bypass",
+    "compensat",
+    "solution",
+    "response",
+)
 QUERY_PHRASE_STOPWORDS = {
     "a",
     "an",
@@ -844,6 +882,220 @@ def _is_specific_jump_query_token(token: str) -> bool:
 
 def _is_concrete_jump_query_token(token: str) -> bool:
     return _is_specific_jump_query_token(token) and token not in AMBIGUOUS_JUMP_QUERY_TOKENS
+
+
+def _normalize_jump_result_host(url: str) -> str:
+    parsed = urlparse(str(url or "").strip())
+    host = str(parsed.netloc or "").strip().lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _build_jump_title_signature(
+    title_text: str,
+    blocked_tokens: set[str],
+) -> tuple[str, ...]:
+    priority_tokens: list[str] = []
+    secondary_tokens: list[str] = []
+    seen: set[str] = set()
+    for token in _tokenize_query_terms(title_text):
+        if (
+            token in seen
+            or token in blocked_tokens
+            or token in GENERIC_QUERY_TOKENS
+            or token in WEAK_QUERY_TOKENS
+            or token in JUMP_TITLE_SIGNATURE_NOISE_TOKENS
+            or len(token) <= 2
+            or not _is_specific_jump_query_token(token)
+        ):
+            continue
+        seen.add(token)
+        if token in MECHANISM_QUERY_TOKENS or "-" in token or len(token) >= 9:
+            priority_tokens.append(token)
+        else:
+            secondary_tokens.append(token)
+    signature = tuple((priority_tokens + secondary_tokens)[:4])
+    return signature if len(signature) >= 2 else ()
+
+
+def _jump_solution_marker_count(text: str) -> int:
+    lowered = str(text or "").lower()
+    return sum(1 for marker in SOLUTION_EVIDENCE_MARKERS if marker in lowered)
+
+
+def _jump_query_support_context(
+    pattern: dict,
+    source_domain: str,
+    source_category: str,
+) -> tuple[set[str], list[str], list[str]]:
+    blocked_tokens = set(_tokenize_query_terms(source_domain))
+    blocked_tokens.update(_tokenize_query_terms(source_category))
+    preferred_anchor_phrases = _preferred_jump_query_anchor_phrases(pattern, blocked_tokens)
+    support_tokens: list[str] = []
+    seen: set[str] = set()
+    for text in (
+        str(pattern.get("control_lever", "") or ""),
+        str(pattern.get("abstract_structure", "") or ""),
+        str(pattern.get("measurable_signal", "") or ""),
+        str(pattern.get("pattern_name", "") or ""),
+        str(pattern.get("transfer_rationale", "") or ""),
+    ):
+        for token in _tokenize_query_terms(text):
+            if (
+                token in seen
+                or token in blocked_tokens
+                or token in GENERIC_QUERY_TOKENS
+                or token in WEAK_QUERY_TOKENS
+                or token in OVERLOADED_JUMP_QUERY_TOKENS
+                or len(token) <= 2
+                or not _is_specific_jump_query_token(token)
+            ):
+                continue
+            seen.add(token)
+            support_tokens.append(token)
+    return blocked_tokens, preferred_anchor_phrases, support_tokens
+
+
+def _jump_query_anchor_support(
+    query: str,
+    preferred_anchor_phrases: list[str],
+    blocked_tokens: set[str],
+) -> tuple[bool, list[str]]:
+    lowered_query = str(query or "").lower()
+    has_preferred_phrase = any(
+        phrase and phrase in lowered_query for phrase in preferred_anchor_phrases
+    )
+    concrete_tokens = [
+        token
+        for token in _tokenize_query_terms(query)
+        if (
+            token not in blocked_tokens
+            and token not in GENERIC_QUERY_TOKENS
+            and token not in WEAK_QUERY_TOKENS
+            and token not in OVERLOADED_JUMP_QUERY_TOKENS
+            and _is_concrete_jump_query_token(token)
+        )
+    ]
+    return has_preferred_phrase, concrete_tokens
+
+
+def _select_best_jump_anchor_phrase(preferred_anchor_phrases: list[str]) -> str:
+    best_phrase = ""
+    best_rank = (-1, -1, -1, -1)
+    for phrase in preferred_anchor_phrases:
+        phrase_tokens = _tokenize_query_terms(phrase)
+        if len(phrase_tokens) < 2:
+            continue
+        first, second = phrase_tokens[0], phrase_tokens[1]
+        rank = (
+            1 if second in PHRASE_ANCHOR_TAIL_TOKENS else 0,
+            1 if second in MECHANISM_QUERY_TOKENS else 0,
+            1 if "-" not in first and "-" not in second else 0,
+            1 if first not in WEAK_QUERY_TOKENS else 0,
+        )
+        if rank > best_rank:
+            best_rank = rank
+            best_phrase = phrase
+    return best_phrase or (preferred_anchor_phrases[0] if preferred_anchor_phrases else "")
+
+
+def _needs_jump_query_collision_guard(
+    query: str,
+    preferred_anchor_phrases: list[str],
+    blocked_tokens: set[str],
+) -> bool:
+    query_tokens = _tokenize_query_terms(query)
+    if not query_tokens or not any(
+        token in OVERLOADED_JUMP_QUERY_TOKENS for token in query_tokens
+    ):
+        return False
+    has_preferred_phrase, concrete_tokens = _jump_query_anchor_support(
+        query,
+        preferred_anchor_phrases,
+        blocked_tokens,
+    )
+    return not (has_preferred_phrase and len(concrete_tokens) >= 2)
+
+
+def _apply_jump_query_collision_guard(
+    query: str,
+    pattern: dict,
+    source_domain: str,
+    source_category: str,
+) -> tuple[str, bool]:
+    clean_query = re.sub(r"\s+", " ", str(query or "").strip())
+    if not clean_query:
+        return "", False
+
+    blocked_tokens, preferred_anchor_phrases, support_tokens = _jump_query_support_context(
+        pattern,
+        source_domain,
+        source_category,
+    )
+    if not _needs_jump_query_collision_guard(
+        clean_query,
+        preferred_anchor_phrases,
+        blocked_tokens,
+    ):
+        return clean_query, False
+
+    selected: list[str] = []
+    covered_tokens: set[str] = set()
+
+    def _append_part(part: str) -> None:
+        normalized = str(part or "").strip()
+        if not normalized or normalized in selected:
+            return
+        selected.append(normalized)
+        covered_tokens.update(_tokenize_query_terms(normalized))
+
+    best_anchor_phrase = _select_best_jump_anchor_phrase(preferred_anchor_phrases)
+    if best_anchor_phrase:
+        phrase_tokens = _tokenize_query_terms(best_anchor_phrase)
+        if phrase_tokens and not any(token in covered_tokens for token in phrase_tokens):
+            _append_part(best_anchor_phrase)
+
+    def _append_tokens(tokens: list[str]) -> None:
+        for token in tokens:
+            if (
+                token in covered_tokens
+                or token in blocked_tokens
+                or token in GENERIC_QUERY_TOKENS
+                or token in WEAK_QUERY_TOKENS
+                or token in OVERLOADED_JUMP_QUERY_TOKENS
+                or len(token) <= 2
+            ):
+                continue
+            _append_part(token)
+            if len(_tokenize_query_terms(" ".join(selected))) >= 6:
+                return
+
+    current_tokens = [
+        token
+        for token in _tokenize_query_terms(clean_query)
+        if token not in OVERLOADED_JUMP_QUERY_TOKENS
+    ]
+    _append_tokens([token for token in current_tokens if _is_concrete_jump_query_token(token)])
+    _append_tokens(support_tokens)
+    _append_tokens([token for token in current_tokens if token in MECHANISM_QUERY_TOKENS])
+
+    rebuilt_query = " ".join(selected).strip()
+    rebuilt_tokens = _tokenize_query_terms(rebuilt_query)
+    if len(rebuilt_tokens) < 4:
+        _append_tokens(
+            [
+                token
+                for token in current_tokens
+                if token not in GENERIC_QUERY_TOKENS and token not in WEAK_QUERY_TOKENS
+            ]
+        )
+        rebuilt_query = " ".join(selected).strip()
+        rebuilt_tokens = _tokenize_query_terms(rebuilt_query)
+
+    if len(rebuilt_tokens) > 10:
+        rebuilt_query = " ".join(rebuilt_tokens[:10])
+    return rebuilt_query or clean_query, True
 
 
 def _extract_jump_query_phrases(text: str, blocked_tokens: set[str]) -> list[str]:
@@ -989,13 +1241,13 @@ def _disambiguate_jump_search_query(
         selected.append(normalized)
         covered_tokens.update(_tokenize_query_terms(normalized))
 
-    anchor_phrase = next(
-        (
+    anchor_phrase = _select_best_jump_anchor_phrase(
+        [
             phrase
             for phrase in preferred_anchor_phrases
             if phrase not in clean_query.lower()
-        ),
-        preferred_anchor_phrases[0] if preferred_anchor_phrases else "",
+        ]
+        or preferred_anchor_phrases
     )
     if anchor_phrase:
         _append_part(anchor_phrase)
@@ -1271,9 +1523,22 @@ def _build_jump_search_query(
     source_domain: str,
     source_category: str,
 ) -> str:
+    query, _collision_guard_applied = _build_jump_search_query_with_metadata(
+        pattern,
+        source_domain,
+        source_category,
+    )
+    return query
+
+
+def _build_jump_search_query_with_metadata(
+    pattern: dict,
+    source_domain: str,
+    source_category: str,
+) -> tuple[str, bool]:
     raw_query = str(pattern.get("search_query", "") or "").strip()
     if not raw_query:
-        return ""
+        return "", False
 
     heuristic_query = _build_jump_search_query_heuristic(
         pattern,
@@ -1281,6 +1546,12 @@ def _build_jump_search_query(
         source_category,
     )
     heuristic_query = _disambiguate_jump_search_query(
+        heuristic_query,
+        pattern,
+        source_domain,
+        source_category,
+    )
+    heuristic_query, heuristic_collision_guard_applied = _apply_jump_query_collision_guard(
         heuristic_query,
         pattern,
         source_domain,
@@ -1299,7 +1570,18 @@ def _build_jump_search_query(
             source_domain,
             source_category,
         )
-    return llm_query or heuristic_query
+    llm_collision_guard_applied = False
+    if llm_query:
+        llm_query, llm_collision_guard_applied = _apply_jump_query_collision_guard(
+            llm_query,
+            pattern,
+            source_domain,
+            source_category,
+        )
+    return (
+        llm_query or heuristic_query,
+        heuristic_collision_guard_applied or llm_collision_guard_applied,
+    )
 
 
 def _build_jump_search_queries(
@@ -1307,11 +1589,12 @@ def _build_jump_search_queries(
     source_domain: str,
     source_category: str,
 ) -> list[str]:
-    query = _build_jump_search_query(
+    query, collision_guard_applied = _build_jump_search_query_with_metadata(
         pattern,
         source_domain,
         source_category,
     )
+    _build_jump_search_queries.last_collision_guard_applied = collision_guard_applied
     if not query:
         return []
 
@@ -1329,6 +1612,134 @@ def _build_jump_search_queries(
         solution_terms[0],
     )
     return [query, f"{query} {solution_term}"]
+
+
+_build_jump_search_queries.last_collision_guard_applied = False
+
+
+def _jump_result_anchor_context(
+    pattern: dict,
+    source_domain: str,
+    source_category: str,
+    queries: list[str],
+) -> tuple[set[str], list[str], set[str]]:
+    blocked_tokens = set(_tokenize_query_terms(source_domain))
+    blocked_tokens.update(_tokenize_query_terms(source_category))
+    preferred_anchor_phrases = _preferred_jump_query_anchor_phrases(pattern, blocked_tokens)
+    strong_anchor_tokens: set[str] = set()
+    for text in (
+        str(pattern.get("control_lever", "") or ""),
+        str(pattern.get("abstract_structure", "") or ""),
+        str(pattern.get("measurable_signal", "") or ""),
+        str(pattern.get("pattern_name", "") or ""),
+        str(pattern.get("transfer_rationale", "") or ""),
+        *(str(query or "") for query in queries),
+    ):
+        for token in _tokenize_query_terms(text):
+            if (
+                token in blocked_tokens
+                or token in GENERIC_QUERY_TOKENS
+                or token in WEAK_QUERY_TOKENS
+                or token in OVERLOADED_JUMP_QUERY_TOKENS
+                or len(token) <= 2
+                or not _is_specific_jump_query_token(token)
+            ):
+                continue
+            strong_anchor_tokens.add(token)
+    return blocked_tokens, preferred_anchor_phrases, strong_anchor_tokens
+
+
+def _score_jump_result_anchor_overlap(
+    title_text: str,
+    url: str,
+    clean: str,
+    preferred_anchor_phrases: list[str],
+    strong_anchor_tokens: set[str],
+) -> tuple[int, bool]:
+    combined_text = " ".join(
+        part for part in (str(title_text or ""), str(clean or "")) if part
+    ).lower()
+    preferred_phrase_match = any(
+        phrase and phrase in combined_text for phrase in preferred_anchor_phrases
+    )
+    text_tokens = set(_tokenize_query_terms(f"{title_text} {clean} {url}"))
+    anchor_overlap = len(text_tokens.intersection(strong_anchor_tokens))
+    return anchor_overlap, preferred_phrase_match
+
+
+def _classify_weak_jump_result(
+    title_text: str,
+    url: str,
+    clean: str,
+    preferred_anchor_phrases: list[str],
+    strong_anchor_tokens: set[str],
+) -> tuple[bool, dict[str, object]]:
+    reference_text = " ".join(
+        part for part in (str(title_text or ""), str(url or "")) if part
+    ).lower()
+    weak_source = any(marker in reference_text for marker in CORE_TARGET_WEAK_SOURCE_MARKERS)
+    broad_page = any(marker in reference_text for marker in CORE_TARGET_BROAD_PAGE_MARKERS)
+    anchor_overlap, preferred_phrase_match = _score_jump_result_anchor_overlap(
+        title_text,
+        url,
+        clean,
+        preferred_anchor_phrases,
+        strong_anchor_tokens,
+    )
+    solution_marker_count = _jump_solution_marker_count(clean)
+    specificity_score = len(
+        {
+            token
+            for token in _tokenize_query_terms(f"{title_text} {clean}")
+            if (
+                len(token) >= 5
+                and token not in GENERIC_QUERY_TOKENS
+                and token not in WEAK_QUERY_TOKENS
+                and token not in JUMP_TITLE_SIGNATURE_NOISE_TOKENS
+                and token not in QUERY_PHRASE_STOPWORDS
+                and token
+                not in {
+                    "background",
+                    "broad",
+                    "context",
+                    "generic",
+                    "general",
+                    "introduction",
+                    "only",
+                    "overview",
+                    "performance",
+                    "system",
+                    "systems",
+                    "tutorial",
+                }
+            )
+        }
+    )
+    reliable_solution_evidence = solution_marker_count > 0 and specificity_score >= 4
+    should_drop = (
+        (weak_source or broad_page)
+        and anchor_overlap < 2
+        and not preferred_phrase_match
+        and not reliable_solution_evidence
+        and specificity_score < 5
+    )
+    reason_codes: list[str] = []
+    if should_drop:
+        if weak_source:
+            reason_codes.append("weak_source")
+        if broad_page:
+            reason_codes.append("broad_page")
+        if anchor_overlap < 2:
+            reason_codes.append("low_anchor_overlap")
+    return should_drop, {
+        "weak_source": weak_source,
+        "broad_page": broad_page,
+        "anchor_overlap": anchor_overlap,
+        "preferred_phrase_match": preferred_phrase_match,
+        "solution_marker_count": solution_marker_count,
+        "specificity_score": specificity_score,
+        "reason_codes": reason_codes,
+    }
 
 
 def _extract_json_substring(text: str) -> str | None:
@@ -3911,7 +4322,12 @@ def lateral_jump_with_diagnostics(
         "raw_search_query": raw_search_query,
         "built_jump_query": None,
         "built_jump_queries": [],
+        "query_collision_guard_applied": False,
         "result_count": 0,
+        "filtered_result_count": 0,
+        "filtered_result_reason_counts": {},
+        "cluster_count": 0,
+        "top_cluster_hints": [],
         "top_result_titles": [],
         "stage1_outcome": None,
         "stage1_target_domain": None,
@@ -3925,6 +4341,9 @@ def lateral_jump_with_diagnostics(
         pattern,
         source_domain,
         source_category,
+    )
+    diagnostic["query_collision_guard_applied"] = bool(
+        getattr(_build_jump_search_queries, "last_collision_guard_applied", False)
     )
     query = queries[0] if queries else ""
     diagnostic["built_jump_query"] = query
@@ -3942,22 +4361,22 @@ def lateral_jump_with_diagnostics(
     merged_results: list[dict] = []
     merged_result_index: dict[str, int] = {}
     query_labels = ("base", "solution-biased")
-    solution_excerpt_markers = (
-        "workaround",
-        "mitigat",
-        "correct",
-        "bypass",
-        "compensat",
-        "solution",
-        "response",
-    )
     query_error_count = 0
+    filtered_result_reason_counts: dict[str, int] = {}
+    filtered_result_reason_keys: dict[str, set[str]] = {}
+    blocked_cluster_tokens = set(_tokenize_query_terms(source_domain))
+    blocked_cluster_tokens.update(_tokenize_query_terms(source_category))
+    _blocked_anchor_tokens, preferred_anchor_phrases, strong_anchor_tokens = _jump_result_anchor_context(
+        pattern,
+        source_domain,
+        source_category,
+        queries,
+    )
 
     def _excerpt_rank(text: str, labels: list[str]) -> tuple[int, int, int, int, int]:
-        lowered = text.lower()
         tokens = _tokenize_query_terms(text)
         return (
-            sum(1 for marker in solution_excerpt_markers if marker in lowered),
+            _jump_solution_marker_count(text),
             len(set(tokens)),
             len(tokens),
             len(text),
@@ -3993,6 +4412,36 @@ def lateral_jump_with_diagnostics(
             if not clean:
                 continue
             url = str(result.get("url", "") or "").strip()
+            should_drop, weak_result_context = _classify_weak_jump_result(
+                title_text,
+                url,
+                clean,
+                preferred_anchor_phrases,
+                strong_anchor_tokens,
+            )
+            if should_drop:
+                filtered_key = (url or title_text or clean).lower()
+                existing_reason_codes = filtered_result_reason_keys.setdefault(
+                    filtered_key,
+                    set(),
+                )
+                if not existing_reason_codes:
+                    diagnostic["filtered_result_count"] += 1
+                for reason_code in weak_result_context.get("reason_codes") or []:
+                    if reason_code in existing_reason_codes:
+                        continue
+                    existing_reason_codes.add(reason_code)
+                    filtered_result_reason_counts[reason_code] = (
+                        filtered_result_reason_counts.get(reason_code, 0) + 1
+                    )
+                continue
+            anchor_overlap = int(weak_result_context.get("anchor_overlap") or 0)
+            preferred_phrase_match = bool(
+                weak_result_context.get("preferred_phrase_match")
+            )
+            solution_marker_count = int(
+                weak_result_context.get("solution_marker_count") or 0
+            )
             dedupe_key = (url or title_text or clean).lower()
             existing_index = merged_result_index.get(dedupe_key)
             if existing_index is None:
@@ -4003,6 +4452,9 @@ def lateral_jump_with_diagnostics(
                         "clean": clean,
                         "url": url,
                         "query_labels": [query_label],
+                        "anchor_overlap": anchor_overlap,
+                        "preferred_phrase_match": preferred_phrase_match,
+                        "solution_marker_count": solution_marker_count,
                     }
                 )
             else:
@@ -4018,43 +4470,187 @@ def lateral_jump_with_diagnostics(
                     existing_result["clean"] = clean
                     if title_text:
                         existing_result["title_text"] = title_text
+                    existing_result["anchor_overlap"] = anchor_overlap
+                    existing_result["preferred_phrase_match"] = preferred_phrase_match
+                    existing_result["solution_marker_count"] = solution_marker_count
                 if query_label not in existing_result["query_labels"]:
                     existing_result["query_labels"].append(query_label)
+
+    diagnostic["filtered_result_reason_counts"] = filtered_result_reason_counts
 
     if query_error_count == len(queries):
         diagnostic["stage1_outcome"] = "no_results"
         diagnostic["stage1_failure_hint"] = "search_error"
         return None, diagnostic
 
-    for index, merged_result in enumerate(merged_results, start=1):
-        title_text = str(merged_result.get("title_text", "") or "").strip()
-        clean = str(merged_result.get("clean", "") or "").strip()
-        url = str(merged_result.get("url", "") or "").strip()
-        source_reference = url or title_text
-        raw_target_candidates.append(
-            {
-                "target_excerpt": clean[:500],
-                "target_url": source_reference or None,
-                "evaluation_source_reference": " ".join(
-                    part for part in (title_text, url) if part
+    def _clustered_result_rank(result: dict) -> tuple[int, int, int, int, int, int, int, int]:
+        clean = str(result.get("clean", "") or "").strip()
+        query_labels = [
+            str(label).strip()
+            for label in (result.get("query_labels") or [])
+            if str(label).strip()
+        ]
+        title_signature = tuple(result.get("title_signature") or ())
+        excerpt_rank = _excerpt_rank(clean, query_labels)
+        return (
+            int(result.get("anchor_overlap") or 0),
+            1 if result.get("preferred_phrase_match") else 0,
+            1 if "solution-biased" in query_labels else 0,
+            int(result.get("solution_marker_count") or excerpt_rank[0]),
+            len(title_signature),
+            excerpt_rank[1],
+            excerpt_rank[2],
+            excerpt_rank[3],
+        )
+
+    clustered_results: list[dict] = []
+    for merged_result in merged_results:
+        title_signature = _build_jump_title_signature(
+            str(merged_result.get("title_text", "") or ""),
+            blocked_cluster_tokens,
+        )
+        normalized_host = _normalize_jump_result_host(str(merged_result.get("url", "") or ""))
+        result_entry = {
+            **merged_result,
+            "title_signature": title_signature,
+            "normalized_host": normalized_host,
+        }
+        matching_cluster: dict | None = None
+        if title_signature:
+            signature_set = set(title_signature)
+            for cluster in clustered_results:
+                cluster_signature = tuple(cluster.get("title_signature") or ())
+                if cluster_signature and cluster_signature == title_signature:
+                    matching_cluster = cluster
+                    break
+            if matching_cluster is None and normalized_host:
+                for cluster in clustered_results:
+                    cluster_signature = tuple(cluster.get("title_signature") or ())
+                    if (
+                        not cluster_signature
+                        or str(cluster.get("normalized_host", "") or "") != normalized_host
+                        or len(signature_set.intersection(cluster_signature)) < 2
+                    ):
+                        continue
+                    matching_cluster = cluster
+                    break
+        if matching_cluster is None:
+            clustered_results.append(
+                {
+                    "title_signature": title_signature,
+                    "normalized_host": normalized_host,
+                    "results": [result_entry],
+                }
+            )
+        else:
+            matching_cluster["results"].append(result_entry)
+
+    for cluster in clustered_results:
+        cluster_results = sorted(
+            cluster.get("results") or [],
+            key=_clustered_result_rank,
+            reverse=True,
+        )
+        cluster["results"] = cluster_results
+        cluster_signature = tuple(cluster.get("title_signature") or ())
+        best_result = cluster_results[0] if cluster_results else {}
+        cluster_hint = " ".join(cluster_signature).strip()
+        if not cluster_hint:
+            cluster_hint = str(best_result.get("title_text", "") or "").strip()
+        if not cluster_hint:
+            cluster_hint = str(cluster.get("normalized_host", "") or "").strip()
+        cluster["cluster_hint"] = cluster_hint or "singleton result"
+        marker_density = (
+            sum(
+                int(
+                    result.get("solution_marker_count")
+                    or _jump_solution_marker_count(str(result.get("clean", "") or ""))
                 )
-                or source_reference
-                or None,
-            }
+                for result in cluster_results
+            )
+            / max(len(cluster_results), 1)
         )
-        if title_text and title_text not in top_titles and len(top_titles) < 3:
-            top_titles.append(title_text)
-        search_content.append(f"Search result {index}:")
-        search_content.append(
-            f"Retrieved via: {', '.join(merged_result.get('query_labels', []))}"
+        anchor_overlap_total = sum(
+            int(result.get("anchor_overlap") or 0) for result in cluster_results
         )
-        search_content.append(f"Title: {title_text or 'Unknown'}")
-        if url:
-            search_content.append(f"URL: {url}")
-        search_content.append(f"Snippet: {clean}")
-        search_content.append("")
+        preferred_phrase_matches = sum(
+            1 for result in cluster_results if result.get("preferred_phrase_match")
+        )
+        best_result_rank = _clustered_result_rank(best_result) if cluster_results else (
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+        cluster["rank"] = (
+            len(cluster_results),
+            anchor_overlap_total,
+            preferred_phrase_matches,
+            1
+            if any(
+                "solution-biased" in (result.get("query_labels") or [])
+                for result in cluster_results
+            )
+            else 0,
+            marker_density,
+            len(cluster_signature),
+            best_result_rank[3],
+            best_result_rank[4],
+            best_result_rank[5],
+        )
+
+    clustered_results.sort(
+        key=lambda cluster: cluster.get("rank") or (0, 0, 0, 0, 0, 0, 0, 0, 0),
+        reverse=True,
+    )
 
     diagnostic["result_count"] = len(merged_results)
+    diagnostic["cluster_count"] = len(clustered_results)
+    diagnostic["top_cluster_hints"] = [
+        str(cluster.get("cluster_hint", "") or "").strip()
+        for cluster in clustered_results[:3]
+        if str(cluster.get("cluster_hint", "") or "").strip()
+    ]
+
+    for cluster_index, cluster in enumerate(clustered_results, start=1):
+        cluster_hint = str(cluster.get("cluster_hint", "") or "").strip() or "Unknown"
+        cluster_results = list(cluster.get("results") or [])
+        search_content.append(f"Candidate cluster {cluster_index}:")
+        search_content.append(f"Cluster hint: {cluster_hint}")
+        search_content.append(f"Supporting results: {len(cluster_results)}")
+        for result_index, merged_result in enumerate(cluster_results, start=1):
+            title_text = str(merged_result.get("title_text", "") or "").strip()
+            clean = str(merged_result.get("clean", "") or "").strip()
+            url = str(merged_result.get("url", "") or "").strip()
+            source_reference = url or title_text
+            raw_target_candidates.append(
+                {
+                    "target_excerpt": clean[:500],
+                    "target_url": source_reference or None,
+                    "evaluation_source_reference": " ".join(
+                        part for part in (title_text, url) if part
+                    )
+                    or source_reference
+                    or None,
+                }
+            )
+            if title_text and title_text not in top_titles and len(top_titles) < 3:
+                top_titles.append(title_text)
+            if result_index <= 2:
+                search_content.append(f"Search result {result_index}:")
+                search_content.append(
+                    f"Retrieved via: {', '.join(merged_result.get('query_labels', []))}"
+                )
+                search_content.append(f"Title: {title_text or 'Unknown'}")
+                if url:
+                    search_content.append(f"URL: {url}")
+                search_content.append(f"Snippet: {clean}")
+        search_content.append("")
+
     diagnostic["top_result_titles"] = top_titles
 
     combined = "\n".join(search_content)
