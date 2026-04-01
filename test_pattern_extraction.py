@@ -855,7 +855,36 @@ def test_dive_keeps_stronger_patterns_and_attaches_quality_metadata(
         "_search_seed",
         lambda _seed: (
             "source material",
-            {"seed_url": "https://seed.test", "seed_excerpt": "seed excerpt"},
+            {
+                "seed_url": "https://seed.test/queue",
+                "seed_excerpt": "Queue threshold gating stabilizes service latency under congestion.",
+                "selected_seed_sources": [
+                    {
+                        "title_text": "Queue control paper",
+                        "url": "https://seed.test/queue",
+                        "clean": "Queue threshold gating stabilizes service latency under congestion.",
+                        "selection_reasons": ["primary/operator source", "mechanism-rich"],
+                        "source_type": "scholarly_primary",
+                        "likely_primary_or_operator_source": True,
+                        "mechanism_signal": True,
+                        "intervention_signal": True,
+                        "query_index": 0,
+                        "specificity_score": 8,
+                    },
+                    {
+                        "title_text": "Retry control note",
+                        "url": "https://seed.test/retry",
+                        "clean": "Retry budget limits resend storms once repeated failures accumulate.",
+                        "selection_reasons": ["mechanism-rich"],
+                        "source_type": "general_web",
+                        "likely_primary_or_operator_source": False,
+                        "mechanism_signal": True,
+                        "intervention_signal": False,
+                        "query_index": 1,
+                        "specificity_score": 6,
+                    },
+                ],
+            },
         ),
     )
     monkeypatch.setattr(
@@ -915,9 +944,103 @@ def test_dive_keeps_stronger_patterns_and_attaches_quality_metadata(
         "Retry-window loss control",
     ]
     assert all("pattern_quality" in pattern for pattern in patterns)
+    assert all("source_anchor" in pattern for pattern in patterns)
+    assert all("_source_anchor_score" not in pattern for pattern in patterns)
+    assert explore.PATTERN_REQUIRED_FIELDS.issubset(patterns[0].keys())
+    assert patterns[0]["seed_url"] == "https://seed.test/queue"
+    assert patterns[0]["seed_excerpt"] == "Queue threshold gating stabilizes service latency under congestion."
+    assert patterns[0]["source_anchor"]["title"] == "Queue control paper"
+    assert patterns[0]["source_anchor"]["url"] == "https://seed.test/queue"
+    assert "Queue threshold gating stabilizes service latency" in patterns[0]["source_anchor"]["snippet"]
+    assert "matched source terms" in patterns[0]["source_anchor"]["note"]
     assert patterns[0]["pattern_quality"]["jump_support_score"] >= patterns[1]["pattern_quality"]["jump_support_score"]
     assert seed["pattern_diagnostics"]["retained_pattern_count"] == 2
     assert seed["pattern_diagnostics"]["high_quality_count"] >= 1
+
+
+def test_dive_keeps_quality_tie_order_even_when_later_pattern_is_better_anchored(
+    monkeypatch,
+) -> None:
+    seed = {"name": "Network Protocols", "category": "Technology", "seed_queries": []}
+    monkeypatch.setattr(
+        explore,
+        "_search_seed",
+        lambda _seed: (
+            "source material",
+            {
+                "seed_url": "https://seed.test/queue",
+                "seed_excerpt": "Queue threshold gating stabilizes service latency under congestion.",
+                "selected_seed_sources": [
+                    {
+                        "title_text": "Queue control paper",
+                        "url": "https://seed.test/queue",
+                        "clean": "Queue threshold gating stabilizes service latency under congestion.",
+                        "selection_reasons": ["mechanism-rich"],
+                        "source_type": "general_web",
+                        "likely_primary_or_operator_source": False,
+                        "mechanism_signal": True,
+                        "intervention_signal": True,
+                        "query_index": 0,
+                        "specificity_score": 8,
+                    }
+                ],
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        explore,
+        "_generate_json_with_retry",
+        lambda *_args, **_kwargs: json.dumps(
+            {
+                "patterns": [
+                    {
+                        "pattern_name": "Comparator-driven arbitration handoff",
+                        "description": "A comparator redistributes work when arbitration pressure shifts.",
+                        "abstract_structure": (
+                            "A monitored load comparator redistributes demand across pathways "
+                            "when arbitration pressure exceeds a control boundary."
+                        ),
+                        "search_query": "arbitration comparator redistribution pressure",
+                        "measurable_signal": "arbitration pressure and reassignment rate",
+                        "control_lever": "adjust the comparator boundary",
+                        "transfer_rationale": "Transfers to systems that reroute work after comparator checks.",
+                    },
+                    {
+                        "pattern_name": "Queue-threshold congestion gating",
+                        "description": "Queue threshold gating suppresses inflow and stabilizes delay.",
+                        "abstract_structure": (
+                            "Increasing queue load is compared against a threshold; "
+                            "crossing it throttles inflow and lowers service latency."
+                        ),
+                        "search_query": "queue threshold throttling latency",
+                        "measurable_signal": "queue length and mean delay",
+                        "control_lever": "adjust the congestion threshold",
+                        "transfer_rationale": "Transfers to buffered systems that gate inflow under overload.",
+                    },
+                ]
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        explore,
+        "_profile_pattern_quality",
+        lambda *_args, **_kwargs: {
+            "score": 0.81,
+            "band": "high",
+            "jump_support_score": 0.81,
+            "jump_ready": True,
+            "strengths": ["mechanism-rich"],
+            "concerns": [],
+            "summary": "high-quality pattern (0.81); jump ready (0.81)",
+        },
+    )
+    monkeypatch.setattr(explore, "PATTERN_MAX_RETURNED", 1)
+
+    patterns = explore.dive(seed)
+
+    assert len(patterns) == 1
+    assert patterns[0]["pattern_name"] == "Comparator-driven arbitration handoff"
+    assert "source_anchor" not in patterns[0]
 
 
 def test_search_seed_uses_three_queries_with_bounded_richness(monkeypatch) -> None:

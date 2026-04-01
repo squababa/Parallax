@@ -352,6 +352,36 @@ PATTERN_OPTIONAL_FIELDS = (
     "control_lever",
     "transfer_rationale",
 )
+PATTERN_ANCHOR_STOPWORDS = {
+    "across",
+    "against",
+    "because",
+    "control",
+    "controls",
+    "domain",
+    "general",
+    "however",
+    "mechanism",
+    "mechanisms",
+    "operator",
+    "operators",
+    "process",
+    "processes",
+    "research",
+    "resulting",
+    "selected",
+    "signal",
+    "signals",
+    "snippet",
+    "source",
+    "sources",
+    "system",
+    "systems",
+    "through",
+    "using",
+    "where",
+    "within",
+}
 
 
 def _normalize_text(value: object) -> str:
@@ -563,6 +593,146 @@ def _profile_pattern_quality(pattern: dict, seed: dict) -> dict:
             f"jump {'ready' if jump_ready else 'weak'} ({jump_support_score:.2f})"
         ),
     }
+
+
+def _pattern_anchor_tokens(*values: object) -> set[str]:
+    """Extract a small set of non-trivial anchor tokens from pattern/source text."""
+    tokens: set[str] = set()
+    for value in values:
+        text = _normalize_text(value).lower()
+        if not text:
+            continue
+        for token in re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)?", text):
+            if len(token) < 4 or token in PATTERN_ANCHOR_STOPWORDS:
+                continue
+            tokens.add(token)
+    return tokens
+
+
+def _seed_source_candidates_from_provenance(provenance: dict) -> list[dict]:
+    """Return selected seed sources, falling back to coarse provenance when needed."""
+    selected_sources = provenance.get("selected_seed_sources")
+    if isinstance(selected_sources, list):
+        cleaned_sources = [
+            dict(source)
+            for source in selected_sources
+            if isinstance(source, dict) and str(source.get("clean") or "").strip()
+        ]
+        if cleaned_sources:
+            return cleaned_sources
+
+    fallback_excerpt = _normalize_text(provenance.get("seed_excerpt"))
+    fallback_url = _normalize_text(provenance.get("seed_url"))
+    if not fallback_excerpt and not fallback_url:
+        return []
+    return [
+        {
+            "title_text": "",
+            "url": fallback_url,
+            "clean": fallback_excerpt,
+            "selection_reasons": ["fallback provenance"],
+            "source_type": "general_web",
+            "likely_primary_or_operator_source": False,
+            "mechanism_signal": False,
+            "intervention_signal": False,
+            "query_index": 0,
+            "specificity_score": 0,
+        }
+    ]
+
+
+def _attach_pattern_source_anchor(pattern: dict, provenance: dict) -> tuple[dict, int]:
+    """Attach one best-effort source anchor to a retained pattern for inspection."""
+    sources = _seed_source_candidates_from_provenance(provenance)
+    if not sources:
+        return pattern, 0
+
+    query_tokens = _pattern_anchor_tokens(pattern.get("search_query"))
+    signal_tokens = _pattern_anchor_tokens(
+        pattern.get("measurable_signal"),
+        pattern.get("control_lever"),
+    )
+    pattern_tokens = _pattern_anchor_tokens(
+        pattern.get("pattern_name"),
+        pattern.get("description"),
+        pattern.get("abstract_structure"),
+        pattern.get("transfer_rationale"),
+    )
+
+    best_source: dict | None = None
+    best_score = 0
+    best_overlap: list[str] = []
+    for source in sources:
+        source_tokens = _pattern_anchor_tokens(
+            source.get("title_text"),
+            source.get("clean"),
+        )
+        query_overlap = sorted(query_tokens.intersection(source_tokens))
+        signal_overlap = sorted(signal_tokens.intersection(source_tokens))
+        general_overlap = sorted(
+            pattern_tokens.intersection(source_tokens)
+            - set(query_overlap)
+            - set(signal_overlap)
+        )
+        overlap_tokens = query_overlap + signal_overlap + general_overlap
+        overlap_score = (
+            len(query_overlap) * 5
+            + len(signal_overlap) * 4
+            + min(4, len(general_overlap)) * 2
+        )
+        source_score = (
+            overlap_score
+            + (3 if source.get("likely_primary_or_operator_source") else 0)
+            + (2 if source.get("mechanism_signal") else 0)
+            + (1 if source.get("intervention_signal") else 0)
+            - (2 if source.get("source_type") == "broad_overview" else 0)
+        )
+        if not overlap_tokens:
+            continue
+        if (
+            best_source is None
+            or (
+                source_score,
+                -int(source.get("query_index") or 0),
+                int(source.get("specificity_score") or 0),
+            )
+            > (
+                best_score,
+                -int(best_source.get("query_index") or 0),
+                int(best_source.get("specificity_score") or 0),
+            )
+        ):
+            best_source = source
+            best_score = source_score
+            best_overlap = overlap_tokens[:3]
+
+    if best_source is None or best_score <= 0:
+        return pattern, 0
+
+    anchored = dict(pattern)
+    source_anchor = {
+        "snippet": str(best_source.get("clean") or "").strip()[:500],
+    }
+    title_text = _normalize_text(best_source.get("title_text"))
+    source_url = _normalize_text(best_source.get("url"))
+    if title_text:
+        source_anchor["title"] = title_text
+    if source_url:
+        source_anchor["url"] = source_url
+    note_parts: list[str] = []
+    if best_overlap:
+        note_parts.append(f"matched source terms: {', '.join(best_overlap)}")
+    selection_reasons = [
+        _normalize_text(reason)
+        for reason in list(best_source.get("selection_reasons") or [])
+        if _normalize_text(reason)
+    ]
+    if selection_reasons:
+        note_parts.append(f"source quality: {', '.join(selection_reasons[:2])}")
+    if note_parts:
+        source_anchor["note"] = "; ".join(note_parts)
+    anchored["source_anchor"] = source_anchor
+    return anchored, best_score
 
 
 def _pattern_diagnostics(
@@ -919,6 +1089,10 @@ def _search_seed(seed: dict) -> tuple[str, dict]:
         )
         combined.append(f"Snippet: {result.get('clean') or ''}")
         combined.append("")
+    if selected_results:
+        provenance["selected_seed_sources"] = [
+            dict(result) for result in selected_results[:SEED_SEARCH_SELECTED_RESULT_LIMIT]
+        ]
     return "\n".join(combined), provenance
 def _extract_json_substring(text: str) -> str | None:
     """
@@ -1107,7 +1281,11 @@ def dive(seed: dict) -> list[dict]:
             normalized["seed_url"] = provenance["seed_url"]
         if provenance.get("seed_excerpt"):
             normalized["seed_excerpt"] = provenance["seed_excerpt"]
-        valid.append(normalized)
+        anchored_pattern, _anchor_score = _attach_pattern_source_anchor(
+            normalized,
+            provenance,
+        )
+        valid.append(anchored_pattern)
 
     valid.sort(
         key=lambda pattern: (
