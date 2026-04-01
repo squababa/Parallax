@@ -261,6 +261,44 @@ def test_stage2_test_prompt_ties_main_test_and_cheap_test_together() -> None:
     assert '"confirm": "what result would support the lever"' in prompt
 
 
+def test_stage2_test_prompt_rejects_generic_cheap_test_wording() -> None:
+    prompt = jump.STAGE2_TEST_PROMPT
+
+    assert "`edge_analysis.cheap_test` must be one real cheap operator-facing workflow slice, not a generic validation program." in prompt
+    assert "Reject generic cheap-test wording such as `run a study`, `validate the hypothesis`, `collect more data`, or `see if the effect appears`." in prompt
+    assert "`edge_analysis.cheap_test` must stay smaller, cheaper, and more decision-facing than the main test" in prompt
+
+
+def test_stage2_test_prompt_requires_metric_alignment_between_main_and_cheap_test() -> None:
+    prompt = jump.STAGE2_TEST_PROMPT
+
+    assert "`test.metric` must use a canonical literature-facing metric name" in prompt
+    assert "`test.confirm` and `test.falsify` must stay on one explicit named metric and one explicit comparator/result family." in prompt
+    assert "`edge_analysis.cheap_test.metric` must stay tightly aligned to `test.metric`: use the same named measurable quantity or a narrow comparator on that same quantity, not a generic proxy." in prompt
+
+
+def test_stage2_edge_prompt_requires_one_hidden_problem_on_same_metric_operator_context() -> None:
+    prompt = jump.STAGE2_EDGE_PROMPT
+
+    assert "`edge_analysis.problem_statement` must name exactly one hidden operational problem, blind spot, missed control point, or failure mode, not field-summary prose." in prompt
+    assert "Tie `edge_analysis.problem_statement` to the same process, the same metric/comparator, and the same operator decision already used in the current test bundle." in prompt
+    assert "Keep the whole edge layer as one operator handoff on the current claim, not a literature summary or second target outcome." in prompt
+
+
+def test_stage2_edge_prompt_requires_edge_if_right_actor_decision_and_advantage() -> None:
+    prompt = jump.STAGE2_EDGE_PROMPT
+
+    assert "`edge_analysis.actionable_lever` must name exactly one concrete operator move" in prompt
+    assert "`edge_analysis.edge_if_right` must name exactly one operator, what decision or workflow they change if confirmed, and what concrete advantage they gain." in prompt
+    assert "`edge_analysis.deployment_scope` should say where to try the lever first." in prompt
+
+
+def test_stage2_edge_prompt_requires_expected_asymmetry_to_explain_underuse() -> None:
+    prompt = jump.STAGE2_EDGE_PROMPT
+
+    assert "`edge_analysis.expected_asymmetry` must explain why the lever is plausibly underused, hidden by workflow, or screened out by standard framing, not merely say it creates an edge or has value." in prompt
+
+
 def test_stage2_substage_static_metadata_matches_intended_split() -> None:
     assert jump.STAGE2_SUBSTAGE_SEQUENCE == ("mechanism", "predict", "test", "edge")
     assert jump.STAGE2_SUBSTAGE_STAGE_NAMES == {

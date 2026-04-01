@@ -480,6 +480,13 @@ Return ONLY valid JSON. No markdown.
 - Consume the current mechanism and prediction as fixed context.
 - Fill only `test` plus `edge_analysis.cheap_test` in this stage.
 - Keep `test.*` and `edge_analysis.cheap_test.*` tied to the same metric, comparator, and operator-facing workflow slice.
+- `test.metric` must use a canonical literature-facing metric name already used in the target-domain search results or standard papers, not a bespoke paraphrase or generic placeholder.
+- `test.confirm` and `test.falsify` must stay on one explicit named metric and one explicit comparator/result family. Do not drift into vague language like `check whether the effect happens`, `results improve`, or a different success criterion.
+- `edge_analysis.cheap_test` must be one real cheap operator-facing workflow slice, not a generic validation program.
+- `edge_analysis.cheap_test.setup` must name one concrete operator move, dataset replay, simulation, audit, filter, threshold toggle, or measurement path on a narrow existing workflow slice.
+- `edge_analysis.cheap_test` must stay smaller, cheaper, and more decision-facing than the main test, while reusing the same process, metric, comparator, and operator context.
+- Reject generic cheap-test wording such as `run a study`, `validate the hypothesis`, `collect more data`, or `see if the effect appears`.
+- `edge_analysis.cheap_test.metric` must stay tightly aligned to `test.metric`: use the same named measurable quantity or a narrow comparator on that same quantity, not a generic proxy.
 - Do not fill other edge_analysis fields in this stage.
 - If the test bundle cannot be grounded on the current claim, return `{{"no_connection": true}}`.
 
@@ -518,6 +525,13 @@ SEARCH RESULTS:
 Return ONLY valid JSON. No markdown.
 - Consume the current mechanism, prediction, test, and cheap_test bundle as fixed context.
 - Fill only edge-layer fields: problem_statement, why_missed, actionable_lever, edge_if_right, expected_asymmetry, primary_operator, and deployment_scope.
+- `edge_analysis.problem_statement` must name exactly one hidden operational problem, blind spot, missed control point, or failure mode, not field-summary prose.
+- Tie `edge_analysis.problem_statement` to the same process, the same metric/comparator, and the same operator decision already used in the current test bundle.
+- `edge_analysis.actionable_lever` must name exactly one concrete operator move, setting change, filter, routing rule, threshold adjustment, replay, audit, or workflow intervention. Do not use advisory filler like `consider`, `explore`, `may help`, or `investigate`.
+- `edge_analysis.edge_if_right` must name exactly one operator, what decision or workflow they change if confirmed, and what concrete advantage they gain.
+- `edge_analysis.expected_asymmetry` must explain why the lever is plausibly underused, hidden by workflow, or screened out by standard framing, not merely say it creates an edge or has value.
+- `edge_analysis.deployment_scope` should say where to try the lever first.
+- Keep the whole edge layer as one operator handoff on the current claim, not a literature summary or second target outcome.
 - Do not rewrite connection, mechanism, prediction, test, variable_mapping, or evidence_map fields here.
 - Do not add or rewrite `edge_analysis.cheap_test` in this stage.
 - If the edge layer cannot be grounded on the current claim, return `{{"no_connection": true}}`.
