@@ -1774,6 +1774,46 @@ def test_stage_two_hypothesize_prompt_reuses_stage_one_solution_evidence(
     assert "Reuse Stage 1 `solution_evidence` as the workaround anchor when present." in captured["prompt"]
 
 
+def test_stage_two_hypothesize_preserves_workaround_anchor_across_substage_prompts(
+    monkeypatch,
+) -> None:
+    payload = _valid_stage2_payload()
+    split_payload = _split_stage2_payload(payload)
+    captured_prompts: dict[str, str] = {}
+
+    monkeypatch.setattr(jump, "_format_relevant_scars_for_prompt", lambda *_args: "None.")
+
+    def fake_generate_json_with_retry(prompt, stage_name, _max_tokens):
+        substage = stage_name.replace("stage2_", "")
+        captured_prompts[substage] = prompt
+        return json.dumps(split_payload[substage])
+
+    monkeypatch.setattr(jump, "_generate_json_with_retry", fake_generate_json_with_retry)
+
+    repaired, failure_hint, incomplete_fields = jump._stage_two_hypothesize_with_diagnostics(
+        source_domain=payload["source_domain"],
+        abstract_structure="load compared against a queue threshold",
+        stage_one={
+            "target_domain": payload["target_domain"],
+            "signal": "shared structural signal",
+            "evidence": payload["evidence"],
+            "solution_evidence": "filtered offset assignment is the grounded workaround",
+        },
+        search_results="Title: target paper\nconcrete target evidence",
+    )
+
+    assert repaired is not None
+    assert failure_hint is None
+    assert incomplete_fields is None
+    assert "filtered offset assignment is the grounded workaround" in captured_prompts["mechanism"]
+    assert '"solution_evidence": "filtered offset assignment is the grounded workaround"' in captured_prompts["predict"]
+    assert payload["mechanism"] in captured_prompts["predict"]
+    assert '"solution_evidence": "filtered offset assignment is the grounded workaround"' in captured_prompts["test"]
+    assert payload["prediction"]["observable"] in captured_prompts["test"]
+    assert '"solution_evidence": "filtered offset assignment is the grounded workaround"' in captured_prompts["edge"]
+    assert payload["edge_analysis"]["cheap_test"]["setup"] in captured_prompts["edge"]
+
+
 def test_stage_two_hypothesize_repair_receives_stage_one_solution_evidence(
     monkeypatch,
 ) -> None:
@@ -2003,6 +2043,12 @@ def test_run_stage_two_substage_repair_stays_local_to_owned_fields(
     assert failure_hint is None
     assert incomplete_fields is None
     assert captured["missing_fields"] == ["edge_analysis.cheap_test.time_to_signal"]
+    assert captured["original_data"]["solution_evidence"] == (
+        "filtered offset assignment is the grounded workaround"
+    )
+    assert captured["original_data"]["connection"] == payload["connection"]
+    assert captured["original_data"]["prediction"] == payload["prediction"]
+    assert set(captured["original_data"]["edge_analysis"]) == {"cheap_test"}
     assert "problem_statement" not in captured["original_data"].get("edge_analysis", {})
     assert repaired["edge_analysis"]["cheap_test"]["time_to_signal"] == (
         payload["edge_analysis"]["cheap_test"]["time_to_signal"]
@@ -2044,6 +2090,12 @@ def test_stage_two_hypothesize_assembles_split_outputs_into_current_candidate_sh
     assert assembled["test"] == payload["test"]
     assert assembled["edge_analysis"] == payload["edge_analysis"]
     assert assembled["evidence_map"] == jump.normalize_evidence_map(payload["evidence_map"])
+    assert set(assembled) == set(payload) | {"mechanism_typing", "solution_evidence"}
+    assert set(assembled["prediction"]) == set(payload["prediction"])
+    assert set(assembled["test"]) == set(payload["test"])
+    assert set(assembled["edge_analysis"]) == set(payload["edge_analysis"])
+    passed, reasons = validate_hypothesis(assembled)
+    assert passed, reasons
     assert transmit.format_transmission(
         1,
         assembled["source_domain"],
