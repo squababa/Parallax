@@ -4,6 +4,7 @@ Searches a seed domain and extracts abstract patterns via LLM.
 """
 import json
 import re
+from urllib.parse import urlparse
 from tavily import TavilyClient
 from config import MODEL, TAVILY_API_KEY
 from llm_client import get_llm_client
@@ -15,6 +16,88 @@ EXPLORE_MODEL = MODEL
 SEED_SEARCH_QUERY_LIMIT = 3
 SEED_SEARCH_MAX_RESULTS = 4
 SEED_SEARCH_ADVANCED_QUERY_COUNT = 1
+SEED_SEARCH_SELECTED_RESULT_LIMIT = 6
+SEED_SEARCH_MECHANISM_MARKERS = (
+    "accumul",
+    "bottleneck",
+    "compare",
+    "constraint",
+    "control",
+    "decay",
+    "feedback",
+    "filter",
+    "gate",
+    "inhibit",
+    "latency",
+    "limit",
+    "mechanism",
+    "queue",
+    "regulat",
+    "route",
+    "saturat",
+    "switch",
+    "threshold",
+)
+SEED_SEARCH_INTERVENTION_MARKERS = (
+    "adjust",
+    "audit",
+    "control strateg",
+    "intervention",
+    "mainten",
+    "manual",
+    "mitigat",
+    "operat",
+    "protocol",
+    "repair",
+    "rerout",
+    "schedule",
+    "suppres",
+    "tuning",
+    "workflow",
+)
+SEED_SEARCH_BROAD_TEXT_MARKERS = (
+    "comprehensive survey",
+    "fundamental concepts",
+    "general background",
+    "introduction",
+    "overview",
+    "review",
+    "survey",
+    "tutorial",
+)
+SEED_SEARCH_SCHOLARLY_HOST_MARKERS = (
+    "arxiv.org",
+    "biorxiv.org",
+    "cell.com",
+    "dl.acm.org",
+    "ieeexplore.ieee.org",
+    "nature.com",
+    "ncbi.nlm.nih.gov",
+    "pubmed.ncbi.nlm.nih.gov",
+    "sciencedirect.com",
+    "springer.com",
+)
+SEED_SEARCH_REPOSITORY_HOST_MARKERS = (
+    "github.com",
+    "gitlab.com",
+    "wikipedia.org",
+)
+SEED_SEARCH_OPERATOR_HOST_MARKERS = (
+    "cdc.gov",
+    "docs.",
+    "engineering.",
+    "nih.gov",
+    "nasa.gov",
+    "support.",
+)
+SEED_SEARCH_SOURCE_TYPE_SCORES = {
+    "scholarly_primary": 5,
+    "operator_or_technical": 4,
+    "patent_or_standard": 3,
+    "general_web": 2,
+    "repository_or_reference": 1,
+    "broad_overview": 0,
+}
 EXTRACT_PROMPT = """You are a pattern extraction engine. Your job is to extract up to 5 transferable, mechanism-level patterns from a domain.
 Domain: {domain}
 
@@ -600,10 +683,155 @@ def finalize_pattern_diagnostics(seed: dict, connections_found: int) -> dict | N
     return final
 
 
+def _normalize_seed_search_host(url: str) -> str:
+    """Return one normalized host for lightweight seed-source typing."""
+    parsed = urlparse(str(url or "").strip())
+    host = str(parsed.netloc or "").strip().lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _match_seed_search_markers(text: str, markers: tuple[str, ...]) -> list[str]:
+    """Return up to a few ordered substring matches for search-result quality signals."""
+    lowered = str(text or "").lower()
+    matches: list[str] = []
+    for marker in markers:
+        if marker in lowered and marker not in matches:
+            matches.append(marker)
+    return matches[:3]
+
+
+def _classify_seed_search_result(
+    title_text: str,
+    url: str,
+    clean: str,
+    query_index: int,
+) -> dict:
+    """Attach lightweight source and evidence-quality metadata to one seed-search result."""
+    host = _normalize_seed_search_host(url)
+    title_lower = str(title_text or "").lower()
+    reference_text = " ".join(part for part in (title_text, host, url) if part).lower()
+    content_text = " ".join(part for part in (title_text, clean) if part).lower()
+
+    mechanism_matches = _match_seed_search_markers(
+        content_text,
+        SEED_SEARCH_MECHANISM_MARKERS,
+    )
+    intervention_matches = _match_seed_search_markers(
+        content_text,
+        SEED_SEARCH_INTERVENTION_MARKERS,
+    )
+    broad_matches = _match_seed_search_markers(
+        content_text,
+        SEED_SEARCH_BROAD_TEXT_MARKERS,
+    )
+
+    if (
+        any(marker in host for marker in SEED_SEARCH_REPOSITORY_HOST_MARKERS)
+        or "readme" in reference_text
+    ):
+        source_type = "repository_or_reference"
+    elif "patent" in reference_text or "standard" in title_lower or "rfc" in title_lower:
+        source_type = "patent_or_standard"
+    elif (
+        any(marker in host for marker in SEED_SEARCH_SCHOLARLY_HOST_MARKERS)
+        or host.endswith(".edu")
+        or host.endswith(".ac.uk")
+        or "[pdf]" in title_lower
+    ):
+        source_type = "scholarly_primary"
+    elif (
+        host.endswith(".gov")
+        or any(marker in host for marker in SEED_SEARCH_OPERATOR_HOST_MARKERS)
+        or any(
+            marker in title_lower
+            for marker in ("guideline", "manual", "operations", "protocol", "workflow")
+        )
+    ):
+        source_type = "operator_or_technical"
+    else:
+        source_type = "general_web"
+        if broad_matches:
+            source_type = "broad_overview"
+
+    likely_primary_or_operator_source = source_type in {
+        "operator_or_technical",
+        "patent_or_standard",
+        "scholarly_primary",
+    }
+    specificity_score = len(
+        {
+            token
+            for token in re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)?", content_text)
+            if len(token) >= 6
+            and token
+            not in {
+                "across",
+                "analysis",
+                "because",
+                "general",
+                "overview",
+                "review",
+                "source",
+                "system",
+                "systems",
+                "through",
+                "within",
+            }
+        }
+    )
+
+    score = (
+        SEED_SEARCH_SOURCE_TYPE_SCORES[source_type] * 10
+        + (8 if likely_primary_or_operator_source else 0)
+        + (min(4, len(mechanism_matches)) * 3)
+        + (min(3, len(intervention_matches)) * 4)
+        + min(8, specificity_score)
+    )
+    if broad_matches:
+        score -= 5
+        if not mechanism_matches and not intervention_matches:
+            score -= 8
+    if source_type == "repository_or_reference":
+        score -= 3
+
+    selection_reasons: list[str] = []
+    if likely_primary_or_operator_source:
+        selection_reasons.append("primary/operator source")
+    if mechanism_matches:
+        selection_reasons.append("mechanism-rich")
+    if intervention_matches:
+        selection_reasons.append("intervention-bearing")
+    if not selection_reasons and source_type == "broad_overview":
+        selection_reasons.append("broad context only")
+    if not selection_reasons:
+        selection_reasons.append("usable source detail")
+
+    return {
+        "title_text": str(title_text or "").strip(),
+        "url": str(url or "").strip(),
+        "host": host,
+        "clean": str(clean or "").strip(),
+        "query_index": int(query_index),
+        "source_type": source_type,
+        "likely_primary_or_operator_source": likely_primary_or_operator_source,
+        "mechanism_signal": bool(mechanism_matches),
+        "intervention_signal": bool(intervention_matches),
+        "mechanism_matches": mechanism_matches,
+        "intervention_matches": intervention_matches,
+        "broad_matches": broad_matches,
+        "specificity_score": specificity_score,
+        "score": score,
+        "selection_reasons": selection_reasons,
+    }
+
+
 def _search_seed(seed: dict) -> tuple[str, dict]:
     """Run Tavily searches for the seed domain and return combined content + provenance."""
     combined = []
     provenance = {"seed_url": None, "seed_excerpt": None}
+    ranked_results: dict[str, dict] = {}
     for index, query in enumerate(seed.get("seed_queries", [])[:SEED_SEARCH_QUERY_LIMIT]):
         query = " ".join(str(query or "").split()).strip()
         if not query:
@@ -626,18 +854,71 @@ def _search_seed(seed: dict) -> tuple[str, dict]:
                     # Sanitize BEFORE collecting
                     clean = sanitize(content)
                     if clean:
-                        if provenance["seed_excerpt"] is None:
-                            provenance["seed_excerpt"] = clean[:500]
-                        if provenance["seed_url"] is None:
-                            url = (result.get("url") or "").strip()
-                            if url:
-                                provenance["seed_url"] = url
-                        combined.append(f"Source: {result.get('title', 'Unknown')}")
-                        combined.append(clean)
-                        combined.append("")
+                        title_text = str(result.get("title", "") or "").strip()
+                        url = str(result.get("url", "") or "").strip()
+                        ranked_result = _classify_seed_search_result(
+                            title_text,
+                            url,
+                            clean,
+                            query_index=index,
+                        )
+                        dedupe_key = (url or title_text or clean).lower()
+                        existing = ranked_results.get(dedupe_key)
+                        if existing is None or (
+                            ranked_result["score"],
+                            -ranked_result["query_index"],
+                            ranked_result["specificity_score"],
+                        ) > (
+                            existing["score"],
+                            -existing["query_index"],
+                            existing["specificity_score"],
+                        ):
+                            ranked_results[dedupe_key] = ranked_result
         except Exception as e:
             print(f"  [!] Tavily search failed for '{query}': {e}")
             continue
+
+    selected_results = sorted(
+        ranked_results.values(),
+        key=lambda item: (
+            -int(item.get("score") or 0),
+            int(item.get("query_index") or 0),
+            -int(item.get("specificity_score") or 0),
+            str(item.get("title_text") or ""),
+        ),
+    )
+    strong_results_present = any(
+        result.get("likely_primary_or_operator_source")
+        or result.get("mechanism_signal")
+        or result.get("intervention_signal")
+        for result in selected_results
+    )
+    if strong_results_present:
+        selected_results = [
+            result
+            for result in selected_results
+            if not (
+                result.get("source_type") in {"broad_overview", "repository_or_reference"}
+                and not result.get("likely_primary_or_operator_source")
+                and not result.get("intervention_signal")
+            )
+        ]
+
+    for result in selected_results[:SEED_SEARCH_SELECTED_RESULT_LIMIT]:
+        if provenance["seed_excerpt"] is None:
+            provenance["seed_excerpt"] = str(result.get("clean") or "")[:500]
+        if provenance["seed_url"] is None and str(result.get("url") or "").strip():
+            provenance["seed_url"] = str(result.get("url") or "").strip()
+        source_type_label = str(result.get("source_type") or "general_web").replace("_", " ")
+        selected_because = ", ".join(result.get("selection_reasons") or []) or "usable source detail"
+        combined.append(f"Source: {result.get('title_text') or 'Unknown'}")
+        combined.append(
+            f"Host: {result.get('host') or 'unknown'} | "
+            f"Source type: {source_type_label} | "
+            f"Selected because: {selected_because}"
+        )
+        combined.append(f"Snippet: {result.get('clean') or ''}")
+        combined.append("")
     return "\n".join(combined), provenance
 def _extract_json_substring(text: str) -> str | None:
     """

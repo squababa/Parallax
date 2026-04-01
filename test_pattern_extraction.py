@@ -953,6 +953,8 @@ def test_search_seed_uses_three_queries_with_bounded_richness(monkeypatch) -> No
         }
     )
 
+    assert isinstance(combined, str)
+    assert isinstance(provenance, dict)
     assert [call["query"] for call in calls] == [
         "queue routing latency control",
         "load balancing failover schedule",
@@ -967,11 +969,14 @@ def test_search_seed_uses_three_queries_with_bounded_richness(monkeypatch) -> No
     assert "should not be queried" not in combined
     assert combined == (
         "Source: queue routing latency control source\n"
-        "queue routing latency control mechanism evidence\n\n"
+        "Host: seed.test | Source type: general web | Selected because: mechanism-rich\n"
+        "Snippet: queue routing latency control mechanism evidence\n\n"
         "Source: load balancing failover schedule source\n"
-        "load balancing failover schedule mechanism evidence\n\n"
+        "Host: seed.test | Source type: general web | Selected because: mechanism-rich, intervention-bearing\n"
+        "Snippet: load balancing failover schedule mechanism evidence\n\n"
         "Source: backpressure retry collapse source\n"
-        "backpressure retry collapse mechanism evidence\n"
+        "Host: seed.test | Source type: general web | Selected because: mechanism-rich\n"
+        "Snippet: backpressure retry collapse mechanism evidence\n"
     )
     assert provenance["seed_url"] == "https://seed.test/1"
     assert provenance["seed_excerpt"] == "queue routing latency control mechanism evidence"
@@ -985,6 +990,11 @@ def test_search_seed_skips_empty_or_noisy_results_and_keeps_first_usable_provena
             "results": [
                 {"title": "Empty", "content": "", "url": "https://seed.test/empty"},
                 {"title": "Noise", "content": "   ", "url": "https://seed.test/noise"},
+                {
+                    "title": "Queueing overview",
+                    "content": "General background overview of queueing systems.",
+                    "url": "https://seed.test/overview",
+                },
                 {
                     "title": "Useful",
                     "content": "Signal threshold gating stabilizes queue delay.",
@@ -1028,14 +1038,53 @@ def test_search_seed_skips_empty_or_noisy_results_and_keeps_first_usable_provena
         }
     )
 
+    assert "Queueing overview" not in combined
     assert combined == (
         "Source: Useful\n"
-        "Signal threshold gating stabilizes queue delay.\n\n"
+        "Host: seed.test | Source type: general web | Selected because: mechanism-rich\n"
+        "Snippet: Signal threshold gating stabilizes queue delay.\n\n"
         "Source: Second useful\n"
-        "Retry budget limits resend storms.\n"
+        "Host: seed.test | Source type: general web | Selected because: mechanism-rich\n"
+        "Snippet: Retry budget limits resend storms.\n"
     )
     assert provenance["seed_url"] == "https://seed.test/useful"
     assert provenance["seed_excerpt"] == "Signal threshold gating stabilizes queue delay."
+
+
+def test_classify_seed_search_result_keeps_scholarly_type_for_review_language() -> None:
+    classified = explore._classify_seed_search_result(
+        title_text="Comprehensive Review of Queue Gating Mechanisms",
+        url="https://pubmed.ncbi.nlm.nih.gov/12345/",
+        clean="This review compares threshold gating and routing control in operator workflows.",
+        query_index=0,
+    )
+
+    assert classified["source_type"] == "scholarly_primary"
+    assert classified["broad_matches"]
+
+
+def test_classify_seed_search_result_keeps_operator_type_for_manual_language() -> None:
+    classified = explore._classify_seed_search_result(
+        title_text="Operations Manual Overview for Switching Protocols",
+        url="https://agency.gov/operations/manuals/switching",
+        clean="The manual describes protocol controls, mitigation steps, and scheduling interventions.",
+        query_index=0,
+    )
+
+    assert classified["source_type"] == "operator_or_technical"
+    assert classified["broad_matches"]
+
+
+def test_classify_seed_search_result_marks_plain_web_overview_as_broad() -> None:
+    classified = explore._classify_seed_search_result(
+        title_text="Introduction to Queueing Systems",
+        url="https://example.com/queueing-overview",
+        clean="This overview introduces general background concepts and review material.",
+        query_index=0,
+    )
+
+    assert classified["source_type"] == "broad_overview"
+    assert classified["score"] < 20
 
 
 def test_finalize_pattern_diagnostics_marks_patterns_too_weak_for_jump() -> None:
