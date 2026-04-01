@@ -5472,10 +5472,13 @@ def lateral_jump_with_diagnostics(
         "top_cluster_hints": [],
         "top_cluster_intervention_scores": [],
         "intervention_promoted_result_count": 0,
+        "adjacent_result_count": 0,
         "adjacent_retained_result_count": 0,
+        "retained_adjacent_result_count": 0,
         "alternate_retrieval_attempted": False,
         "alternate_jump_query": None,
         "alternate_result_count": 0,
+        "enriched_packet": False,
         "top_result_titles": [],
         "stage1_outcome": None,
         "stage1_target_domain": None,
@@ -6014,9 +6017,12 @@ def lateral_jump_with_diagnostics(
     diagnostic["intervention_promoted_result_count"] = sum(
         1 for result in merged_results if result.get("intervention_evidence")
     )
-    diagnostic["adjacent_retained_result_count"] = sum(
+    adjacent_result_count = sum(
         1 for result in merged_results if result.get("triage_class") == "adjacent"
     )
+    diagnostic["adjacent_result_count"] = adjacent_result_count
+    diagnostic["adjacent_retained_result_count"] = adjacent_result_count
+    diagnostic["retained_adjacent_result_count"] = adjacent_result_count
 
     diagnostic["result_count"] = len(merged_results)
     diagnostic["cluster_count"] = len(clustered_results)
@@ -6030,6 +6036,7 @@ def lateral_jump_with_diagnostics(
         for cluster in clustered_results[:3]
     ]
 
+    enriched_packet = False
     for cluster_index, cluster in enumerate(clustered_results, start=1):
         cluster_hint = str(cluster.get("cluster_hint", "") or "").strip() or "Unknown"
         cluster_results = list(cluster.get("results") or [])
@@ -6043,7 +6050,10 @@ def lateral_jump_with_diagnostics(
         elif int(cluster.get("intervention_score") or 0) > 0:
             search_content.append("Intervention evidence: yes")
         highlighted_result_keys: set[str] = set()
-        for highlight in _select_stage_one_evidence_highlights(cluster_results):
+        highlights = _select_stage_one_evidence_highlights(cluster_results)
+        if highlights:
+            enriched_packet = True
+        for highlight in highlights:
             highlighted_result = dict(highlight.get("result") or {})
             title_text = str(highlighted_result.get("title_text", "") or "").strip()
             clean = str(highlighted_result.get("clean", "") or "").strip()
@@ -6104,6 +6114,7 @@ def lateral_jump_with_diagnostics(
         search_content.append("")
 
     diagnostic["top_result_titles"] = top_titles
+    diagnostic["enriched_packet"] = enriched_packet
 
     combined = "\n".join(search_content)
     if not combined.strip():

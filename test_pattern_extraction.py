@@ -3639,9 +3639,53 @@ def test_jump_diagnostics_report_prints_attempts_and_aggregate(temp_db, capsys) 
     assert "[JumpDiagnostics] Recent 1 explorations" in output
     assert "pattern=Pattern A | query=query a | results=0 | stage1=no_results | stage2=—" in output
     assert "pattern=Pattern B | query=query b | results=2 | stage1=detect_signal | stage2=stage2_no_connection" in output
+    assert "prestage1=" not in output
     assert "total_attempted_patterns\t2" in output
     assert "no_results\t1\t50.0%" in output
     assert "stage2_no_connection\t1\t50.0%" in output
+
+
+def test_jump_diagnostics_report_prints_prestage1_observability_when_relevant(
+    temp_db,
+    capsys,
+) -> None:
+    store.save_exploration(
+        seed_domain="Network Protocols",
+        seed_category="Technology",
+        pattern_diagnostics={
+            "summary": "patterns_ready: kept 2/2 patterns; jump_outcome=patterns_present_but_no_connection",
+            "jump_attempts": [
+                {
+                    "pattern_name": "Pattern Hard",
+                    "built_jump_query": "query hard",
+                    "result_count": 1,
+                    "stage1_outcome": "detect_no_signal",
+                    "stage1_failure_hint": "no_connection",
+                },
+                {
+                    "pattern_name": "Pattern Adjacent",
+                    "built_jump_query": "query adjacent",
+                    "result_count": 3,
+                    "stage1_outcome": "detect_no_signal",
+                    "stage1_failure_hint": "no_connection",
+                    "alternate_retrieval_attempted": True,
+                    "adjacent_result_count": 1,
+                    "retained_adjacent_result_count": 1,
+                    "enriched_packet": True,
+                },
+            ],
+        },
+        transmitted=False,
+    )
+
+    main._print_jump_diagnostics(limit=5)
+    output = capsys.readouterr().out
+
+    assert "prestage1=hard_no_signal" in output
+    assert (
+        "prestage1=adjacent_packet | alternate=yes | enriched_packet=yes | "
+        "adjacent=1 | retained_adjacent=1"
+    ) in output
 
 
 def test_jump_diagnostics_report_prints_repair_incomplete_fields(

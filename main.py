@@ -1814,6 +1814,41 @@ def _print_jump_diagnostics(limit: int = 20) -> None:
                 print(
                     f"    target={target_domain} | failure_hint={failure_hint}"
                 )
+            adjacent_result_count = int(
+                attempt.get("adjacent_result_count")
+                or attempt.get("retained_adjacent_result_count")
+                or attempt.get("adjacent_retained_result_count")
+                or 0
+            )
+            retained_adjacent_result_count = int(
+                attempt.get("retained_adjacent_result_count")
+                or attempt.get("adjacent_retained_result_count")
+                or adjacent_result_count
+            )
+            alternate_retrieval_attempted = bool(
+                attempt.get("alternate_retrieval_attempted")
+            )
+            enriched_packet = bool(attempt.get("enriched_packet"))
+            prestage1_parts: list[str] = []
+            if stage1_outcome == "detect_no_signal" and adjacent_result_count <= 0:
+                prestage1_parts.append("prestage1=hard_no_signal")
+            elif adjacent_result_count > 0:
+                prestage1_parts.append("prestage1=adjacent_packet")
+            if alternate_retrieval_attempted:
+                prestage1_parts.append("alternate=yes")
+            if enriched_packet and (
+                stage1_outcome == "detect_no_signal"
+                or adjacent_result_count > 0
+                or alternate_retrieval_attempted
+            ):
+                prestage1_parts.append("enriched_packet=yes")
+            if adjacent_result_count > 0:
+                prestage1_parts.append(f"adjacent={adjacent_result_count}")
+                prestage1_parts.append(
+                    f"retained_adjacent={retained_adjacent_result_count}"
+                )
+            if prestage1_parts:
+                print("    " + " | ".join(prestage1_parts))
             incomplete_fields = (
                 attempt.get("stage2_incomplete_fields")
                 if isinstance(attempt.get("stage2_incomplete_fields"), list)
