@@ -394,6 +394,11 @@ Return ONLY valid JSON. No markdown.
 - Build only the target-domain core: connection, mechanism, mechanism typing, variable mappings, mechanism assertions, assumptions, and boundary_conditions.
 - Do not fill prediction, test, or edge_analysis fields in this stage.
 - Reuse Stage 1 `solution_evidence` as the workaround anchor when present.
+- `evidence_map.variable_mappings` must contain only narrow, directly supported source->target mappings tied to the same target-domain process named in `mechanism`.
+- Prefer exactly 3 strong direct mappings over padded weak mappings.
+- Keep each mapping claim at the same specificity level on both the source and target sides and no broader than its supporting snippet.
+- If a snippet supports the broader mechanism or background process but not a narrow variable-level correspondence, move that support to `evidence_map.mechanism_assertions`, not `evidence_map.variable_mappings`.
+- If fewer than 3 direct variable mappings are supportable, return `{{"no_connection": true}}`.
 - If the mechanism core cannot be grounded concretely, return `{{"no_connection": true}}`.
 
 If valid:
@@ -4512,10 +4517,13 @@ def _repair_guidance_for_missing_fields(
     if "evidence_map.variable_mappings" in missing_fields:
         if missing_field_set == {"evidence_map.variable_mappings"}:
             guidance.append(
-                "- This is a variable-mapping completion pass. Keep `connection`, `mechanism`, `prediction`, `test`, `variable_mapping`, `edge_analysis`, and `evidence_map.mechanism_assertions` stable."
+                "- This is a variable-mapping completion pass. Keep `target_domain`, `connection`, `mechanism`, `mechanism_type`, `mechanism_type_confidence`, `secondary_mechanism_types`, `prediction`, `test`, `variable_mapping`, `edge_analysis`, and `evidence_map.mechanism_assertions` stable."
             )
             guidance.append(
                 "- If only this field is missing, prefer returning only `{\"evidence_map\": {\"variable_mappings\": [...]}}` instead of rewriting the full candidate."
+            )
+            guidance.append(
+                "- Reconstruct only the mapping bundle. Preserve the already grounded mechanism core and any existing valid `evidence_map.mechanism_assertions`."
             )
         if (
             current_mechanism
@@ -4530,6 +4538,9 @@ def _repair_guidance_for_missing_fields(
             )
             guidance.append(
                 "- Treat this as a narrow direct-support repair. Preserve the current claim, mechanism, test/operator anchors, target-domain process, observable, metric, comparator, and strongest current target evidence while rewriting only the first 3 critical mappings."
+            )
+            guidance.append(
+                "- Prefer narrow direct-support reconstruction over filler mappings. If direct support is not there, return `{\"no_connection\": true}` instead of broadening the mapping story."
             )
             if current_mechanism:
                 guidance.append(
@@ -4569,10 +4580,10 @@ def _repair_guidance_for_missing_fields(
             "- Prioritize only the first 3 critical mappings. Prefer exactly 3 strong mappings over padded weak ones. Do not invent extra mappings, broaden the mechanism, or expand beyond the current grounded claim."
         )
         guidance.append(
-            "- Rebuild only the first 3 critical mappings. Keep each repaired claim narrowly aligned to its source_variable/target_variable pair and at the same specificity as the supporting snippet."
+            "- Rebuild only the first 3 critical mappings. Keep each repaired claim narrowly aligned to its source_variable/target_variable pair, tied to the same target-domain process, and at the same specificity as the supporting snippet on both sides of the mapping."
         )
         guidance.append(
-            "- Do not pad with abstract correspondences, nearby downstream effects, or mechanism-level filler. If a snippet supports only the mechanism story, move that support to `evidence_map.mechanism_assertions` instead of forcing it into `evidence_map.variable_mappings`."
+            "- Do not pad with abstract correspondences, nearby downstream effects, or mechanism-level filler. If a snippet supports only the mechanism story, background process, or broader target-domain claim, move that support to `evidence_map.mechanism_assertions` instead of forcing it into `evidence_map.variable_mappings`."
         )
         guidance.append(
             "- If only 1 or 2 critical mappings can be directly supported from the current payload and evidence, prefer `{\"no_connection\": true}` over weak padding or malformed partial JSON."

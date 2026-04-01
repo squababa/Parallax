@@ -216,6 +216,11 @@ def test_stage2_substage_prompts_are_scoped_to_intended_bundles() -> None:
 
     assert "Build only the target-domain core" in mechanism_prompt
     assert "Do not fill prediction, test, or edge_analysis fields in this stage." in mechanism_prompt
+    assert "`evidence_map.variable_mappings` must contain only narrow, directly supported source->target mappings tied to the same target-domain process named in `mechanism`." in mechanism_prompt
+    assert "Prefer exactly 3 strong direct mappings over padded weak mappings." in mechanism_prompt
+    assert "Keep each mapping claim at the same specificity level on both the source and target sides" in mechanism_prompt
+    assert "move that support to `evidence_map.mechanism_assertions`, not `evidence_map.variable_mappings`." in mechanism_prompt
+    assert "If fewer than 3 direct variable mappings are supportable" in mechanism_prompt
     assert '"prediction"' not in mechanism_prompt
     assert '"test"' not in mechanism_prompt
 
@@ -1153,13 +1158,18 @@ def test_build_repair_prompt_marks_variable_mapping_completion_as_narrow() -> No
     )
 
     assert "This is a variable-mapping completion pass." in repair_prompt
+    assert "Keep `target_domain`, `connection`, `mechanism`, `mechanism_type`, `mechanism_type_confidence`, `secondary_mechanism_types`" in repair_prompt
+    assert "Reconstruct only the mapping bundle. Preserve the already grounded mechanism core and any existing valid `evidence_map.mechanism_assertions`." in repair_prompt
     assert (
         "prefer returning only `{\"evidence_map\": {\"variable_mappings\": [...]}}` "
         "instead of rewriting the full candidate."
     ) in repair_prompt
     assert "Complete the missing critical variable mappings from the current payload one supported entry at a time." in repair_prompt
     assert "Prefer exactly 3 strong mappings over padded weak ones." in repair_prompt
+    assert "Prefer narrow direct-support reconstruction over filler mappings." in repair_prompt
     assert "If only 1 or 2 critical mappings can be directly supported from the current payload and evidence, prefer `{\"no_connection\": true}` over weak padding or malformed partial JSON." in repair_prompt
+    assert "same target-domain process" in repair_prompt
+    assert "background process, or broader target-domain claim" in repair_prompt
     assert "Keep the critical pair wording exactly aligned to the current payload: `throw_offset -> task_offset`." in repair_prompt
     assert "Reuse this current mapping claim as the starting point and narrow it only if needed: `Periodic tasks are assigned offsets within a shared hyperperiod.`." in repair_prompt
     assert "Reuse this current evidence wording where possible and keep the repaired claim as a narrow paraphrase of it: `Tasks are assigned offsets within the hyperperiod to determine activation times.`." in repair_prompt
