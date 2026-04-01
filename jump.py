@@ -378,6 +378,207 @@ If valid:
   "evidence": "specific evidence from search results"
 }}"""
 
+STAGE2_MECHANISM_PROMPT = """Stage 2A: mechanism only.
+Build only the target-domain mechanism core from an approved Stage 1 signal.
+ORIGINAL DOMAIN: {source_domain}
+ABSTRACT STRUCTURE: {abstract_structure}
+STAGE 1 DETECTION JSON:
+{stage_one_json}
+SEARCH RESULTS:
+{search_results}
+RELEVANT PRIOR FAILURE CONSTRAINTS:
+{relevant_scars}
+
+Return ONLY valid JSON. No markdown.
+- Keep target_domain aligned with Stage 1.
+- Build only the target-domain core: connection, mechanism, mechanism typing, variable mappings, mechanism assertions, assumptions, and boundary_conditions.
+- Do not fill prediction, test, or edge_analysis fields in this stage.
+- Reuse Stage 1 `solution_evidence` as the workaround anchor when present.
+- If the mechanism core cannot be grounded concretely, return `{{"no_connection": true}}`.
+
+If valid:
+{{
+  "no_connection": false,
+  "target_domain": "target field from stage 1",
+  "connection": "2-4 sentence evidence-bounded target-domain claim",
+  "mechanism": "one process-first causal chain",
+  "mechanism_type": "one controlled vocabulary tag from {mechanism_vocab}",
+  "mechanism_type_confidence": 0.82,
+  "secondary_mechanism_types": ["optional additional controlled tag"],
+  "variable_mapping": {{"a_in_source": "b_in_target", "c_in_source": "d_in_target", "e_in_source": "f_in_target"}},
+  "evidence_map": {{
+    "variable_mappings": [
+      {{
+        "source_variable": "a_in_source",
+        "target_variable": "b_in_target",
+        "claim": "tight mapped-variable claim",
+        "evidence_snippet": "short direct evidence",
+        "source_reference": "title or URL"
+      }}
+    ],
+    "mechanism_assertions": [
+      {{
+        "mechanism_claim": "concise same-process mechanism support",
+        "evidence_snippet": "short direct evidence",
+        "source_reference": "title or URL"
+      }}
+    ]
+  }},
+  "assumptions": ["...", "..."],
+  "boundary_conditions": "when this mapping should and should not hold"
+}}"""
+
+STAGE2_PREDICT_PROMPT = """Stage 2B: predict only.
+Build only the prediction bundle for the current Stage 2 claim.
+ORIGINAL DOMAIN: {source_domain}
+ABSTRACT STRUCTURE: {abstract_structure}
+STAGE 1 DETECTION JSON:
+{stage_one_json}
+CURRENT STAGE 2 JSON:
+{current_stage_json}
+SEARCH RESULTS:
+{search_results}
+
+Return ONLY valid JSON. No markdown.
+- Consume the current Stage 2 core as fixed context.
+- Fill only the `prediction` bundle in this stage.
+- Do not rewrite connection, mechanism, test, or edge_analysis fields here.
+- If the prediction cannot be grounded on the current claim, return `{{"no_connection": true}}`.
+
+If valid:
+{{
+  "no_connection": false,
+  "prediction": {{
+    "observable": "canonical measurable quantity or event reported in literature",
+    "time_horizon": "when the observable should move in the stated context",
+    "direction": "increase/decrease/higher/lower",
+    "magnitude": "expected effect size, threshold, or bounded null effect",
+    "confidence": "low/medium/high or numeric confidence",
+    "falsification_condition": "what concrete result would falsify the prediction",
+    "utility_rationale": "why this prediction is useful to test or act on",
+    "who_benefits": "who can use this prediction"
+  }}
+}}"""
+
+STAGE2_TEST_PROMPT = """Stage 2C: test only.
+Build only the falsifiable test bundle for the current Stage 2 claim.
+ORIGINAL DOMAIN: {source_domain}
+ABSTRACT STRUCTURE: {abstract_structure}
+STAGE 1 DETECTION JSON:
+{stage_one_json}
+CURRENT STAGE 2 JSON:
+{current_stage_json}
+SEARCH RESULTS:
+{search_results}
+
+Return ONLY valid JSON. No markdown.
+- Consume the current mechanism and prediction as fixed context.
+- Fill only `test` plus `edge_analysis.cheap_test` in this stage.
+- Keep `test.*` and `edge_analysis.cheap_test.*` tied to the same metric, comparator, and operator-facing workflow slice.
+- Do not fill other edge_analysis fields in this stage.
+- If the test bundle cannot be grounded on the current claim, return `{{"no_connection": true}}`.
+
+If valid:
+{{
+  "no_connection": false,
+  "test": {{
+    "data": "specific dataset or experiment to use",
+    "metric": "one concrete canonical reported metric name",
+    "horizon": "same or compatible time horizon",
+    "confirm": "what result on that metric confirms the hypothesis",
+    "falsify": "what result on that metric falsifies it"
+  }},
+  "edge_analysis": {{
+    "cheap_test": {{
+      "setup": "one real operator move on a narrow workflow slice",
+      "metric": "the same named metric as test.metric",
+      "confirm": "what result would support the lever",
+      "falsify": "what result would kill the lever",
+      "time_to_signal": "how quickly the test should produce evidence"
+    }}
+  }}
+}}"""
+
+STAGE2_EDGE_PROMPT = """Stage 2D: edge only.
+Build only the edge-analysis layer for the current Stage 2 claim.
+ORIGINAL DOMAIN: {source_domain}
+ABSTRACT STRUCTURE: {abstract_structure}
+STAGE 1 DETECTION JSON:
+{stage_one_json}
+CURRENT STAGE 2 JSON:
+{current_stage_json}
+SEARCH RESULTS:
+{search_results}
+
+Return ONLY valid JSON. No markdown.
+- Consume the current mechanism, prediction, test, and cheap_test bundle as fixed context.
+- Fill only edge-layer fields: problem_statement, why_missed, actionable_lever, edge_if_right, expected_asymmetry, primary_operator, and deployment_scope.
+- Do not rewrite connection, mechanism, prediction, test, variable_mapping, or evidence_map fields here.
+- Do not add or rewrite `edge_analysis.cheap_test` in this stage.
+- If the edge layer cannot be grounded on the current claim, return `{{"no_connection": true}}`.
+
+If valid:
+{{
+  "no_connection": false,
+  "edge_analysis": {{
+    "problem_statement": "one specific target-domain problem, blind spot, or hidden failure mode",
+    "why_missed": "why standard framing or workflow may overlook it",
+    "actionable_lever": "one concrete action implied by the mechanism",
+    "edge_if_right": "one operator, one decision change, and one concrete advantage if confirmed",
+    "expected_asymmetry": "why this is plausibly underexploited",
+    "primary_operator": "specific operator who would use it",
+    "deployment_scope": "where to try it first"
+  }}
+}}"""
+
+STAGE2_SUBSTAGE_SEQUENCE = ("mechanism", "predict", "test", "edge")
+
+STAGE2_SUBSTAGE_STAGE_NAMES = {
+    "mechanism": "stage2_mechanism",
+    "predict": "stage2_predict",
+    "test": "stage2_test",
+    "edge": "stage2_edge",
+}
+
+STAGE2_SUBSTAGE_FIELD_OWNERSHIP = {
+    "mechanism": [
+        "target_domain",
+        "connection",
+        "mechanism",
+        "mechanism_type",
+        "mechanism_type_confidence",
+        "secondary_mechanism_types",
+        "variable_mapping",
+        "evidence_map.variable_mappings",
+        "evidence_map.mechanism_assertions",
+        "assumptions",
+        "boundary_conditions",
+    ],
+    "predict": [
+        "prediction",
+    ],
+    "test": [
+        "test",
+        "edge_analysis.cheap_test",
+    ],
+    "edge": [
+        "edge_analysis.problem_statement",
+        "edge_analysis.why_missed",
+        "edge_analysis.actionable_lever",
+        "edge_analysis.edge_if_right",
+        "edge_analysis.expected_asymmetry",
+        "edge_analysis.primary_operator",
+        "edge_analysis.deployment_scope",
+    ],
+}
+
+STAGE2_SUBSTAGE_PROMPTS = {
+    "mechanism": STAGE2_MECHANISM_PROMPT,
+    "predict": STAGE2_PREDICT_PROMPT,
+    "test": STAGE2_TEST_PROMPT,
+    "edge": STAGE2_EDGE_PROMPT,
+}
+
 JSON_RETRY_PROMPT = (
     "Your previous response was not valid JSON. Please respond with ONLY valid JSON, "
     "no markdown, no explanation, no trailing commas, no comments. Here is what I need:"
@@ -2257,6 +2458,10 @@ def _generate_json_with_retry(full_prompt: str, stage: str, max_output_tokens: i
     env_key = {
         "stage1_detect": "BLACKCLAW_JUMP_STAGE1_MAX_OUTPUT_TOKENS",
         "stage2_hypothesize": "BLACKCLAW_JUMP_STAGE2_MAX_OUTPUT_TOKENS",
+        "stage2_mechanism": "BLACKCLAW_JUMP_STAGE2_MAX_OUTPUT_TOKENS",
+        "stage2_predict": "BLACKCLAW_JUMP_STAGE2_MAX_OUTPUT_TOKENS",
+        "stage2_test": "BLACKCLAW_JUMP_STAGE2_MAX_OUTPUT_TOKENS",
+        "stage2_edge": "BLACKCLAW_JUMP_STAGE2_MAX_OUTPUT_TOKENS",
     }.get(str(stage or "").strip())
     effective_max_output_tokens = max_output_tokens
     if env_key:
@@ -3781,6 +3986,10 @@ def _repair_guidance_for_missing_fields(
         if isinstance(original_data, dict)
         else ""
     )
+    if solution_evidence_anchor:
+        guidance.append(
+            f"- Reuse the current workaround or operating-response anchor instead of inventing a different intervention: `{solution_evidence_anchor}`."
+        )
     target_evidence_anchor = str(core_target_anchor.get("evidence_snippet") or "").strip()
     target_evidence_source = str(core_target_anchor.get("source_reference") or "").strip()
     if not target_evidence_anchor:
@@ -4780,6 +4989,214 @@ def _short_stage_two_failure_hint(payload: object) -> str | None:
     return None
 
 
+STAGE2_SUBSTAGE_MAX_OUTPUT_TOKENS = {
+    "mechanism": 4096,
+    "predict": 4096,
+    "test": 4096,
+    "edge": 4096,
+}
+
+STAGE2_SUBSTAGE_EXTRA_REQUIRED_FIELDS = {
+    "test": ["edge_analysis.cheap_test.time_to_signal"],
+    "edge": ["edge_analysis.deployment_scope"],
+}
+
+
+def _initialize_stage_two_candidate(source_domain: str, stage_one: dict) -> dict:
+    candidate = {
+        "no_connection": False,
+        "source_domain": str(source_domain or "").strip(),
+        "target_domain": str(stage_one.get("target_domain") or "").strip(),
+        "evidence": str(stage_one.get("evidence") or "").strip(),
+    }
+    solution_evidence = str(stage_one.get("solution_evidence") or "").strip()
+    if solution_evidence:
+        candidate["solution_evidence"] = solution_evidence
+    return candidate
+
+
+def _stage_two_field_owner(field_path: str) -> str | None:
+    clean_field = str(field_path or "").strip()
+    if not clean_field:
+        return None
+    for substage in STAGE2_SUBSTAGE_SEQUENCE:
+        for owned_field in STAGE2_SUBSTAGE_FIELD_OWNERSHIP.get(substage, []):
+            if clean_field == owned_field:
+                return substage
+            if clean_field.startswith(f"{owned_field}."):
+                return substage
+    return None
+
+
+def _stage_two_field_has_value(payload: dict, field_path: str) -> bool:
+    found, value = _get_nested_repair_value(payload, field_path)
+    if not found:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, dict, tuple, set)):
+        return len(value) > 0
+    return value is not None
+
+
+def _merge_stage_two_selected_fields(
+    original_data: dict,
+    updated_data: dict,
+    field_paths: list[str],
+) -> dict:
+    merged = copy.deepcopy(original_data)
+    for field_path in field_paths:
+        found, value = _get_nested_repair_value(updated_data, field_path)
+        if not found:
+            continue
+        _set_nested_repair_value(merged, field_path, value)
+    return merged
+
+
+def _normalize_stage_two_candidate(data: dict) -> dict:
+    normalized = copy.deepcopy(data)
+    normalized = _apply_mechanism_naming_precision(normalized)
+    normalized = _apply_normalized_mechanism_typing(normalized)
+    normalized["evidence_map"] = normalize_evidence_map(
+        normalized.get("evidence_map")
+    )
+    normalized.pop("depth", None)
+    return normalized
+
+
+def _missing_fields_for_stage_two_substage(data: dict, substage: str) -> list[str]:
+    missing_fields = [
+        field
+        for field in _missing_required_fields(data)
+        if _stage_two_field_owner(field) == substage
+    ]
+    if substage == "test":
+        missing_fields = [
+            field for field in missing_fields if field == "test" or field.startswith("test.")
+        ]
+        edge_analysis = (
+            data.get("edge_analysis") if isinstance(data.get("edge_analysis"), dict) else {}
+        )
+        cheap_test = (
+            edge_analysis.get("cheap_test")
+            if isinstance(edge_analysis.get("cheap_test"), dict)
+            else {}
+        )
+        setup = str(cheap_test.get("setup") or "").strip().lower()
+        if (
+            not isinstance(cheap_test, dict)
+            or not str(cheap_test.get("setup") or "").strip()
+            or not str(cheap_test.get("metric") or "").strip()
+            or not str(cheap_test.get("confirm") or "").strip()
+            or not str(cheap_test.get("falsify") or "").strip()
+            or "run a study" in setup
+            or "validate the hypothesis" in setup
+            or "collect more data" in setup
+            or "effect appears" in setup
+        ):
+            if "edge_analysis.cheap_test" not in missing_fields:
+                missing_fields.append("edge_analysis.cheap_test")
+    for field_path in STAGE2_SUBSTAGE_EXTRA_REQUIRED_FIELDS.get(substage, []):
+        if (
+            not _stage_two_field_has_value(data, field_path)
+            and field_path not in missing_fields
+        ):
+            missing_fields.append(field_path)
+    return missing_fields
+
+
+def _build_stage_two_substage_prompt(
+    substage: str,
+    *,
+    source_domain: str,
+    abstract_structure: str,
+    stage_one: dict,
+    current_candidate: dict,
+    search_results: str,
+    relevant_scars: str,
+) -> str:
+    return STAGE2_SUBSTAGE_PROMPTS[substage].format(
+        source_domain=source_domain,
+        abstract_structure=abstract_structure,
+        stage_one_json=json.dumps(stage_one, ensure_ascii=False, sort_keys=True),
+        current_stage_json=json.dumps(
+            current_candidate, ensure_ascii=False, sort_keys=True
+        ),
+        search_results=search_results,
+        relevant_scars=relevant_scars,
+        mechanism_vocab=MECHANISM_VOCAB_TEXT,
+    )
+
+
+def _run_stage_two_substage(
+    substage: str,
+    *,
+    source_domain: str,
+    abstract_structure: str,
+    stage_one: dict,
+    current_candidate: dict,
+    search_results: str,
+    relevant_scars: str,
+) -> tuple[dict | None, str | None, list[str] | None]:
+    prompt = _build_stage_two_substage_prompt(
+        substage,
+        source_domain=source_domain,
+        abstract_structure=abstract_structure,
+        stage_one=stage_one,
+        current_candidate=current_candidate,
+        search_results=search_results,
+        relevant_scars=relevant_scars,
+    )
+    extracted_json = _generate_json_with_retry(
+        prompt,
+        STAGE2_SUBSTAGE_STAGE_NAMES[substage],
+        STAGE2_SUBSTAGE_MAX_OUTPUT_TOKENS[substage],
+    )
+    if extracted_json is None:
+        return None, "generation_failed", None
+    try:
+        data = json.loads(extracted_json)
+    except json.JSONDecodeError:
+        return None, "invalid_json", None
+    if not isinstance(data, dict):
+        return None, "invalid_payload", None
+    if data.get("no_connection", False):
+        return None, _short_stage_two_failure_hint(data) or "returned_no_connection", None
+
+    owned_fields = STAGE2_SUBSTAGE_FIELD_OWNERSHIP[substage]
+    candidate = _merge_stage_two_selected_fields(
+        current_candidate,
+        data,
+        owned_fields,
+    )
+    candidate = _normalize_stage_two_candidate(candidate)
+    missing_fields = _missing_fields_for_stage_two_substage(candidate, substage)
+    if not missing_fields:
+        return candidate, None, None
+
+    repaired = _repair_missing_fields(
+        prompt,
+        extracted_json,
+        missing_fields,
+        original_data=candidate,
+    )
+    if repaired is None:
+        return None, "repair_failed", None
+    if repaired.get("no_connection", False):
+        return None, _short_stage_two_failure_hint(repaired) or "returned_no_connection", None
+
+    candidate = _merge_stage_two_selected_fields(
+        candidate,
+        repaired,
+        missing_fields,
+    )
+    candidate = _normalize_stage_two_candidate(candidate)
+    incomplete_fields = _missing_fields_for_stage_two_substage(candidate, substage)
+    if incomplete_fields:
+        return None, "repair_incomplete", incomplete_fields
+    return candidate, None, None
+
+
 def _format_relevant_scars_for_prompt(
     target_domain: str,
     abstract_structure: str,
@@ -4823,66 +5240,43 @@ def _stage_two_hypothesize_with_diagnostics(
     stage_one: dict,
     search_results: str,
 ) -> tuple[dict | None, str | None, list[str] | None]:
+    setattr(_stage_two_hypothesize_with_diagnostics, "last_failed_at", None)
     relevant_scars = _format_relevant_scars_for_prompt(
         str(stage_one.get("target_domain") or ""),
         abstract_structure,
     )
-    prompt = HYPOTHESIZE_PROMPT.format(
-        source_domain=source_domain,
-        abstract_structure=abstract_structure,
-        stage_one_json=json.dumps(stage_one, ensure_ascii=False, sort_keys=True),
-        search_results=search_results,
-        relevant_scars=relevant_scars,
-        mechanism_vocab=MECHANISM_VOCAB_TEXT,
-    )
-    extracted_json = _generate_json_with_retry(prompt, "stage2_hypothesize", 4096)
-    if extracted_json is None:
-        return None, "generation_failed", None
-    try:
-        data = json.loads(extracted_json)
-    except json.JSONDecodeError:
-        return None, "invalid_json", None
-    if not isinstance(data, dict):
-        return None, "invalid_payload", None
-    if data.get("no_connection", True):
-        return None, _short_stage_two_failure_hint(data) or "returned_no_connection", None
-
-    data = _apply_mechanism_naming_precision(data)
-    data = _apply_normalized_mechanism_typing(data)
-    missing_fields = _missing_required_fields(data)
-    if missing_fields:
-        repair_original_data = data
-        stage_one_solution_evidence = str(stage_one.get("solution_evidence") or "").strip()
-        if stage_one_solution_evidence and not str(
-            data.get("solution_evidence") or ""
-        ).strip():
-            repair_original_data = {
-                **data,
-                "solution_evidence": stage_one_solution_evidence,
-            }
-        repaired = _repair_missing_fields(
-            prompt,
-            extracted_json,
-            missing_fields,
-            original_data=repair_original_data,
+    candidate = _initialize_stage_two_candidate(source_domain, stage_one)
+    for substage in STAGE2_SUBSTAGE_SEQUENCE:
+        candidate, failure_hint, incomplete_fields = _run_stage_two_substage(
+            substage,
+            source_domain=source_domain,
+            abstract_structure=abstract_structure,
+            stage_one=stage_one,
+            current_candidate=candidate,
+            search_results=search_results,
+            relevant_scars=relevant_scars,
         )
-        if repaired is None:
-            return None, "repair_failed", None
-        if repaired.get("no_connection", False):
-            return None, _short_stage_two_failure_hint(repaired) or "returned_no_connection", None
-        repaired = _apply_mechanism_naming_precision(repaired)
-        repaired = _apply_normalized_mechanism_typing(repaired)
-        incomplete_fields = _missing_required_fields(repaired)
-        if incomplete_fields:
-            return None, "repair_incomplete", incomplete_fields
-        data = repaired
+        if candidate is None:
+            setattr(_stage_two_hypothesize_with_diagnostics, "last_failed_at", substage)
+            return None, failure_hint, incomplete_fields
 
-    data["evidence_map"] = normalize_evidence_map(data.get("evidence_map"))
-    data = _apply_normalized_mechanism_typing(data)
-
-    # Jump output must never self-grade depth.
-    data.pop("depth", None)
-    return data, None, None
+    candidate = _normalize_stage_two_candidate(candidate)
+    incomplete_fields = _missing_required_fields(candidate)
+    if incomplete_fields:
+        setattr(
+            _stage_two_hypothesize_with_diagnostics,
+            "last_failed_at",
+            next(
+                (
+                    _stage_two_field_owner(field)
+                    for field in incomplete_fields
+                    if _stage_two_field_owner(field) is not None
+                ),
+                None,
+            ),
+        )
+        return None, "repair_incomplete", incomplete_fields
+    return candidate, None, None
 
 
 def _stage_two_hypothesize(
@@ -4933,6 +5327,7 @@ def lateral_jump_with_diagnostics(
         "stage2_outcome": None,
         "stage2_target_domain": None,
         "stage2_failure_hint": None,
+        "stage2_failed_at": None,
         "benchmark_snapshot": None,
     }
 
@@ -5415,9 +5810,19 @@ def lateral_jump_with_diagnostics(
         if isinstance(stage_two_result, tuple) and len(stage_two_result) >= 3
         else None
     )
+    stage2_failed_at = getattr(
+        _stage_two_hypothesize_with_diagnostics,
+        "last_failed_at",
+        None,
+    )
     if data is None:
         diagnostic["stage2_outcome"] = "stage2_no_connection"
         diagnostic["stage2_failure_hint"] = stage_two_failure_hint or "returned_no_connection"
+        diagnostic["stage2_failed_at"] = (
+            str(stage2_failed_at).strip() or None
+            if stage2_failed_at is not None
+            else None
+        )
         if (
             diagnostic["stage2_failure_hint"] == "repair_incomplete"
             and isinstance(stage2_incomplete_fields, list)
