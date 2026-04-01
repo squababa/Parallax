@@ -1324,6 +1324,60 @@ def test_lateral_jump_with_diagnostics_records_stage2_no_connection(monkeypatch)
     assert diagnostic["stage1_target_domain"] == "Wireless Scheduling"
     assert diagnostic["stage2_outcome"] == "stage2_no_connection"
     assert diagnostic["stage2_failure_hint"] == "returned_no_connection"
+    assert diagnostic["stage2_failed_at"] is None
+
+
+def test_lateral_jump_with_diagnostics_records_stage2_failed_at(monkeypatch) -> None:
+    monkeypatch.setattr(
+        jump._tavily,
+        "search",
+        lambda **_kwargs: {
+            "results": [
+                {
+                    "title": "Independent target paper",
+                    "content": "concrete signal in another field",
+                    "url": "https://target.test/paper",
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        jump,
+        "_stage_one_detect_with_diagnostics",
+        lambda **_kwargs: (
+            {
+                "target_domain": "Wireless Scheduling",
+                "signal": "shared structural signal",
+                "evidence": "specific evidence",
+            },
+            None,
+        ),
+    )
+
+    def fake_stage_two(**_kwargs):
+        return (None, "returned_no_connection", None)
+
+    fake_stage_two.last_failed_at = "test"
+    monkeypatch.setattr(
+        jump,
+        "_stage_two_hypothesize_with_diagnostics",
+        fake_stage_two,
+    )
+
+    connection, diagnostic = jump.lateral_jump_with_diagnostics(
+        {
+            "pattern_name": "Queue-threshold congestion gating",
+            "abstract_structure": "load compared against a queue threshold",
+            "search_query": "queue threshold throttling latency",
+        },
+        "Network Protocols",
+        "Technology",
+    )
+
+    assert connection is None
+    assert diagnostic["stage2_outcome"] == "stage2_no_connection"
+    assert diagnostic["stage2_failure_hint"] == "returned_no_connection"
+    assert diagnostic["stage2_failed_at"] == "test"
 
 
 def test_lateral_jump_with_diagnostics_records_repair_incomplete_fields(

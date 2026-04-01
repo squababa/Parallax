@@ -1,3 +1,4 @@
+import copy
 import json
 
 import jump
@@ -94,6 +95,39 @@ def _valid_stage2_payload() -> dict:
     }
 
 
+def _split_stage2_payload(payload: dict) -> dict[str, dict]:
+    edge_analysis = copy.deepcopy(payload["edge_analysis"])
+    cheap_test = edge_analysis.pop("cheap_test")
+    return {
+        "mechanism": {
+            "no_connection": False,
+            "target_domain": payload["target_domain"],
+            "connection": payload["connection"],
+            "mechanism": payload["mechanism"],
+            "mechanism_type": payload["mechanism_type"],
+            "mechanism_type_confidence": payload["mechanism_type_confidence"],
+            "secondary_mechanism_types": payload["secondary_mechanism_types"],
+            "variable_mapping": payload["variable_mapping"],
+            "evidence_map": payload["evidence_map"],
+            "assumptions": payload["assumptions"],
+            "boundary_conditions": payload["boundary_conditions"],
+        },
+        "predict": {
+            "no_connection": False,
+            "prediction": payload["prediction"],
+        },
+        "test": {
+            "no_connection": False,
+            "test": payload["test"],
+            "edge_analysis": {"cheap_test": cheap_test},
+        },
+        "edge": {
+            "no_connection": False,
+            "edge_analysis": edge_analysis,
+        },
+    }
+
+
 def test_hypothesize_prompt_has_stronger_examples() -> None:
     prompt = jump.HYPOTHESIZE_PROMPT
 
@@ -165,6 +199,103 @@ def test_hypothesize_prompt_has_stronger_examples() -> None:
     assert "mechanism_assertions must be concise mechanism-support statements tied to the same target-domain process named in `mechanism`" in prompt
     assert "Do not use broad field summaries, adjacent background explanation, or generic literature framing as `mechanism_assertions`." in prompt
     assert "If the mechanism cannot be directly supported by a target-domain snippet or a concise mechanism_assertion on that same process, return `no_connection`." in prompt
+
+
+def test_stage2_substage_prompts_exist() -> None:
+    assert "Stage 2A: mechanism only." in jump.STAGE2_MECHANISM_PROMPT
+    assert "Stage 2B: predict only." in jump.STAGE2_PREDICT_PROMPT
+    assert "Stage 2C: test only." in jump.STAGE2_TEST_PROMPT
+    assert "Stage 2D: edge only." in jump.STAGE2_EDGE_PROMPT
+
+
+def test_stage2_substage_prompts_are_scoped_to_intended_bundles() -> None:
+    mechanism_prompt = jump.STAGE2_MECHANISM_PROMPT
+    predict_prompt = jump.STAGE2_PREDICT_PROMPT
+    test_prompt = jump.STAGE2_TEST_PROMPT
+    edge_prompt = jump.STAGE2_EDGE_PROMPT
+
+    assert "Build only the target-domain core" in mechanism_prompt
+    assert "Do not fill prediction, test, or edge_analysis fields in this stage." in mechanism_prompt
+    assert '"prediction"' not in mechanism_prompt
+    assert '"test"' not in mechanism_prompt
+
+    assert "Fill only the `prediction` bundle in this stage." in predict_prompt
+    assert "Do not rewrite connection, mechanism, test, or edge_analysis fields here." in predict_prompt
+    assert '"prediction"' in predict_prompt
+    assert '"test"' not in predict_prompt
+    assert '"edge_analysis"' not in predict_prompt
+
+    assert "Fill only `test` plus `edge_analysis.cheap_test` in this stage." in test_prompt
+    assert "Do not fill other edge_analysis fields in this stage." in test_prompt
+    assert '"test"' in test_prompt
+    assert '"cheap_test"' in test_prompt
+    assert '"problem_statement"' not in test_prompt
+    assert '"actionable_lever"' not in test_prompt
+
+    assert "Fill only edge-layer fields" in edge_prompt
+    assert "Do not add or rewrite `edge_analysis.cheap_test` in this stage." in edge_prompt
+    assert '"problem_statement"' in edge_prompt
+    assert '"why_missed"' in edge_prompt
+    assert '"actionable_lever"' in edge_prompt
+    assert '"edge_if_right"' in edge_prompt
+    assert '"expected_asymmetry"' in edge_prompt
+    assert '"primary_operator"' in edge_prompt
+    assert '"deployment_scope"' in edge_prompt
+    assert '"cheap_test"' not in edge_prompt
+    assert '"prediction"' not in edge_prompt
+    assert '"test"' not in edge_prompt
+
+
+def test_stage2_test_prompt_ties_main_test_and_cheap_test_together() -> None:
+    prompt = jump.STAGE2_TEST_PROMPT
+
+    assert "Keep `test.*` and `edge_analysis.cheap_test.*` tied to the same metric, comparator, and operator-facing workflow slice." in prompt
+    assert '"metric": "one concrete canonical reported metric name"' in prompt
+    assert '"metric": "the same named metric as test.metric"' in prompt
+    assert '"confirm": "what result on that metric confirms the hypothesis"' in prompt
+    assert '"confirm": "what result would support the lever"' in prompt
+
+
+def test_stage2_substage_static_metadata_matches_intended_split() -> None:
+    assert jump.STAGE2_SUBSTAGE_SEQUENCE == ("mechanism", "predict", "test", "edge")
+    assert jump.STAGE2_SUBSTAGE_STAGE_NAMES == {
+        "mechanism": "stage2_mechanism",
+        "predict": "stage2_predict",
+        "test": "stage2_test",
+        "edge": "stage2_edge",
+    }
+    assert jump.STAGE2_SUBSTAGE_FIELD_OWNERSHIP == {
+        "mechanism": [
+            "target_domain",
+            "connection",
+            "mechanism",
+            "mechanism_type",
+            "mechanism_type_confidence",
+            "secondary_mechanism_types",
+            "variable_mapping",
+            "evidence_map.variable_mappings",
+            "evidence_map.mechanism_assertions",
+            "assumptions",
+            "boundary_conditions",
+        ],
+        "predict": ["prediction"],
+        "test": ["test", "edge_analysis.cheap_test"],
+        "edge": [
+            "edge_analysis.problem_statement",
+            "edge_analysis.why_missed",
+            "edge_analysis.actionable_lever",
+            "edge_analysis.edge_if_right",
+            "edge_analysis.expected_asymmetry",
+            "edge_analysis.primary_operator",
+            "edge_analysis.deployment_scope",
+        ],
+    }
+    assert jump.STAGE2_SUBSTAGE_PROMPTS == {
+        "mechanism": jump.STAGE2_MECHANISM_PROMPT,
+        "predict": jump.STAGE2_PREDICT_PROMPT,
+        "test": jump.STAGE2_TEST_PROMPT,
+        "edge": jump.STAGE2_EDGE_PROMPT,
+    }
 
 
 def test_detect_prompt_accepts_engineered_interventions_as_solution_evidence() -> None:
@@ -653,7 +784,7 @@ def test_stage_two_hypothesize_injects_relevant_scars_into_prompt(monkeypatch) -
             return [1.0, 0.0]
 
     def _fake_generate_json(prompt: str, stage_name: str, max_tokens: int) -> str:
-        captured["prompt"] = prompt
+        captured[stage_name] = prompt
         return json.dumps(_valid_stage2_payload())
 
     monkeypatch.setattr(jump, "_llm_client", _DummyEmbedClient())
@@ -684,9 +815,9 @@ def test_stage_two_hypothesize_injects_relevant_scars_into_prompt(monkeypatch) -
 
     assert result is not None
     assert captured["embedded_text"] == "modular collision filter"
-    assert "RELEVANT PRIOR FAILURE CONSTRAINTS:" in captured["prompt"]
-    assert "constraint_rule: avoid sequential-only slot search under dense periodic load" in captured["prompt"]
-    assert "why_it_failed: sequential assignment explored too little of the valid modular schedule space" in captured["prompt"]
+    assert "RELEVANT PRIOR FAILURE CONSTRAINTS:" in captured["stage2_mechanism"]
+    assert "constraint_rule: avoid sequential-only slot search under dense periodic load" in captured["stage2_mechanism"]
+    assert "why_it_failed: sequential assignment explored too little of the valid modular schedule space" in captured["stage2_mechanism"]
 
 
 def test_missing_required_fields_requests_repair_for_usefulness_alignment_bottleneck() -> None:
@@ -1630,7 +1761,7 @@ def test_stage_two_hypothesize_prompt_reuses_stage_one_solution_evidence(
     assert failure_hint == "returned_no_connection"
     assert incomplete_fields is None
     assert '"solution_evidence": "offset assignment with collision-avoidance constraints provides the working workaround"' in captured["prompt"]
-    assert "treat it as a required anchor for the working solution or workaround" in captured["prompt"]
+    assert "Reuse Stage 1 `solution_evidence` as the workaround anchor when present." in captured["prompt"]
 
 
 def test_stage_two_hypothesize_repair_receives_stage_one_solution_evidence(
@@ -1777,3 +1908,171 @@ def test_stage_two_hypothesize_repair_context_stays_unchanged_without_solution_e
     assert failure_hint is None
     assert incomplete_fields is None
     assert "solution_evidence" not in captured["original_data"]
+
+
+def test_stage_two_field_owner_maps_expected_fields_to_substages() -> None:
+    assert jump._stage_two_field_owner("target_domain") == "mechanism"
+    assert jump._stage_two_field_owner("mechanism_type_confidence") == "mechanism"
+    assert jump._stage_two_field_owner("evidence_map.variable_mappings") == "mechanism"
+    assert jump._stage_two_field_owner("prediction.observable") == "predict"
+    assert jump._stage_two_field_owner("test.confirm") == "test"
+    assert jump._stage_two_field_owner("edge_analysis.cheap_test.metric") == "test"
+    assert jump._stage_two_field_owner("edge_analysis.actionable_lever") == "edge"
+    assert jump._stage_two_field_owner("edge_analysis.deployment_scope") == "edge"
+
+
+def test_run_stage_two_substage_repair_stays_local_to_owned_fields(
+    monkeypatch,
+) -> None:
+    payload = _valid_stage2_payload()
+    split_payload = _split_stage2_payload(payload)
+    split_payload["test"]["edge_analysis"]["cheap_test"]["time_to_signal"] = ""
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        jump,
+        "_generate_json_with_retry",
+        lambda *_args, **_kwargs: json.dumps(split_payload["test"]),
+    )
+
+    def fake_repair(
+        _full_prompt: str,
+        _original_json: str,
+        missing_fields: list[str],
+        *,
+        original_data: dict | None = None,
+    ) -> dict:
+        captured["missing_fields"] = missing_fields
+        captured["original_data"] = original_data
+        return {
+            "edge_analysis": {
+                "cheap_test": {
+                    "time_to_signal": payload["edge_analysis"]["cheap_test"]["time_to_signal"]
+                }
+            }
+        }
+
+    monkeypatch.setattr(jump, "_repair_missing_fields", fake_repair)
+
+    current_candidate = jump._initialize_stage_two_candidate(
+        payload["source_domain"],
+        {
+            "target_domain": payload["target_domain"],
+            "evidence": payload["evidence"],
+            "solution_evidence": "filtered offset assignment is the grounded workaround",
+        },
+    )
+    current_candidate = jump._merge_stage_two_selected_fields(
+        current_candidate,
+        split_payload["mechanism"],
+        jump.STAGE2_SUBSTAGE_FIELD_OWNERSHIP["mechanism"],
+    )
+    current_candidate = jump._merge_stage_two_selected_fields(
+        current_candidate,
+        split_payload["predict"],
+        jump.STAGE2_SUBSTAGE_FIELD_OWNERSHIP["predict"],
+    )
+    current_candidate = jump._normalize_stage_two_candidate(current_candidate)
+
+    repaired, failure_hint, incomplete_fields = jump._run_stage_two_substage(
+        "test",
+        source_domain=payload["source_domain"],
+        abstract_structure="load compared against a queue threshold",
+        stage_one={
+            "target_domain": payload["target_domain"],
+            "signal": "shared structural signal",
+            "evidence": payload["evidence"],
+            "solution_evidence": "filtered offset assignment is the grounded workaround",
+        },
+        current_candidate=current_candidate,
+        search_results="Title: target paper\nconcrete target evidence",
+        relevant_scars="None.",
+    )
+
+    assert repaired is not None
+    assert failure_hint is None
+    assert incomplete_fields is None
+    assert captured["missing_fields"] == ["edge_analysis.cheap_test.time_to_signal"]
+    assert "problem_statement" not in captured["original_data"].get("edge_analysis", {})
+    assert repaired["edge_analysis"]["cheap_test"]["time_to_signal"] == (
+        payload["edge_analysis"]["cheap_test"]["time_to_signal"]
+    )
+
+
+def test_stage_two_hypothesize_assembles_split_outputs_into_current_candidate_shape(
+    monkeypatch,
+) -> None:
+    payload = _valid_stage2_payload()
+    split_payload = _split_stage2_payload(payload)
+
+    def fake_generate_json_with_retry(_prompt, stage_name, _max_tokens):
+        return json.dumps(split_payload[stage_name.replace("stage2_", "")])
+
+    monkeypatch.setattr(jump, "_format_relevant_scars_for_prompt", lambda *_args: "None.")
+    monkeypatch.setattr(jump, "_generate_json_with_retry", fake_generate_json_with_retry)
+
+    assembled, failure_hint, incomplete_fields = jump._stage_two_hypothesize_with_diagnostics(
+        source_domain=payload["source_domain"],
+        abstract_structure="load compared against a queue threshold",
+        stage_one={
+            "target_domain": payload["target_domain"],
+            "signal": "shared structural signal",
+            "evidence": payload["evidence"],
+            "solution_evidence": "filtered offset assignment is the grounded workaround",
+        },
+        search_results="Title: target paper\nconcrete target evidence",
+    )
+
+    assert assembled is not None
+    assert failure_hint is None
+    assert incomplete_fields is None
+    assert assembled["source_domain"] == payload["source_domain"]
+    assert assembled["target_domain"] == payload["target_domain"]
+    assert assembled["connection"] == payload["connection"]
+    assert assembled["mechanism"] == payload["mechanism"]
+    assert assembled["prediction"] == payload["prediction"]
+    assert assembled["test"] == payload["test"]
+    assert assembled["edge_analysis"] == payload["edge_analysis"]
+    assert assembled["evidence_map"] == jump.normalize_evidence_map(payload["evidence_map"])
+    assert transmit.format_transmission(
+        1,
+        assembled["source_domain"],
+        assembled["target_domain"],
+        assembled,
+        {},
+    )
+
+
+def test_stage_two_hypothesize_sets_last_failed_at_for_each_substage(
+    monkeypatch,
+) -> None:
+    payload = _valid_stage2_payload()
+    split_payload = _split_stage2_payload(payload)
+
+    monkeypatch.setattr(jump, "_format_relevant_scars_for_prompt", lambda *_args: "None.")
+
+    for failed_stage in jump.STAGE2_SUBSTAGE_SEQUENCE:
+        def fake_generate_json_with_retry(_prompt, stage_name, _max_tokens):
+            current_stage = stage_name.replace("stage2_", "")
+            if current_stage == failed_stage:
+                return json.dumps({"no_connection": True})
+            return json.dumps(split_payload[current_stage])
+
+        monkeypatch.setattr(jump, "_generate_json_with_retry", fake_generate_json_with_retry)
+
+        repaired, failure_hint, incomplete_fields = jump._stage_two_hypothesize_with_diagnostics(
+            source_domain=payload["source_domain"],
+            abstract_structure="load compared against a queue threshold",
+            stage_one={
+                "target_domain": payload["target_domain"],
+                "signal": "shared structural signal",
+                "evidence": payload["evidence"],
+                "solution_evidence": "filtered offset assignment is the grounded workaround",
+            },
+            search_results="Title: target paper\nconcrete target evidence",
+        )
+
+        assert repaired is None
+        assert failure_hint == "returned_no_connection"
+        assert incomplete_fields is None
+        assert jump._stage_two_hypothesize_with_diagnostics.last_failed_at == failed_stage
