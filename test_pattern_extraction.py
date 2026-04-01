@@ -100,9 +100,10 @@ def test_profile_pattern_quality_prefers_operational_mechanism() -> None:
 
 
 def test_build_jump_search_query_replaces_weak_feedback_style_terms() -> None:
+    raw_query = "deficiency threshold triggered directed recruitment feedback"
     query = jump._build_jump_search_query(
         {
-            "search_query": "deficiency threshold triggered directed recruitment feedback",
+            "search_query": raw_query,
             "pattern_name": "Deficiency-triggered balancing",
             "abstract_structure": (
                 "deficit detection compares underfilled channels and routes supply "
@@ -120,11 +121,13 @@ def test_build_jump_search_query_replaces_weak_feedback_style_terms() -> None:
     )
 
     tokens = set(query.split())
-    assert "deficit detector" in query
+    assert query != raw_query
+    assert "deficit" in tokens
+    assert "compares" in tokens or "routes" in tokens
     assert "feedback" not in tokens
     assert "recruitment" not in tokens
     assert "threshold" not in tokens
-    assert "routing" in tokens
+    assert "triggered" not in tokens
 
 
 def test_build_jump_search_query_keeps_lock_in_anchor_but_drops_generic_terms() -> None:
@@ -150,6 +153,7 @@ def test_build_jump_search_query_keeps_lock_in_anchor_but_drops_generic_terms() 
     tokens = set(query.split())
     assert "commitment lock-in" in query
     assert "switching cost" in query
+    assert "retention" in tokens or "hysteresis" in tokens
     assert "credibility" not in tokens
     assert "feedback" not in tokens
     assert "threshold" not in tokens
@@ -182,6 +186,7 @@ def test_build_jump_search_query_disambiguates_generic_query_with_concrete_ancho
 
     assert query != "channel routing threshold switching"
     assert "relay gating" in query
+    assert "suppresses" in query
     assert "actuator" in query
 
 
@@ -210,6 +215,7 @@ def test_build_jump_search_query_rebuilds_unanchored_overloaded_terms(
 
     tokens = set(query.split())
     assert "relay gating" in query
+    assert "suppresses" in query
     assert "actuator" in query
     assert "backtesting" not in tokens
     assert "policy" not in tokens
@@ -324,6 +330,31 @@ def test_build_jump_search_query_prefers_mutation_rate_phrase_anchor() -> None:
 
     assert "mutation rate" in query
     assert "scheduled" not in query
+
+
+def test_build_jump_search_query_prefers_causal_dynamics_for_disturbance_release() -> None:
+    query = jump._build_jump_search_query(
+        {
+            "search_query": "tide pool monopoly prevention",
+            "pattern_name": "Disturbance-mediated competitive release",
+            "abstract_structure": (
+                "periodic disturbance resets dominant occupancy and reopens limited "
+                "resource access before one competitor locks in long-term control"
+            ),
+            "measurable_signal": "share of occupied patches after each disruption pulse",
+            "control_lever": "change disturbance frequency and protected recovery windows",
+            "transfer_rationale": (
+                "transfers to systems where periodic disruption prevents durable "
+                "resource monopolization by one actor"
+            ),
+        },
+        "Marine Ecology",
+        "Science",
+    )
+
+    assert query == "periodic disruption prevents monopolization"
+    assert "tide" not in query
+    assert "pool" not in query
 
 
 def test_build_jump_search_query_prefers_compact_llm_query_when_valid(
@@ -456,6 +487,107 @@ def test_build_jump_search_query_falls_back_when_llm_query_is_formal_token_soup(
     )
 
     assert query == expected
+
+
+def test_lateral_jump_with_diagnostics_academic_lane_uses_improved_base_query(
+    monkeypatch,
+) -> None:
+    seen_calls: list[tuple[str, tuple[str, ...] | None]] = []
+    stage_inputs: dict[str, object] = {}
+
+    def fake_search(**kwargs):
+        query = kwargs["query"]
+        include_domains = tuple(kwargs.get("include_domains") or ())
+        seen_calls.append((query, include_domains or None))
+        if include_domains:
+            return {
+                "results": [
+                    {
+                        "title": "Resource recovery mechanism paper",
+                        "content": (
+                            "Periodic disruption prevents durable resource monopolization "
+                            "and restores access after competitive lock-in."
+                        ),
+                        "url": "https://arxiv.org/abs/2604.00001",
+                    }
+                ]
+            }
+        if query.endswith("workaround"):
+            return {
+                "results": [
+                    {
+                        "title": "Recovery intervention note",
+                        "content": "Operators use periodic resets to reopen access after dominance lock-in.",
+                        "url": "https://target.test/recovery-note",
+                    }
+                ]
+            }
+        return {
+            "results": [
+                {
+                    "title": "Generalized competitive-release paper",
+                    "content": "Periodic disruption prevents durable monopolization across constrained resource regimes.",
+                    "url": "https://target.test/competitive-release",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(jump._tavily, "search", fake_search)
+
+    def fake_stage_one(**kwargs):
+        stage_inputs["stage1"] = kwargs["search_results"]
+        return (
+            {
+                "target_domain": "Access-control recovery",
+                "signal": "shared reset-and-reopen structure",
+                "evidence": "specific evidence",
+                "solution_evidence": "periodic resets reopen access after dominance lock-in",
+            },
+            None,
+        )
+
+    def fake_stage_two(**kwargs):
+        stage_inputs["stage2"] = kwargs["search_results"]
+        return (_safety_interlock_jump_payload(), None, None)
+
+    monkeypatch.setattr(jump, "_stage_one_detect_with_diagnostics", fake_stage_one)
+    monkeypatch.setattr(jump, "_stage_two_hypothesize_with_diagnostics", fake_stage_two)
+
+    connection, diagnostic = jump.lateral_jump_with_diagnostics(
+        {
+            "pattern_name": "Disturbance-mediated competitive release",
+            "abstract_structure": (
+                "periodic disturbance resets dominant occupancy and reopens limited "
+                "resource access before one competitor locks in long-term control"
+            ),
+            "search_query": "tide pool monopoly prevention",
+            "measurable_signal": "share of occupied patches after each disruption pulse",
+            "control_lever": "change disturbance frequency and protected recovery windows",
+            "transfer_rationale": (
+                "transfers to systems where periodic disruption prevents durable "
+                "resource monopolization by one actor"
+            ),
+        },
+        "Marine Ecology",
+        "Science",
+    )
+
+    assert connection is not None
+    assert diagnostic["built_jump_query"] == "periodic disruption prevents monopolization"
+    assert diagnostic["built_jump_queries"] == [
+        "periodic disruption prevents monopolization",
+        "periodic disruption prevents monopolization workaround",
+    ]
+    assert seen_calls == [
+        ("periodic disruption prevents monopolization", None),
+        ("periodic disruption prevents monopolization workaround", None),
+        (
+            "periodic disruption prevents monopolization",
+            jump.ACADEMIC_JUMP_INCLUDE_DOMAINS,
+        ),
+    ]
+    assert stage_inputs["stage1"] == stage_inputs["stage2"]
+    assert "Retrieved via: academic" in stage_inputs["stage1"]
 
 
 def test_stage_one_detect_prompt_prefers_solution_bearing_analogues(

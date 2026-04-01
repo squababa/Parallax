@@ -925,6 +925,78 @@ QUERY_PHRASE_STOPWORDS = {
     "with",
 }
 
+JUMP_QUERY_CAUSAL_VERB_STEMS = (
+    "attenuat",
+    "compare",
+    "cross",
+    "delay",
+    "gate",
+    "isolat",
+    "limit",
+    "lock",
+    "prevent",
+    "redirect",
+    "reduce",
+    "release",
+    "reopen",
+    "replenish",
+    "reset",
+    "restore",
+    "rerout",
+    "route",
+    "stabiliz",
+    "suppress",
+    "throttl",
+    "trigger",
+)
+JUMP_QUERY_CAUSAL_OUTCOME_HINTS = {
+    "access",
+    "collapse",
+    "competition",
+    "dominance",
+    "imbalance",
+    "interference",
+    "monopolization",
+    "regime",
+    "response",
+    "recovery",
+    "stability",
+    "throughput",
+}
+JUMP_QUERY_CLAUSE_PREFIXES = (
+    "applies to systems where ",
+    "applies to any system where ",
+    "applies where ",
+    "transfers to systems where ",
+    "transfers to any system where ",
+    "transfers to ",
+    "maps to any system where ",
+    "maps to systems where ",
+    "maps to ",
+    "systems where ",
+    "any system where ",
+    "where ",
+)
+JUMP_QUERY_FILLER_TOKENS = {
+    "a",
+    "an",
+    "actor",
+    "actors",
+    "already",
+    "any",
+    "are",
+    "be",
+    "by",
+    "durable",
+    "long",
+    "most",
+    "one",
+    "same",
+    "term",
+    "the",
+    "toward",
+}
+
 
 def _tokenize_query_terms(text: str) -> list[str]:
     """Extract lowercase query tokens while preserving hyphenated mechanism words."""
@@ -943,6 +1015,10 @@ def _is_specific_jump_query_token(token: str) -> bool:
 
 def _is_concrete_jump_query_token(token: str) -> bool:
     return _is_specific_jump_query_token(token) and token not in AMBIGUOUS_JUMP_QUERY_TOKENS
+
+
+def _is_causal_jump_query_token(token: str) -> bool:
+    return any(token.startswith(stem) for stem in JUMP_QUERY_CAUSAL_VERB_STEMS)
 
 
 def _normalize_jump_result_host(url: str) -> str:
@@ -1097,12 +1173,127 @@ def _jump_query_support_context(
                 or token in WEAK_QUERY_TOKENS
                 or token in OVERLOADED_JUMP_QUERY_TOKENS
                 or len(token) <= 2
-                or not _is_specific_jump_query_token(token)
+                or (
+                    not _is_specific_jump_query_token(token)
+                    and not _is_causal_jump_query_token(token)
+                )
             ):
                 continue
             seen.add(token)
             support_tokens.append(token)
     return blocked_tokens, preferred_anchor_phrases, support_tokens
+
+
+def _normalize_jump_query_clause(text: str) -> str:
+    clean_text = re.sub(r"\s+", " ", str(text or "").strip()).lower()
+    for prefix in JUMP_QUERY_CLAUSE_PREFIXES:
+        if clean_text.startswith(prefix):
+            return clean_text[len(prefix):].strip()
+    return clean_text
+
+
+def _score_jump_query_clause(
+    clause: str,
+    blocked_tokens: set[str],
+) -> tuple[int, int, int, int, int]:
+    tokens = _tokenize_query_terms(clause)
+    specific_count = sum(
+        1
+        for token in tokens
+        if token not in blocked_tokens
+        and token not in GENERIC_QUERY_TOKENS
+        and token not in WEAK_QUERY_TOKENS
+        and token not in JUMP_QUERY_FILLER_TOKENS
+        and (_is_specific_jump_query_token(token) or _is_causal_jump_query_token(token))
+    )
+    mechanism_count = sum(token in MECHANISM_QUERY_TOKENS for token in tokens)
+    causal_count = sum(_is_causal_jump_query_token(token) for token in tokens)
+    outcome_count = sum(token in JUMP_QUERY_CAUSAL_OUTCOME_HINTS for token in tokens)
+    return (
+        1 if causal_count > 0 else 0,
+        causal_count + mechanism_count + outcome_count,
+        specific_count,
+        outcome_count,
+        len(tokens),
+    )
+
+
+def _build_causal_jump_query_fragment(
+    text: str,
+    blocked_tokens: set[str],
+) -> str:
+    normalized_text = _normalize_jump_query_clause(text)
+    if not normalized_text:
+        return ""
+
+    clauses = [
+        clause.strip()
+        for clause in re.split(r"[.;:,]", normalized_text)
+        if clause.strip()
+    ]
+    if not clauses:
+        clauses = [normalized_text]
+    best_clause = max(
+        clauses,
+        key=lambda clause: _score_jump_query_clause(clause, blocked_tokens),
+    )
+    clause_tokens = _tokenize_query_terms(best_clause)
+    if not clause_tokens:
+        return ""
+
+    focus_index = next(
+        (
+            index
+            for index, token in enumerate(clause_tokens)
+            if _is_causal_jump_query_token(token)
+        ),
+        next(
+            (
+                index
+                for index, token in enumerate(clause_tokens)
+                if token in MECHANISM_QUERY_TOKENS
+            ),
+            0,
+        ),
+    )
+    start_index = max(0, focus_index - 2)
+    selected: list[str] = []
+    strong_token_count = 0
+    for token in clause_tokens[start_index:]:
+        if token in blocked_tokens or token in OVERLOADED_JUMP_QUERY_TOKENS:
+            continue
+        if token in JUMP_QUERY_FILLER_TOKENS:
+            continue
+        if (
+            token in GENERIC_QUERY_TOKENS
+            and not _is_causal_jump_query_token(token)
+            and token not in JUMP_QUERY_CAUSAL_OUTCOME_HINTS
+        ):
+            continue
+        if (
+            token in WEAK_QUERY_TOKENS
+            and not _is_causal_jump_query_token(token)
+        ):
+            continue
+        if (
+            token in AMBIGUOUS_JUMP_QUERY_TOKENS
+            and strong_token_count >= 3
+            and token not in MECHANISM_QUERY_TOKENS
+        ):
+            continue
+        if len(token) <= 2:
+            continue
+        selected.append(token)
+        if (
+            _is_specific_jump_query_token(token)
+            or _is_causal_jump_query_token(token)
+            or token in MECHANISM_QUERY_TOKENS
+            or token in JUMP_QUERY_CAUSAL_OUTCOME_HINTS
+        ):
+            strong_token_count += 1
+        if len(selected) >= 7:
+            break
+    return " ".join(selected[:7]).strip()
 
 
 def _jump_query_anchor_support(
@@ -1446,13 +1637,39 @@ def _build_jump_search_query_heuristic(
     source_domain: str,
     source_category: str,
 ) -> str:
-    """Deterministically enrich pattern queries with concrete mechanism-bearing terms."""
+    """Deterministically prefer causal-dynamics phrasing over source-token recombination."""
     raw_query = str(pattern.get("search_query", "") or "").strip()
     if not raw_query:
         return ""
 
     blocked_tokens = set(_tokenize_query_terms(source_domain))
     blocked_tokens.update(_tokenize_query_terms(source_category))
+
+    causal_candidates: list[tuple[int, str]] = []
+    for priority, text in enumerate(
+        (
+            str(pattern.get("transfer_rationale", "") or ""),
+            str(pattern.get("abstract_structure", "") or ""),
+        ),
+        start=1,
+    ):
+        causal_fragment = _build_causal_jump_query_fragment(text, blocked_tokens)
+        causal_tokens = _tokenize_query_terms(causal_fragment)
+        if len(causal_tokens) >= 4 and any(
+            _is_causal_jump_query_token(token) for token in causal_tokens
+        ):
+            causal_candidates.append((priority, causal_fragment))
+    if causal_candidates:
+        return max(
+            causal_candidates,
+            key=lambda item: (
+                _score_jump_query_clause(item[1], blocked_tokens)[3],
+                _score_jump_query_clause(item[1], blocked_tokens)[1],
+                _score_jump_query_clause(item[1], blocked_tokens)[2],
+                -item[0],
+                _score_jump_query_clause(item[1], blocked_tokens)[4],
+            ),
+        )[1]
 
     def _filtered_tokens(text: str, *, specific_only: bool = False) -> list[str]:
         out = []
