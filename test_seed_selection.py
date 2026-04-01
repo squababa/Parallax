@@ -163,6 +163,28 @@ def test_quality_matching_does_not_penalize_history_for_story_substring() -> Non
     )
 
 
+def test_domain_to_seed_problem_frames_runtime_queries() -> None:
+    runtime_seed = seed._domain_to_seed(
+        {
+            "name": "Distributed Systems",
+            "category": "Technology",
+            "seed_queries": [
+                "  consensus algorithms distributed systems  ",
+                "Byzantine   fault tolerance",
+                "queue routing latency control",
+                "load balancing failover schedule",
+            ],
+        }
+    )
+
+    assert runtime_seed["seed_queries"] == [
+        "unsolved problems in Distributed Systems consensus algorithms distributed systems",
+        "failure modes in Distributed Systems Byzantine fault tolerance",
+        "constraints in Distributed Systems queue routing latency control",
+        "bottlenecks in Distributed Systems load balancing failover schedule",
+    ]
+
+
 def test_pick_seed_returns_quality_diagnostics(monkeypatch) -> None:
     strong_domains = [
         {

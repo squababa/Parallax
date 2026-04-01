@@ -1327,8 +1327,9 @@ def test_lateral_jump_with_diagnostics_records_success(monkeypatch) -> None:
 def test_lateral_jump_with_diagnostics_merges_multi_query_results_for_both_stages(
     monkeypatch,
 ) -> None:
-    seen_queries: list[str] = []
+    seen_calls: list[tuple[str, tuple[str, ...] | None]] = []
     stage_inputs: dict[str, object] = {}
+    tavily_call_counts: list[int] = []
 
     monkeypatch.setattr(
         jump,
@@ -1341,14 +1342,31 @@ def test_lateral_jump_with_diagnostics_merges_multi_query_results_for_both_stage
 
     def fake_search(**kwargs):
         query = kwargs["query"]
-        seen_queries.append(query)
+        include_domains = tuple(kwargs.get("include_domains") or ())
+        seen_calls.append((query, include_domains or None))
+        if include_domains:
+            assert include_domains == jump.ACADEMIC_JUMP_INCLUDE_DOMAINS
+            return {
+                "results": [
+                    {
+                        "title": "Shared target paper",
+                        "content": "shared academic mechanism evidence for both lanes",
+                        "url": "https://arxiv.org/abs/2401.12345",
+                    },
+                    {
+                        "title": "Academic-only target paper",
+                        "content": "academic retrieval evidence with a concrete mechanism",
+                        "url": "https://pubmed.ncbi.nlm.nih.gov/12345678/",
+                    },
+                ]
+            }
         if query == "queue threshold throttling latency":
             return {
                 "results": [
                     {
                         "title": "Shared target paper",
-                        "content": "shared mechanism evidence for both queries",
-                        "url": "https://target.test/shared",
+                        "content": "shared mechanism evidence for both general queries",
+                        "url": "https://arxiv.org/abs/2401.12345",
                     },
                     {
                         "title": "Base-only target paper",
@@ -1361,8 +1379,8 @@ def test_lateral_jump_with_diagnostics_merges_multi_query_results_for_both_stage
             "results": [
                 {
                     "title": "Shared target paper",
-                    "content": "shared mechanism evidence for both queries",
-                    "url": "https://target.test/shared",
+                    "content": "shared solution-biased evidence for the same paper",
+                    "url": "https://arxiv.org/abs/2401.12345",
                 },
                 {
                     "title": "Solution-only target paper",
@@ -1373,6 +1391,11 @@ def test_lateral_jump_with_diagnostics_merges_multi_query_results_for_both_stage
         }
 
     monkeypatch.setattr(jump._tavily, "search", fake_search)
+    monkeypatch.setattr(
+        jump,
+        "increment_tavily_calls",
+        lambda count=1: tavily_call_counts.append(count),
+    )
 
     def fake_stage_one(**kwargs):
         stage_inputs["stage1"] = kwargs["search_results"]
@@ -1407,32 +1430,28 @@ def test_lateral_jump_with_diagnostics_merges_multi_query_results_for_both_stage
     )
 
     assert connection is not None
-    assert seen_queries == [
-        "queue threshold throttling latency",
-        "queue threshold throttling latency workaround",
+    assert seen_calls == [
+        ("queue threshold throttling latency", None),
+        ("queue threshold throttling latency workaround", None),
+        ("queue threshold throttling latency", jump.ACADEMIC_JUMP_INCLUDE_DOMAINS),
     ]
+    assert tavily_call_counts == [1, 1, 1]
     assert diagnostic["built_jump_query"] == "queue threshold throttling latency"
     assert diagnostic["built_jump_queries"] == [
         "queue threshold throttling latency",
         "queue threshold throttling latency workaround",
     ]
     assert diagnostic["query_collision_guard_applied"] is False
-    assert diagnostic["result_count"] == 3
+    assert diagnostic["general_result_count"] == 4
+    assert diagnostic["academic_result_count"] == 2
+    assert diagnostic["result_count"] == 4
     assert diagnostic["filtered_result_count"] == 0
     assert diagnostic["filtered_result_reason_counts"] == {}
-    assert diagnostic["cluster_count"] == 3
+    assert diagnostic["cluster_count"] == 4
     assert diagnostic["intervention_promoted_result_count"] == 0
     assert diagnostic["top_cluster_intervention_scores"] == [0, 0, 0]
-    assert set(diagnostic["top_result_titles"]) == {
-        "Shared target paper",
-        "Base-only target paper",
-        "Solution-only target paper",
-    }
-    assert set(diagnostic["top_cluster_hints"]) == {
-        "Shared target paper",
-        "Base-only target paper",
-        "Solution-only target paper",
-    }
+    assert "Shared target paper" in diagnostic["top_result_titles"]
+    assert "Shared target paper" in diagnostic["top_cluster_hints"]
     assert stage_inputs["stage1"] == stage_inputs["stage2"]
     assert stage_inputs["stage2_solution_evidence"] == (
         "actuation suppression during mismatch faults is the concrete workaround"
@@ -1440,11 +1459,97 @@ def test_lateral_jump_with_diagnostics_merges_multi_query_results_for_both_stage
     assert "Candidate cluster 1:" in stage_inputs["stage1"]
     assert "Search result 1:" in stage_inputs["stage1"]
     assert stage_inputs["stage1"].count("Title: Shared target paper") == 1
-    assert "Retrieved via: base, solution-biased" in stage_inputs["stage1"]
-    assert "URL: https://target.test/shared" in stage_inputs["stage1"]
-    assert "Snippet: shared mechanism evidence for both queries" in stage_inputs["stage1"]
+    assert "Retrieved via: base, solution-biased, academic" in stage_inputs["stage1"]
+    assert "Retrieved via: academic" in stage_inputs["stage1"]
+    assert "URL: https://arxiv.org/abs/2401.12345" in stage_inputs["stage1"]
+    assert "Snippet: shared solution-biased evidence for the same paper" in stage_inputs["stage1"]
     assert "Retrieved via: base" in stage_inputs["stage1"]
     assert "Retrieved via: solution-biased" in stage_inputs["stage1"]
+    assert "Title: Academic-only target paper" in stage_inputs["stage1"]
+
+
+def test_lateral_jump_with_diagnostics_reports_general_and_academic_result_counts(
+    monkeypatch,
+    capsys,
+) -> None:
+    tavily_call_counts: list[int] = []
+
+    monkeypatch.setattr(
+        jump,
+        "_build_jump_search_queries",
+        lambda *_args, **_kwargs: [
+            "queue threshold throttling latency",
+            "queue threshold throttling latency workaround",
+        ],
+    )
+
+    def fake_search(**kwargs):
+        query = kwargs["query"]
+        include_domains = tuple(kwargs.get("include_domains") or ())
+        if include_domains:
+            return {
+                "results": [
+                    {
+                        "title": "Academic mechanism paper",
+                        "content": "academic mechanism evidence for the same operator constraint",
+                        "url": "https://arxiv.org/abs/2501.98765",
+                    }
+                ]
+            }
+        if query == "queue threshold throttling latency":
+            return {
+                "results": [
+                    {
+                        "title": "Base-only target paper",
+                        "content": "base query retrieval evidence",
+                        "url": "https://target.test/base-only",
+                    }
+                ]
+            }
+        return {"results": []}
+
+    monkeypatch.setattr(jump._tavily, "search", fake_search)
+    monkeypatch.setattr(
+        jump,
+        "increment_tavily_calls",
+        lambda count=1: tavily_call_counts.append(count),
+    )
+    monkeypatch.setattr(
+        jump,
+        "_stage_one_detect_with_diagnostics",
+        lambda **_kwargs: (
+            {
+                "target_domain": "Safety Interlock Monitoring",
+                "signal": "shared structural signal",
+                "evidence": "specific evidence",
+                "solution_evidence": "concrete operator response",
+            },
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        jump,
+        "_stage_two_hypothesize_with_diagnostics",
+        lambda **_kwargs: (_safety_interlock_jump_payload(), None, None),
+    )
+
+    connection, diagnostic = jump.lateral_jump_with_diagnostics(
+        {
+            "pattern_name": "Queue-threshold congestion gating",
+            "abstract_structure": "load compared against a queue threshold",
+            "search_query": "queue threshold throttling latency",
+        },
+        "Network Protocols",
+        "Technology",
+    )
+
+    output = capsys.readouterr().out
+
+    assert connection is not None
+    assert tavily_call_counts == [1, 1, 1]
+    assert diagnostic["general_result_count"] == 1
+    assert diagnostic["academic_result_count"] == 1
+    assert "[Jump] general_results=1 academic_results=1" in output
 
 
 def test_lateral_jump_with_diagnostics_clusters_coherent_results_ahead_of_generic_singleton(
@@ -2067,7 +2172,7 @@ def test_lateral_jump_with_diagnostics_prefers_solution_biased_duplicate_excerpt
 def test_lateral_jump_with_diagnostics_continues_after_partial_tavily_failure(
     monkeypatch,
 ) -> None:
-    seen_queries: list[str] = []
+    seen_calls: list[tuple[str, tuple[str, ...] | None]] = []
     stage_inputs: dict[str, object] = {}
 
     monkeypatch.setattr(
@@ -2081,7 +2186,8 @@ def test_lateral_jump_with_diagnostics_continues_after_partial_tavily_failure(
 
     def fake_search(**kwargs):
         query = kwargs["query"]
-        seen_queries.append(query)
+        include_domains = tuple(kwargs.get("include_domains") or ())
+        seen_calls.append((query, include_domains or None))
         if query == "queue threshold throttling latency workaround":
             raise RuntimeError("transient tavily failure")
         return {
@@ -2126,9 +2232,10 @@ def test_lateral_jump_with_diagnostics_continues_after_partial_tavily_failure(
     )
 
     assert connection is not None
-    assert seen_queries == [
-        "queue threshold throttling latency",
-        "queue threshold throttling latency workaround",
+    assert seen_calls == [
+        ("queue threshold throttling latency", None),
+        ("queue threshold throttling latency workaround", None),
+        ("queue threshold throttling latency", jump.ACADEMIC_JUMP_INCLUDE_DOMAINS),
     ]
     assert diagnostic["stage1_outcome"] == "detect_signal"
     assert diagnostic["stage2_outcome"] == "connection_found"
