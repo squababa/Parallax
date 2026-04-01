@@ -30,6 +30,13 @@ from debug_log import log_gemini_output
 _llm_client = get_llm_client()
 _tavily = TavilyClient(api_key=TAVILY_API_KEY)
 MECHANISM_VOCAB_TEXT = ", ".join(MECHANISM_TYPE_V1_VOCAB)
+ACADEMIC_JUMP_INCLUDE_DOMAINS = (
+    "arxiv.org",
+    "biorxiv.org",
+    "medrxiv.org",
+    "pubmed.ncbi.nlm.nih.gov",
+    "ncbi.nlm.nih.gov",
+)
 
 DETECT_PROMPT = """Stage 1: detection only.
 You are deciding whether there is enough evidence of a real structural parallel to proceed.
@@ -944,6 +951,16 @@ def _normalize_jump_result_host(url: str) -> str:
     if host.startswith("www."):
         host = host[4:]
     return host
+
+
+def _host_matches_jump_include_domains(host: str, include_domains: tuple[str, ...]) -> bool:
+    clean_host = str(host or "").strip().lower()
+    if not clean_host:
+        return False
+    return any(
+        clean_host == domain or clean_host.endswith(f".{domain}")
+        for domain in include_domains
+    )
 
 
 def _build_jump_title_signature(
@@ -4587,6 +4604,8 @@ def lateral_jump_with_diagnostics(
         "built_jump_queries": [],
         "query_collision_guard_applied": False,
         "result_count": 0,
+        "general_result_count": 0,
+        "academic_result_count": 0,
         "filtered_result_count": 0,
         "filtered_result_reason_counts": {},
         "cluster_count": 0,
@@ -4628,6 +4647,8 @@ def lateral_jump_with_diagnostics(
     merged_result_index: dict[str, int] = {}
     query_labels = ("base", "solution-biased")
     query_error_count = 0
+    general_result_count = 0
+    academic_result_count = 0
     filtered_result_reason_counts: dict[str, int] = {}
     filtered_result_reason_keys: dict[str, set[str]] = {}
     blocked_cluster_tokens = set(_tokenize_query_terms(source_domain))
@@ -4649,25 +4670,12 @@ def lateral_jump_with_diagnostics(
             1 if "solution-biased" in labels else 0,
         )
 
-    for index, current_query in enumerate(queries):
-        try:
-            results = _tavily.search(
-                query=current_query,
-                max_results=5,
-                include_answer=False,
-                search_depth="basic",
-            )
-            increment_tavily_calls(1)
-        except Exception as e:
-            print(f"  [!] Tavily search failed for jump query '{current_query}': {e}")
-            query_error_count += 1
-            continue
-
-        raw_results = results.get("results", [])
-        if not isinstance(raw_results, list):
-            raw_results = []
-
-        query_label = query_labels[index] if index < len(query_labels) else f"variant-{index + 1}"
+    def _merge_search_results(
+        raw_results: list[dict],
+        query_label: str,
+        *,
+        include_domains: tuple[str, ...] | None = None,
+    ) -> None:
         for result in raw_results:
             title_text = str(result.get("title", "") or "").strip()
             title = title_text.lower()
@@ -4678,6 +4686,12 @@ def lateral_jump_with_diagnostics(
             if not clean:
                 continue
             url = str(result.get("url", "") or "").strip()
+            normalized_host = _normalize_jump_result_host(url)
+            if include_domains and not _host_matches_jump_include_domains(
+                normalized_host,
+                include_domains,
+            ):
+                continue
             should_drop, weak_result_context = _classify_weak_jump_result(
                 title_text,
                 url,
@@ -4735,47 +4749,98 @@ def lateral_jump_with_diagnostics(
                         "intervention_signal": intervention_signal,
                     }
                 )
+                continue
+            existing_result = merged_results[existing_index]
+            existing_labels = list(existing_result["query_labels"])
+            incoming_labels = [query_label]
+            incoming_rank = _excerpt_rank(clean, incoming_labels)
+            existing_rank = _excerpt_rank(
+                str(existing_result.get("clean", "") or ""),
+                existing_labels,
+            )
+            if incoming_rank > existing_rank:
+                existing_result["clean"] = clean
+                if title_text:
+                    existing_result["title_text"] = title_text
+                existing_result["anchor_overlap"] = anchor_overlap
+                existing_result["preferred_phrase_match"] = preferred_phrase_match
+                existing_result["solution_marker_count"] = solution_marker_count
+                existing_result["intervention_marker_count"] = intervention_marker_count
+                existing_result["intervention_evidence"] = intervention_evidence
+                existing_result["intervention_signal"] = intervention_signal
             else:
-                existing_result = merged_results[existing_index]
-                existing_labels = list(existing_result["query_labels"])
-                incoming_labels = [query_label]
-                incoming_rank = _excerpt_rank(clean, incoming_labels)
-                existing_rank = _excerpt_rank(
-                    str(existing_result.get("clean", "") or ""),
-                    existing_labels,
+                existing_result["intervention_marker_count"] = max(
+                    int(existing_result.get("intervention_marker_count") or 0),
+                    intervention_marker_count,
                 )
-                if incoming_rank > existing_rank:
-                    existing_result["clean"] = clean
-                    if title_text:
-                        existing_result["title_text"] = title_text
-                    existing_result["anchor_overlap"] = anchor_overlap
-                    existing_result["preferred_phrase_match"] = preferred_phrase_match
-                    existing_result["solution_marker_count"] = solution_marker_count
-                    existing_result["intervention_marker_count"] = intervention_marker_count
-                    existing_result["intervention_evidence"] = intervention_evidence
+                existing_result["intervention_evidence"] = bool(
+                    existing_result.get("intervention_evidence")
+                ) or intervention_evidence
+                if (
+                    intervention_signal
+                    and not str(existing_result.get("intervention_signal") or "").strip()
+                ):
                     existing_result["intervention_signal"] = intervention_signal
-                else:
-                    existing_result["intervention_marker_count"] = max(
-                        int(existing_result.get("intervention_marker_count") or 0),
-                        intervention_marker_count,
-                    )
-                    existing_result["intervention_evidence"] = bool(
-                        existing_result.get("intervention_evidence")
-                    ) or intervention_evidence
-                    if (
-                        intervention_signal
-                        and not str(existing_result.get("intervention_signal") or "").strip()
-                    ):
-                        existing_result["intervention_signal"] = intervention_signal
-                if query_label not in existing_result["query_labels"]:
-                    existing_result["query_labels"].append(query_label)
+            if query_label not in existing_result["query_labels"]:
+                existing_result["query_labels"].append(query_label)
+
+    for index, current_query in enumerate(queries):
+        try:
+            results = _tavily.search(
+                query=current_query,
+                max_results=5,
+                include_answer=False,
+                search_depth="basic",
+            )
+            increment_tavily_calls(1)
+        except Exception as e:
+            print(f"  [!] Tavily search failed for jump query '{current_query}': {e}")
+            query_error_count += 1
+            continue
+
+        raw_results = results.get("results", [])
+        if not isinstance(raw_results, list):
+            raw_results = []
+        general_result_count += len(raw_results)
+
+        query_label = query_labels[index] if index < len(query_labels) else f"variant-{index + 1}"
+        _merge_search_results(raw_results, query_label)
+
+    try:
+        academic_results = _tavily.search(
+            query=query,
+            max_results=5,
+            include_answer=False,
+            search_depth="basic",
+            include_domains=list(ACADEMIC_JUMP_INCLUDE_DOMAINS),
+        )
+        increment_tavily_calls(1)
+    except Exception as e:
+        print(f"  [!] Tavily academic jump search failed for query '{query}': {e}")
+        query_error_count += 1
+        academic_results = {"results": []}
+
+    raw_academic_results = academic_results.get("results", [])
+    if not isinstance(raw_academic_results, list):
+        raw_academic_results = []
+    academic_result_count = len(raw_academic_results)
+    _merge_search_results(
+        raw_academic_results,
+        "academic",
+        include_domains=ACADEMIC_JUMP_INCLUDE_DOMAINS,
+    )
+    diagnostic["general_result_count"] = general_result_count
+    diagnostic["academic_result_count"] = academic_result_count
+    print(
+        f"[Jump] general_results={general_result_count} academic_results={academic_result_count}"
+    )
 
     diagnostic["filtered_result_reason_counts"] = filtered_result_reason_counts
     diagnostic["intervention_promoted_result_count"] = sum(
         1 for result in merged_results if result.get("intervention_evidence")
     )
 
-    if query_error_count == len(queries):
+    if query_error_count == len(queries) + 1:
         diagnostic["stage1_outcome"] = "no_results"
         diagnostic["stage1_failure_hint"] = "search_error"
         return None, diagnostic

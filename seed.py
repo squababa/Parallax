@@ -235,6 +235,13 @@ ABSTRACT_OR_INTERPRETIVE_CATEGORIES = {
     "Philosophy",
 }
 
+SEED_PROBLEM_FRAMING_PREFIXES = (
+    "unsolved problems in",
+    "failure modes in",
+    "constraints in",
+    "bottlenecks in",
+)
+
 
 def _load_domains() -> list[dict]:
     """Load domain list from domains.json."""
@@ -242,6 +249,21 @@ def _load_domains() -> list[dict]:
     with open(path, "r") as f:
         data = json.load(f)
     return data["domains"]
+
+
+def _problem_frame_seed_queries(domain_name: str, seed_queries: list[str]) -> list[str]:
+    """Return runtime seed queries biased toward unresolved problems and constraints."""
+    clean_domain_name = " ".join(str(domain_name or "").split()).strip()
+    reframed_queries: list[str] = []
+    for index, query in enumerate(seed_queries):
+        clean_query = " ".join(str(query or "").split()).strip()
+        if not clean_query:
+            continue
+        prefix = SEED_PROBLEM_FRAMING_PREFIXES[
+            index % len(SEED_PROBLEM_FRAMING_PREFIXES)
+        ]
+        reframed_queries.append(f"{prefix} {clean_domain_name} {clean_query}".strip())
+    return reframed_queries
 
 
 def _domain_to_seed(
@@ -253,7 +275,10 @@ def _domain_to_seed(
     seed = {
         "name": domain["name"],
         "category": domain["category"],
-        "seed_queries": list(domain["seed_queries"]),
+        "seed_queries": _problem_frame_seed_queries(
+            domain["name"],
+            list(domain["seed_queries"]),
+        ),
     }
     if isinstance(quality_profile, dict) and quality_profile:
         seed["quality_profile"] = quality_profile
