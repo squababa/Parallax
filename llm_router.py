@@ -1,4 +1,5 @@
 import json
+import os
 
 import requests
 
@@ -15,6 +16,8 @@ class LLMRouter:
         system_prompt: str,
         user_prompt: str,
         temperature: float = 0,
+        request_timeout_s: float | None = None,
+        num_predict: int | None = None,
     ) -> str:
         prompt = (
             f"{system_prompt.strip()}\n\n"
@@ -22,15 +25,33 @@ class LLMRouter:
             f"{user_prompt.strip()}"
         )
         try:
+            resolved_timeout = float(
+                request_timeout_s
+                if request_timeout_s is not None
+                else os.getenv("OLLAMA_REQUEST_TIMEOUT_S", "120")
+            )
+        except (TypeError, ValueError):
+            resolved_timeout = 120.0
+        if resolved_timeout <= 0:
+            resolved_timeout = 120.0
+        options = {"temperature": temperature}
+        if num_predict is not None:
+            try:
+                resolved_num_predict = int(num_predict)
+            except (TypeError, ValueError):
+                resolved_num_predict = None
+            if resolved_num_predict is not None and resolved_num_predict > 0:
+                options["num_predict"] = resolved_num_predict
+        try:
             response = requests.post(
                 f"{self._base_url}/api/generate",
                 json={
                     "model": model,
                     "prompt": prompt,
                     "stream": False,
-                    "options": {"temperature": temperature},
+                    "options": options,
                 },
-                timeout=120,
+                timeout=resolved_timeout,
             )
         except requests.RequestException as exc:
             raise RuntimeError(f"Failed to reach Ollama at {self._base_url}: {exc}") from exc

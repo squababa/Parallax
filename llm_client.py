@@ -191,13 +191,24 @@ class OllamaClient:
 
     def generate_content(self, prompt: str, generation_config: dict | None = None):
         temperature = 0
+        request_timeout_s = None
+        num_predict = None
         if isinstance(generation_config, dict):
             temperature = float(generation_config.get("temperature", 0) or 0)
+            request_timeout_s = generation_config.get("request_timeout_s")
+            max_output_tokens = generation_config.get("max_output_tokens")
+            if max_output_tokens is not None:
+                try:
+                    num_predict = int(max_output_tokens)
+                except (TypeError, ValueError):
+                    num_predict = None
         text = self._router.call_local_chat(
             model=self._model,
             system_prompt="Respond directly to the user's instructions.",
             user_prompt=prompt,
             temperature=temperature,
+            request_timeout_s=request_timeout_s,
+            num_predict=num_predict,
         )
         payload = {"model": self._model, "response": text}
         try:
