@@ -2553,6 +2553,98 @@ def test_lateral_jump_with_diagnostics_promotes_intervention_bearing_cluster(
     ) < stage_inputs["stage1"].index("Title: Electrochemical gas phase dynamics")
 
 
+def test_lateral_jump_with_diagnostics_enriches_stage1_packet_with_evidence_roles(
+    monkeypatch,
+) -> None:
+    stage_inputs: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        jump,
+        "_build_jump_search_queries",
+        lambda *_args, **_kwargs: ["relay gating mismatch suppression"],
+    )
+    monkeypatch.setattr(
+        jump._tavily,
+        "search",
+        lambda **_kwargs: {
+            "results": [
+                {
+                    "title": "Relay gating mismatch suppression",
+                    "content": (
+                        "Relay gating mismatch suppression isolates the mismatched lane "
+                        "before actuator switching."
+                    ),
+                    "url": "https://target.test/relay-1",
+                },
+                {
+                    "title": "Relay gating mismatch monitoring",
+                    "content": (
+                        "Redundant relay mismatch monitoring compares lane states "
+                        "before actuator startup."
+                    ),
+                    "url": "https://target.test/relay-2",
+                },
+                {
+                    "title": "Relay gating operator response",
+                    "content": (
+                        "Operators isolate the failing lane as a practical workaround "
+                        "when mismatch alarms trigger before actuation."
+                    ),
+                    "url": "https://target.test/relay-3",
+                },
+            ]
+        },
+    )
+
+    def fake_stage_one(**kwargs):
+        stage_inputs["stage1"] = kwargs["search_results"]
+        return (
+            {
+                "target_domain": "Safety Interlock Monitoring",
+                "signal": "shared structural signal",
+                "evidence": "specific evidence",
+                "solution_evidence": "concrete workaround",
+            },
+            None,
+        )
+
+    monkeypatch.setattr(jump, "_stage_one_detect_with_diagnostics", fake_stage_one)
+    monkeypatch.setattr(
+        jump,
+        "_stage_two_hypothesize_with_diagnostics",
+        lambda **_kwargs: (_safety_interlock_jump_payload(), None, None),
+    )
+
+    connection, _diagnostic = jump.lateral_jump_with_diagnostics(
+        {
+            "pattern_name": "Relay-gated mismatch suppression",
+            "abstract_structure": "relay gating suppresses mismatch faults before actuator switching",
+            "search_query": "relay gating mismatch suppression",
+        },
+        "Network Protocols",
+        "Technology",
+    )
+
+    assert connection is not None
+    assert "Mechanism evidence:" in stage_inputs["stage1"]
+    assert "Intervention/workaround evidence:" in stage_inputs["stage1"]
+    assert "Operator response evidence:" in stage_inputs["stage1"]
+    assert (
+        "Relay gating mismatch suppression isolates the mismatched lane "
+        "before actuator switching."
+    ) in stage_inputs["stage1"]
+    assert (
+        "Operators isolate the failing lane as a practical workaround "
+        "when mismatch alarms trigger before actuation."
+    ) in stage_inputs["stage1"]
+    assert stage_inputs["stage1"].count("Title: Relay gating mismatch suppression") == 1
+    assert stage_inputs["stage1"].count("Title: Relay gating operator response") == 1
+    assert "Title: Relay gating mismatch monitoring" in stage_inputs["stage1"]
+    assert "Search result 2:" not in stage_inputs["stage1"]
+    assert "Search result 3:" not in stage_inputs["stage1"]
+    assert stage_inputs["stage1"].count("Snippet:") <= 5
+
+
 def test_lateral_jump_with_diagnostics_does_not_promote_descriptive_process_paper_as_intervention(
     monkeypatch,
 ) -> None:

@@ -5624,6 +5624,111 @@ def lateral_jump_with_diagnostics(
             excerpt_rank[3],
         )
 
+    def _stage_one_mechanism_evidence_rank(result: dict) -> tuple[int, int, int, int, int, int, int]:
+        clean = str(result.get("clean", "") or "").strip()
+        title_text = str(result.get("title_text", "") or "").strip()
+        query_labels = [
+            str(label).strip()
+            for label in (result.get("query_labels") or [])
+            if str(label).strip()
+        ]
+        token_set = set(_tokenize_query_terms(f"{title_text} {clean}"))
+        mechanism_token_count = len(token_set.intersection(MECHANISM_QUERY_TOKENS))
+        anchor_token_count = len(token_set.intersection(strong_anchor_tokens))
+        excerpt_rank = _excerpt_rank(clean, query_labels)
+        triage_class = str(result.get("triage_class") or "keep").strip() or "keep"
+        return (
+            1 if triage_class == "keep" else 0,
+            1 if result.get("preferred_phrase_match") else 0,
+            int(result.get("anchor_overlap") or 0),
+            anchor_token_count + mechanism_token_count,
+            excerpt_rank[0],
+            excerpt_rank[1],
+            excerpt_rank[2],
+        )
+
+    def _stage_one_intervention_evidence_rank(result: dict) -> tuple[int, int, int, int, int, int, int]:
+        clean = str(result.get("clean", "") or "").strip()
+        query_labels = [
+            str(label).strip()
+            for label in (result.get("query_labels") or [])
+            if str(label).strip()
+        ]
+        excerpt_rank = _excerpt_rank(clean, query_labels)
+        return (
+            1 if result.get("intervention_evidence") else 0,
+            int(result.get("intervention_marker_count") or 0),
+            int(result.get("solution_marker_count") or 0),
+            1 if "solution-biased" in query_labels else 0,
+            int(result.get("anchor_overlap") or 0),
+            1 if result.get("preferred_phrase_match") else 0,
+            excerpt_rank[1],
+        )
+
+    def _stage_one_packet_result_key(result: dict) -> str:
+        return (
+            str(result.get("url", "") or "").strip().lower()
+            or str(result.get("title_text", "") or "").strip().lower()
+            or str(result.get("clean", "") or "").strip().lower()
+        )
+
+    def _select_stage_one_evidence_highlights(cluster_results: list[dict]) -> list[dict[str, object]]:
+        highlight_order: list[str] = []
+        highlights_by_key: dict[str, dict[str, object]] = {}
+
+        def _pick_highlight(
+            label: str,
+            predicate,
+            ranker,
+        ) -> None:
+            candidates = [result for result in cluster_results if predicate(result)]
+            if not candidates:
+                return
+            best_result = max(candidates, key=ranker)
+            key = _stage_one_packet_result_key(best_result)
+            existing = highlights_by_key.get(key)
+            if existing is None:
+                highlight_order.append(key)
+                highlights_by_key[key] = {
+                    "result": best_result,
+                    "labels": [label],
+                }
+                return
+            labels = existing.setdefault("labels", [])
+            if label not in labels:
+                labels.append(label)
+
+        _pick_highlight(
+            "Mechanism evidence",
+            lambda result: (
+                bool(result.get("preferred_phrase_match"))
+                or int(result.get("anchor_overlap") or 0) >= 2
+                or _stage_one_mechanism_evidence_rank(result)[3] >= 3
+            ),
+            _stage_one_mechanism_evidence_rank,
+        )
+        _pick_highlight(
+            "Intervention/workaround evidence",
+            lambda result: (
+                bool(result.get("intervention_evidence"))
+                or int(result.get("solution_marker_count") or 0) > 0
+            ),
+            _stage_one_intervention_evidence_rank,
+        )
+        _pick_highlight(
+            "Operator response evidence",
+            lambda result: (
+                bool(str(result.get("intervention_signal", "") or "").strip())
+                or bool(result.get("intervention_evidence"))
+                or int(result.get("solution_marker_count") or 0) > 0
+            ),
+            lambda result: (
+                1 if str(result.get("intervention_signal", "") or "").strip() else 0,
+                *_stage_one_intervention_evidence_rank(result),
+            ),
+        )
+        return [highlights_by_key[key] for key in highlight_order]
+
     clustered_results: list[dict] = []
     for merged_result in merged_results:
         title_signature = _build_jump_title_signature(
@@ -5783,7 +5888,33 @@ def lateral_jump_with_diagnostics(
             )
         elif int(cluster.get("intervention_score") or 0) > 0:
             search_content.append("Intervention evidence: yes")
-        for result_index, merged_result in enumerate(cluster_results, start=1):
+        highlighted_result_keys: set[str] = set()
+        for highlight in _select_stage_one_evidence_highlights(cluster_results):
+            highlighted_result = dict(highlight.get("result") or {})
+            title_text = str(highlighted_result.get("title_text", "") or "").strip()
+            clean = str(highlighted_result.get("clean", "") or "").strip()
+            url = str(highlighted_result.get("url", "") or "").strip()
+            query_label_text = ", ".join(
+                str(label).strip()
+                for label in (highlighted_result.get("query_labels") or [])
+                if str(label).strip()
+            )
+            label_texts = [
+                str(label).strip()
+                for label in (highlight.get("labels") or [])
+                if str(label).strip()
+            ]
+            highlighted_result_keys.add(_stage_one_packet_result_key(highlighted_result))
+            for label_text in label_texts:
+                search_content.append(f"{label_text}:")
+            if query_label_text:
+                search_content.append(f"Retrieved via: {query_label_text}")
+            search_content.append(f"Title: {title_text or 'Unknown'}")
+            if url:
+                search_content.append(f"URL: {url}")
+            search_content.append(f"Snippet: {clean}")
+        fallback_results: list[dict] = []
+        for merged_result in cluster_results:
             title_text = str(merged_result.get("title_text", "") or "").strip()
             clean = str(merged_result.get("clean", "") or "").strip()
             url = str(merged_result.get("url", "") or "").strip()
@@ -5801,6 +5932,12 @@ def lateral_jump_with_diagnostics(
             )
             if title_text and title_text not in top_titles and len(top_titles) < 3:
                 top_titles.append(title_text)
+            if _stage_one_packet_result_key(merged_result) not in highlighted_result_keys:
+                fallback_results.append(merged_result)
+        for result_index, merged_result in enumerate(fallback_results[:2], start=1):
+            title_text = str(merged_result.get("title_text", "") or "").strip()
+            clean = str(merged_result.get("clean", "") or "").strip()
+            url = str(merged_result.get("url", "") or "").strip()
             if result_index <= 2:
                 search_content.append(f"Search result {result_index}:")
                 search_content.append(
