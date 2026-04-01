@@ -1751,6 +1751,7 @@ def _print_jump_diagnostics(limit: int = 20) -> None:
     total_attempts = 0
     outcome_counts = {
         "no_results": 0,
+        "weak_signal": 0,
         "detect_no_signal": 0,
         "stage2_no_connection": 0,
         "connection_found": 0,
@@ -1787,6 +1788,8 @@ def _print_jump_diagnostics(limit: int = 20) -> None:
             result_count = int(attempt.get("result_count") or 0)
             if stage1_outcome == "no_results":
                 outcome_counts["no_results"] += 1
+            elif stage1_outcome == "weak_signal":
+                outcome_counts["weak_signal"] += 1
             elif stage1_outcome == "detect_no_signal":
                 outcome_counts["detect_no_signal"] += 1
             elif stage2_outcome == "stage2_no_connection":
@@ -1814,6 +1817,18 @@ def _print_jump_diagnostics(limit: int = 20) -> None:
                 print(
                     f"    target={target_domain} | failure_hint={failure_hint}"
                 )
+            soft_gate_attempted = bool(attempt.get("stage1_soft_gate_attempted"))
+            soft_gate_recovered = bool(attempt.get("stage1_soft_gate_recovered"))
+            if stage1_outcome == "weak_signal" or (
+                stage1_outcome == "detect_signal" and soft_gate_recovered
+            ):
+                attempted_text = (
+                    "attempted" if soft_gate_attempted else "not_attempted"
+                )
+                recovered_text = (
+                    "recovered" if soft_gate_recovered else "not_recovered"
+                )
+                print(f"    soft_gate={attempted_text},{recovered_text}")
             incomplete_fields = (
                 attempt.get("stage2_incomplete_fields")
                 if isinstance(attempt.get("stage2_incomplete_fields"), list)
@@ -1858,6 +1873,7 @@ def _print_jump_diagnostics(limit: int = 20) -> None:
 
     for label in (
         "no_results",
+        "weak_signal",
         "detect_no_signal",
         "stage2_no_connection",
         "connection_found",
@@ -2141,10 +2157,12 @@ def _jump_benchmark_stage_rank(stage1_outcome: str | None, stage2_outcome: str |
     clean_stage2 = str(stage2_outcome or "").strip()
     clean_stage1 = str(stage1_outcome or "").strip()
     if clean_stage2 == "connection_found":
-        return 3
+        return 5
     if clean_stage2 == "stage2_no_connection":
-        return 2
+        return 4
     if clean_stage1 == "detect_signal":
+        return 3
+    if clean_stage1 == "weak_signal":
         return 2
     if clean_stage1 == "detect_no_signal":
         return 1
@@ -2228,19 +2246,17 @@ def _run_jump_attempt_benchmark_case(case: dict) -> dict:
                     "pattern_name": _clean_inline_text(case.get("pattern_name")),
                     "replay_mode": replay_mode,
                 }
-            actual_stage1_outcome = (
-                "detect_no_signal"
-                if stage_one_failure_hint in ("no_connection", "missing_solution_evidence")
-                else "no_results"
-            )
-            actual_stage2_outcome = None
-            actual_stage2_failure_hint = None
-            actual_stage2_incomplete_fields: list[str] = []
-            actual_stage2_target_domain = None
-            actual_stage1_target_domain = None
-        else:
-            actual_stage1_outcome = "detect_signal"
-            actual_stage1_target_domain = _clean_inline_text(stage_one.get("target_domain"))
+        actual_stage1_outcome = jump_module._classify_stage_one_outcome(
+            stage_one,
+            stage_one_failure_hint,
+        )
+        actual_stage2_outcome = None
+        actual_stage2_failure_hint = None
+        actual_stage2_incomplete_fields: list[str] = []
+        actual_stage2_target_domain = None
+        actual_stage1_target_domain = _clean_inline_text(
+            stage_one.get("target_domain") if isinstance(stage_one, dict) else None
+        )
     else:
         replay_mode = "stage2_only"
         actual_stage1_outcome = "detect_signal"
