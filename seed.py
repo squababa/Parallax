@@ -235,11 +235,19 @@ ABSTRACT_OR_INTERPRETIVE_CATEGORIES = {
     "Philosophy",
 }
 
-SEED_PROBLEM_FRAMING_PREFIXES = (
-    "unsolved problems in",
-    "failure modes in",
-    "constraints in",
-    "bottlenecks in",
+SEED_QUERY_FAMILY_TEMPLATES = (
+    (
+        "failure modes in {domain} {topic}",
+        "operating constraints in {domain} {topic}",
+    ),
+    (
+        "control strategies in {domain} {topic}",
+        "workflow interventions in {domain} {topic}",
+    ),
+    (
+        "mechanisms in {domain} {topic}",
+        "process bottlenecks in {domain} {topic}",
+    ),
 )
 
 
@@ -252,17 +260,25 @@ def _load_domains() -> list[dict]:
 
 
 def _problem_frame_seed_queries(domain_name: str, seed_queries: list[str]) -> list[str]:
-    """Return runtime seed queries biased toward unresolved problems and constraints."""
+    """Return deterministic runtime seed queries across failure, operator, and mechanism families."""
     clean_domain_name = " ".join(str(domain_name or "").split()).strip()
     reframed_queries: list[str] = []
-    for index, query in enumerate(seed_queries):
+    family_count = len(SEED_QUERY_FAMILY_TEMPLATES)
+    for query in seed_queries:
         clean_query = " ".join(str(query or "").split()).strip()
         if not clean_query:
             continue
-        prefix = SEED_PROBLEM_FRAMING_PREFIXES[
-            index % len(SEED_PROBLEM_FRAMING_PREFIXES)
+        active_index = len(reframed_queries)
+        family_templates = SEED_QUERY_FAMILY_TEMPLATES[active_index % family_count]
+        template = family_templates[
+            (active_index // family_count) % len(family_templates)
         ]
-        reframed_queries.append(f"{prefix} {clean_domain_name} {clean_query}".strip())
+        reframed_queries.append(
+            template.format(
+                domain=clean_domain_name,
+                topic=clean_query,
+            ).strip()
+        )
     return reframed_queries
 
 
