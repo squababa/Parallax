@@ -250,24 +250,64 @@ def test_build_jump_search_query_keeps_anchored_overloaded_term_when_supported(
     assert query == "priority scheduling latency gating saturation"
 
 
+def test_build_jump_search_query_preserves_natural_language_causal_shape_through_collision_guard(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        jump,
+        "_generate_llm_jump_search_query",
+        lambda *_args, **_kwargs: "systems where periodic disruption prevents resource monopolization",
+    )
+
+    query = jump._build_jump_search_query(
+        {
+            "search_query": "periodic clearing dominant process cpu queue monopoly prevention",
+            "pattern_name": "Disturbance-mediated competitive release",
+            "abstract_structure": (
+                "periodic disturbance resets dominant occupancy and reopens limited "
+                "resource access before one competitor locks in long-term control"
+            ),
+            "measurable_signal": "share of occupied patches after each disruption pulse",
+            "control_lever": "change disturbance frequency and protected recovery windows",
+            "transfer_rationale": (
+                "transfers to systems where periodic disruption prevents durable "
+                "resource monopolization by one actor"
+            ),
+        },
+        "Marine Ecology",
+        "Science",
+    )
+
+    assert query == "systems where periodic disruption prevents resource monopolization"
+
+
 def test_build_jump_search_queries_returns_base_query_plus_solution_variant(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
         jump,
         "_generate_llm_jump_search_query",
-        lambda *_args, **_kwargs: "queue threshold throttling latency",
+        lambda *_args, **_kwargs: "allocation regimes where threshold gating trades efficiency for overload prevention",
     )
 
     queries = jump._build_jump_search_queries(
-        {"search_query": "queue threshold throttling latency"},
+        {
+            "search_query": "allocation threshold rate efficiency overload routing",
+            "pattern_name": "Threshold-gated overload prevention",
+            "abstract_structure": (
+                "threshold gating slows allocation when overload risk rises above the "
+                "safe operating band"
+            ),
+            "measurable_signal": "allocation efficiency and overload incidents",
+            "control_lever": "change threshold gating and overflow routing",
+        },
         "Network Protocols",
         "Technology",
     )
 
     assert queries == [
-        "queue threshold throttling latency",
-        "queue threshold throttling latency workaround",
+        "allocation regimes where threshold gating trades efficiency for overload prevention",
+        "allocation regimes where threshold gating trades efficiency for overload prevention workaround",
     ]
 
 
@@ -357,14 +397,14 @@ def test_build_jump_search_query_prefers_causal_dynamics_for_disturbance_release
     assert "pool" not in query
 
 
-def test_build_jump_search_query_prefers_compact_llm_query_when_valid(
+def test_build_jump_search_query_prefers_compact_natural_language_llm_query_when_valid(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
         jump,
         "_generate_json_with_retry",
         lambda *_args, **_kwargs: json.dumps(
-            {"query": "deficit detector routing quota balancing"}
+            {"query": "systems where deficit detection routes supply before stockouts cascade"}
         ),
     )
 
@@ -387,29 +427,34 @@ def test_build_jump_search_query_prefers_compact_llm_query_when_valid(
         "Operations",
     )
 
-    assert query == "deficit detector routing quota balancing"
+    assert query == "systems where deficit detection routes supply before stockouts cascade"
 
 
-def test_is_acceptable_llm_jump_query_accepts_compact_query_with_phrase_anchor() -> None:
+def test_is_acceptable_llm_jump_query_accepts_compact_natural_language_causal_query() -> None:
     pattern = {
-        "search_query": "selection pressure variance collapse transition parameter",
-        "pattern_name": "Selection-pressure collapse gating",
+        "search_query": "periodic clearing dominant process cpu queue monopoly prevention",
+        "pattern_name": "Disturbance-mediated competitive release",
         "abstract_structure": (
-            "selection pressure rises until a collapse transition compresses diversity"
+            "periodic disturbance resets dominant occupancy and reopens limited "
+            "resource access before one competitor locks in long-term control"
         ),
-        "measurable_signal": "diversity loss and collapse transition frequency",
-        "control_lever": "tune selection pressure and restart threshold",
+        "measurable_signal": "share of occupied patches after each disruption pulse",
+        "control_lever": "change disturbance frequency and protected recovery windows",
+        "transfer_rationale": (
+            "transfers to systems where periodic disruption prevents durable "
+            "resource monopolization by one actor"
+        ),
     }
 
     acceptable = jump._is_acceptable_llm_jump_query(
-        "selection pressure collapse gating",
+        "systems where periodic disruption prevents resource monopolization",
         pattern,
-        "Evolutionary Computation",
-        "Technology",
+        "Marine Ecology",
+        "Science",
         jump._build_jump_search_query_heuristic(
             pattern,
-            "Evolutionary Computation",
-            "Technology",
+            "Marine Ecology",
+            "Science",
         ),
     )
 
@@ -588,6 +633,96 @@ def test_lateral_jump_with_diagnostics_academic_lane_uses_improved_base_query(
     ]
     assert stage_inputs["stage1"] == stage_inputs["stage2"]
     assert "Retrieved via: academic" in stage_inputs["stage1"]
+
+
+def test_lateral_jump_with_diagnostics_reports_preserved_natural_language_built_queries(
+    monkeypatch,
+) -> None:
+    seen_calls: list[tuple[str, tuple[str, ...] | None]] = []
+    stage_inputs: dict[str, object] = {}
+
+    def fake_search(**kwargs):
+        query = kwargs["query"]
+        include_domains = tuple(kwargs.get("include_domains") or ())
+        seen_calls.append((query, include_domains or None))
+        return {
+            "results": [
+                {
+                    "title": "Recovered target paper",
+                    "content": (
+                        "Periodic disruption prevents durable resource monopolization "
+                        "and operators use resets to reopen access after dominance lock-in."
+                    ),
+                    "url": "https://target.test/recovered-query-shape",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(jump._tavily, "search", fake_search)
+    monkeypatch.setattr(
+        jump,
+        "_generate_llm_jump_search_query",
+        lambda *_args, **_kwargs: "systems where periodic disruption prevents resource monopolization",
+    )
+
+    def fake_stage_one(**kwargs):
+        stage_inputs["stage1"] = kwargs["search_results"]
+        return (
+            {
+                "target_domain": "Access-control recovery",
+                "signal": "shared reset-and-reopen structure",
+                "evidence": "specific evidence",
+                "solution_evidence": "periodic resets reopen access after dominance lock-in",
+            },
+            None,
+        )
+
+    def fake_stage_two(**kwargs):
+        stage_inputs["stage2"] = kwargs["search_results"]
+        return (_safety_interlock_jump_payload(), None, None)
+
+    monkeypatch.setattr(jump, "_stage_one_detect_with_diagnostics", fake_stage_one)
+    monkeypatch.setattr(jump, "_stage_two_hypothesize_with_diagnostics", fake_stage_two)
+
+    connection, diagnostic = jump.lateral_jump_with_diagnostics(
+        {
+            "pattern_name": "Disturbance-mediated competitive release",
+            "abstract_structure": (
+                "periodic disturbance resets dominant occupancy and reopens limited "
+                "resource access before one competitor locks in long-term control"
+            ),
+            "search_query": "periodic clearing dominant process cpu queue monopoly prevention",
+            "measurable_signal": "share of occupied patches after each disruption pulse",
+            "control_lever": "change disturbance frequency and protected recovery windows",
+            "transfer_rationale": (
+                "transfers to systems where periodic disruption prevents durable "
+                "resource monopolization by one actor"
+            ),
+        },
+        "Marine Ecology",
+        "Science",
+    )
+
+    assert connection is not None
+    assert diagnostic["built_jump_query"] == (
+        "systems where periodic disruption prevents resource monopolization"
+    )
+    assert diagnostic["built_jump_queries"] == [
+        "systems where periodic disruption prevents resource monopolization",
+        "systems where periodic disruption prevents resource monopolization workaround",
+    ]
+    assert seen_calls == [
+        ("systems where periodic disruption prevents resource monopolization", None),
+        (
+            "systems where periodic disruption prevents resource monopolization workaround",
+            None,
+        ),
+        (
+            "systems where periodic disruption prevents resource monopolization",
+            jump.ACADEMIC_JUMP_INCLUDE_DOMAINS,
+        ),
+    ]
+    assert stage_inputs["stage1"] == stage_inputs["stage2"]
 
 
 def test_stage_one_detect_prompt_prefers_solution_bearing_analogues(

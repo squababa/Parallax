@@ -1218,6 +1218,44 @@ def _score_jump_query_clause(
     )
 
 
+def _is_compact_natural_language_jump_query(
+    query: str,
+    blocked_tokens: set[str],
+) -> bool:
+    clean_query = re.sub(r"\s+", " ", str(query or "").strip())
+    candidate_tokens = _tokenize_query_terms(clean_query)
+    if len(candidate_tokens) < 4 or len(candidate_tokens) > 12:
+        return False
+    if _looks_like_formal_jump_query_token_soup(clean_query, candidate_tokens):
+        return False
+
+    strong_tokens = [
+        token
+        for token in candidate_tokens
+        if token not in blocked_tokens
+        and token not in GENERIC_QUERY_TOKENS
+        and token not in WEAK_QUERY_TOKENS
+    ]
+    if len(strong_tokens) < 3:
+        return False
+
+    connector_markers = {
+        "after",
+        "before",
+        "during",
+        "under",
+        "when",
+        "where",
+        "with",
+        "without",
+    }
+    if any(token in connector_markers for token in candidate_tokens):
+        return True
+    return any(_is_causal_jump_query_token(token) for token in candidate_tokens) and len(
+        candidate_tokens
+    ) <= 5
+
+
 def _build_causal_jump_query_fragment(
     text: str,
     blocked_tokens: set[str],
@@ -1763,21 +1801,21 @@ def _is_acceptable_llm_jump_query(
     if not raw_candidate or "\n" in raw_candidate or "\r" in raw_candidate:
         return False
 
-    candidate = re.sub(r"\s+", " ", raw_candidate)
+    candidate = re.sub(r"\s+", " ", raw_candidate).strip(" .,!?")
     if len(candidate) > 96:
         return False
     if "http://" in candidate.lower() or "https://" in candidate.lower():
         return False
     if any(char in candidate for char in ('{', '}', '[', ']', ':', ';', '"', "`", "|")):
         return False
-    if re.search(r"[.!?,()]", candidate):
+    if re.search(r"[()]", candidate):
         return False
 
     blocked_tokens = set(_tokenize_query_terms(source_domain))
     blocked_tokens.update(_tokenize_query_terms(source_category))
 
     candidate_tokens = _tokenize_query_terms(candidate)
-    if len(candidate_tokens) < 3 or len(candidate_tokens) > 10:
+    if len(candidate_tokens) < 3 or len(candidate_tokens) > 12:
         return False
     if any(token in blocked_tokens for token in candidate_tokens):
         return False
@@ -1789,6 +1827,7 @@ def _is_acceptable_llm_jump_query(
         for token in candidate_tokens
         if token not in GENERIC_QUERY_TOKENS and token not in WEAK_QUERY_TOKENS
     ]
+    natural_language_query = _is_compact_natural_language_jump_query(candidate, blocked_tokens)
     if len(strong_tokens) < 3:
         return False
     if not any(_is_specific_jump_query_token(token) for token in strong_tokens):
@@ -1836,7 +1875,49 @@ def _is_acceptable_llm_jump_query(
     if candidate_token_set.intersection(anchor_tokens):
         return True
 
-    return any(phrase in lowered_candidate for phrase in anchor_phrases)
+    if any(phrase in lowered_candidate for phrase in anchor_phrases):
+        return True
+
+    clause_score = _score_jump_query_clause(candidate, blocked_tokens)
+    return natural_language_query and clause_score[1] >= 2 and clause_score[2] >= 3
+
+
+def _preserve_jump_query_causal_shape(
+    original_query: str,
+    rebuilt_query: str,
+    pattern: dict,
+    source_domain: str,
+    source_category: str,
+) -> str:
+    clean_original = re.sub(r"\s+", " ", str(original_query or "").strip())
+    clean_rebuilt = re.sub(r"\s+", " ", str(rebuilt_query or "").strip())
+    if not clean_original or not clean_rebuilt or clean_original == clean_rebuilt:
+        return clean_rebuilt or clean_original
+
+    blocked_tokens = set(_tokenize_query_terms(source_domain))
+    blocked_tokens.update(_tokenize_query_terms(source_category))
+    if not _is_compact_natural_language_jump_query(clean_original, blocked_tokens):
+        return clean_rebuilt
+    if _is_compact_natural_language_jump_query(clean_rebuilt, blocked_tokens):
+        return clean_rebuilt
+
+    preferred_anchor_phrases = _preferred_jump_query_anchor_phrases(pattern, blocked_tokens)
+    original_has_phrase, original_concrete_tokens = _jump_query_anchor_support(
+        clean_original,
+        preferred_anchor_phrases,
+        blocked_tokens,
+    )
+    if not original_has_phrase and len(original_concrete_tokens) < 2:
+        return clean_rebuilt
+
+    if not _is_compact_natural_language_jump_query(clean_rebuilt, blocked_tokens):
+        return clean_original
+
+    original_score = _score_jump_query_clause(clean_original, blocked_tokens)
+    rebuilt_score = _score_jump_query_clause(clean_rebuilt, blocked_tokens)
+    if original_score >= rebuilt_score:
+        return clean_original
+    return clean_rebuilt
 
 
 def _generate_llm_jump_search_query(
@@ -1880,7 +1961,7 @@ def _generate_llm_jump_search_query(
         heuristic_query,
     ):
         return None
-    return re.sub(r"\s+", " ", query)
+    return re.sub(r"\s+", " ", query).strip(" .,!?")
 
 
 def _build_jump_search_query(
@@ -1922,6 +2003,13 @@ def _build_jump_search_query_with_metadata(
         source_domain,
         source_category,
     )
+    heuristic_query = _preserve_jump_query_causal_shape(
+        raw_query,
+        heuristic_query,
+        pattern,
+        source_domain,
+        source_category,
+    )
     llm_query = _generate_llm_jump_search_query(
         pattern,
         source_domain,
@@ -1929,6 +2017,7 @@ def _build_jump_search_query_with_metadata(
         heuristic_query,
     )
     if llm_query:
+        original_llm_query = llm_query
         llm_query = _disambiguate_jump_search_query(
             llm_query,
             pattern,
@@ -1938,6 +2027,13 @@ def _build_jump_search_query_with_metadata(
     llm_collision_guard_applied = False
     if llm_query:
         llm_query, llm_collision_guard_applied = _apply_jump_query_collision_guard(
+            llm_query,
+            pattern,
+            source_domain,
+            source_category,
+        )
+        llm_query = _preserve_jump_query_causal_shape(
+            original_llm_query,
             llm_query,
             pattern,
             source_domain,
@@ -1976,7 +2072,8 @@ def _build_jump_search_queries(
         (term for term in solution_terms if term not in query_tokens),
         solution_terms[0],
     )
-    return [query, f"{query} {solution_term}"]
+    base_query = re.sub(r"\s+", " ", query).strip()
+    return [base_query, f"{base_query} {solution_term}"]
 
 
 _build_jump_search_queries.last_collision_guard_applied = False
