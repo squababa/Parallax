@@ -5016,6 +5016,8 @@ def lateral_jump_with_diagnostics(
 
     diagnostic["stage1_outcome"] = "detect_signal"
     diagnostic["stage1_target_domain"] = str(stage_one.get("target_domain", "") or "").strip() or None
+    if isinstance(diagnostic.get("benchmark_snapshot"), dict):
+        diagnostic["benchmark_snapshot"]["stage_one_success"] = dict(stage_one)
 
     stage_two_result = _stage_two_hypothesize_with_diagnostics(
         source_domain=source_domain,

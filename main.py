@@ -2048,6 +2048,13 @@ def _capture_jump_benchmark_case(
             ],
         },
     }
+    stage_one_success = (
+        snapshot.get("stage_one_success")
+        if isinstance(snapshot.get("stage_one_success"), dict)
+        else None
+    )
+    if stage_one_success is not None:
+        case["stage_one_success"] = dict(stage_one_success)
 
     try:
         cases = _load_jump_benchmark_cases(benchmark_file)
@@ -2144,6 +2151,33 @@ def _jump_benchmark_stage_rank(stage1_outcome: str | None, stage2_outcome: str |
     return 0
 
 
+def _benchmark_stage_one_success_snapshot(case: dict) -> dict | None:
+    """Return one valid captured Stage 1 success payload for Stage-2-only replay."""
+    expected = case.get("expected") if isinstance(case.get("expected"), dict) else {}
+    if str(expected.get("stage1_outcome") or "").strip() != "detect_signal":
+        return None
+    stage_one_success = (
+        case.get("stage_one_success")
+        if isinstance(case.get("stage_one_success"), dict)
+        else None
+    )
+    if stage_one_success is None:
+        return None
+
+    required_fields = ("target_domain", "signal", "evidence", "solution_evidence")
+    normalized: dict[str, object] = {}
+    for field in required_fields:
+        value = _clean_inline_text(stage_one_success.get(field))
+        if not value:
+            return None
+        normalized[field] = value
+    for key, value in stage_one_success.items():
+        if key in normalized:
+            continue
+        normalized[str(key)] = value
+    return normalized
+
+
 def _strong_rejection_benchmark_rank(verdict: str | None) -> int:
     """Rank strong-rejection replay verdicts so later survival counts as improvement."""
     clean = str(verdict or "").strip().lower()
@@ -2173,35 +2207,46 @@ def _run_jump_attempt_benchmark_case(case: dict) -> dict:
             "message": "missing abstract_structure or search_results",
         }
 
-    stage_one, stage_one_failure_hint = jump_module._stage_one_detect_with_diagnostics(
-        source_domain=source_domain,
-        abstract_structure=abstract_structure,
-        search_results=search_results,
-    )
+    replay_mode = "full"
+    stage_one_failure_hint = None
+    stage_one = _benchmark_stage_one_success_snapshot(case)
     if stage_one is None:
-        if str(stage_one_failure_hint or "").strip() == "generation_failed":
-            return {
-                "type": "jump_attempt",
-                "case_id": case.get("id"),
-                "label": case.get("label"),
-                "status": "ERROR",
-                "message": "stage1_detect generation failed during benchmark replay",
-                "actual_stage1_failure_hint": stage_one_failure_hint,
-                "pattern_name": _clean_inline_text(case.get("pattern_name")),
-            }
-        actual_stage1_outcome = (
-            "detect_no_signal"
-            if stage_one_failure_hint in ("no_connection", "missing_solution_evidence")
-            else "no_results"
+        stage_one, stage_one_failure_hint = jump_module._stage_one_detect_with_diagnostics(
+            source_domain=source_domain,
+            abstract_structure=abstract_structure,
+            search_results=search_results,
         )
-        actual_stage2_outcome = None
-        actual_stage2_failure_hint = None
-        actual_stage2_incomplete_fields: list[str] = []
-        actual_stage2_target_domain = None
-        actual_stage1_target_domain = None
+        if stage_one is None:
+            if str(stage_one_failure_hint or "").strip() == "generation_failed":
+                return {
+                    "type": "jump_attempt",
+                    "case_id": case.get("id"),
+                    "label": case.get("label"),
+                    "status": "ERROR",
+                    "message": "stage1_detect generation failed during benchmark replay",
+                    "actual_stage1_failure_hint": stage_one_failure_hint,
+                    "pattern_name": _clean_inline_text(case.get("pattern_name")),
+                    "replay_mode": replay_mode,
+                }
+            actual_stage1_outcome = (
+                "detect_no_signal"
+                if stage_one_failure_hint in ("no_connection", "missing_solution_evidence")
+                else "no_results"
+            )
+            actual_stage2_outcome = None
+            actual_stage2_failure_hint = None
+            actual_stage2_incomplete_fields: list[str] = []
+            actual_stage2_target_domain = None
+            actual_stage1_target_domain = None
+        else:
+            actual_stage1_outcome = "detect_signal"
+            actual_stage1_target_domain = _clean_inline_text(stage_one.get("target_domain"))
     else:
+        replay_mode = "stage2_only"
         actual_stage1_outcome = "detect_signal"
         actual_stage1_target_domain = _clean_inline_text(stage_one.get("target_domain"))
+
+    if stage_one is not None and actual_stage1_outcome == "detect_signal":
         stage_two_data, stage_two_failure_hint, stage_two_incomplete_fields = (
             jump_module._stage_two_hypothesize_with_diagnostics(
                 source_domain=source_domain,
@@ -2222,6 +2267,7 @@ def _run_jump_attempt_benchmark_case(case: dict) -> dict:
                     "actual_stage1_target_domain": actual_stage1_target_domain,
                     "actual_stage2_failure_hint": stage_two_failure_hint,
                     "pattern_name": _clean_inline_text(case.get("pattern_name")),
+                    "replay_mode": replay_mode,
                 }
             actual_stage2_outcome = "stage2_no_connection"
             actual_stage2_failure_hint = stage_two_failure_hint or "returned_no_connection"
@@ -2270,6 +2316,7 @@ def _run_jump_attempt_benchmark_case(case: dict) -> dict:
         "actual_stage2_target_domain": actual_stage2_target_domain,
         "actual_stage2_incomplete_fields": actual_stage2_incomplete_fields,
         "pattern_name": _clean_inline_text(case.get("pattern_name")),
+        "replay_mode": replay_mode,
     }
 
 
@@ -2397,9 +2444,13 @@ def _run_jump_benchmark(
             f"{result.get('case_id') or '—'}\t{label_text}"
         )
         if status == "ERROR":
+            if result.get("type") == "jump_attempt" and result.get("replay_mode"):
+                print(f"  replay_mode={result.get('replay_mode')}")
             print(f"  message={result.get('message') or 'unknown error'}")
             continue
         if result.get("type") == "jump_attempt":
+            if result.get("replay_mode"):
+                print(f"  replay_mode={result.get('replay_mode')}")
             print(
                 f"  expected={result.get('expected_stage1_outcome') or '—'} -> "
                 f"{result.get('expected_stage2_outcome') or '—'} | "

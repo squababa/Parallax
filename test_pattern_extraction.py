@@ -2747,6 +2747,12 @@ def test_lateral_jump_with_diagnostics_records_benchmark_snapshot(monkeypatch) -
     assert snapshot["pattern_name"] == "Queue-threshold congestion gating"
     assert "Candidate cluster 1:" in snapshot["search_results"]
     assert "Title: Wireless scheduling paper" in snapshot["search_results"]
+    assert snapshot["stage_one_success"] == {
+        "target_domain": "Wireless Scheduling",
+        "signal": "shared structural signal",
+        "evidence": "specific evidence",
+        "solution_evidence": "threshold gate lowers collision pressure",
+    }
 
 
 def test_capture_jump_benchmark_case_writes_case_file(temp_db, tmp_path) -> None:
@@ -2772,6 +2778,12 @@ def test_capture_jump_benchmark_case_writes_case_file(temp_db, tmp_path) -> None
                         "abstract_structure": "load compared against a queue threshold",
                         "built_jump_query": "queue threshold throttling latency",
                         "search_results": "Candidate cluster 1:\nTitle: Wireless scheduling paper",
+                        "stage_one_success": {
+                            "target_domain": "Wireless Scheduling",
+                            "signal": "shared structural signal",
+                            "evidence": "specific evidence",
+                            "solution_evidence": "threshold gate lowers collision pressure",
+                        },
                     },
                 }
             ],
@@ -2794,6 +2806,7 @@ def test_capture_jump_benchmark_case_writes_case_file(temp_db, tmp_path) -> None
     assert cases[0]["type"] == "jump_attempt"
     assert cases[0]["expected"]["stage2_failure_hint"] == "repair_incomplete"
     assert "Wireless scheduling paper" in cases[0]["search_results"]
+    assert cases[0]["stage_one_success"]["target_domain"] == "Wireless Scheduling"
 
 
 def test_configure_benchmark_llm_env_forces_local_qwen(monkeypatch) -> None:
@@ -3083,7 +3096,64 @@ def test_run_jump_benchmark_marks_jump_case_improved(tmp_path, capsys, monkeypat
     assert main._run_jump_benchmark(benchmark_file, 0.6) is True
     output = capsys.readouterr().out
     assert "IMPROVED\tjump_attempt\tjump-case-1" in output
+    assert "replay_mode=full" in output
     assert "actual=detect_signal -> connection_found" in output
+
+
+def test_run_jump_benchmark_uses_stage2_only_replay_when_stage_one_success_present(
+    tmp_path,
+    capsys,
+    monkeypatch,
+) -> None:
+    benchmark_file = tmp_path / "jump_replay_benchmark.json"
+    benchmark_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "cases": [
+                    {
+                        "id": "jump-case-stage2-only",
+                        "label": "jump stage2 only",
+                        "type": "jump_attempt",
+                        "source_domain": "Network Protocols",
+                        "pattern_name": "Queue-threshold congestion gating",
+                        "abstract_structure": "load compared against a queue threshold",
+                        "search_results": "Candidate cluster 1:\nTitle: Wireless scheduling paper",
+                        "stage_one_success": {
+                            "target_domain": "Wireless Scheduling",
+                            "signal": "shared structural signal",
+                            "evidence": "specific evidence",
+                            "solution_evidence": "threshold gate lowers collision pressure",
+                        },
+                        "expected": {
+                            "stage1_outcome": "detect_signal",
+                            "stage2_outcome": "stage2_no_connection",
+                        },
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        main.jump_module,
+        "_stage_one_detect_with_diagnostics",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("stage1 replay should be skipped when stage_one_success is present")
+        ),
+    )
+    monkeypatch.setattr(
+        main.jump_module,
+        "_stage_two_hypothesize_with_diagnostics",
+        lambda **_kwargs: (None, "repair_incomplete", ["edge_analysis.edge_if_right"]),
+    )
+
+    assert main._run_jump_benchmark(benchmark_file, 0.6) is True
+    output = capsys.readouterr().out
+    assert "MATCH\tjump_attempt\tjump-case-stage2-only" in output
+    assert "replay_mode=stage2_only" in output
+    assert "actual=detect_signal -> stage2_no_connection" in output
 
 
 def test_run_jump_benchmark_marks_strong_rejection_improved(
