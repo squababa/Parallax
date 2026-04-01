@@ -125,10 +125,13 @@ Requirements:
   - If a snippet only supports the overall causal story but not the exact mapped-variable claim, use it for mechanism_assertions instead of variable_mappings.
   - If a snippet only supports mechanism-level logic without a direct variable-level claim, put it in `mechanism_assertions`, not in `variable_mappings`.
   - evidence_map.mechanism_assertions must include at least 1 entry with mechanism_claim, evidence_snippet, and source_reference.
+  - mechanism_assertions must be concise mechanism-support statements tied to the same target-domain process named in `mechanism`, not broad literature-summary assertions.
   - mechanism_assertions must support the actual causal operator or control logic in the mechanism (what triggers, routes, switches, inhibits, amplifies, or accumulates), not just background context about the target domain.
   - At least one target-domain snippet or mechanism_assertion must directly support the named target-domain process or the exact metric/immediate observable consequence used in the test.
   - Treat the evidence_snippet itself as the core proof. Do not let mechanism_claim carry stronger process language than the snippet actually supports.
+  - Do not use broad field summaries, adjacent background explanation, or generic literature framing as `mechanism_assertions`.
   - For the core claim, prefer one direct target-domain snippet that explicitly names the same process noun phrase or the same canonical test metric. If you only have adjacent context, background explanation, or broad domain framing, return `no_connection`.
+  - If the mechanism cannot be directly supported by a target-domain snippet or a concise mechanism_assertion on that same process, return `no_connection`.
   - Prefer direct core target evidence over broad contextual target evidence. A weaker overview-style snippet should never be the main support if a narrower direct mechanism or metric snippet is available.
   - For the named target-domain process, `test.metric`, and the first 3 critical mappings, prefer scholarly, technical, primary, standards, or otherwise domain-credible target evidence when available.
   - Reject off-domain or generic background target evidence. If a result title or evidence_snippet is not clearly about the target domain, named process, or named metric, treat it as unusable and return `no_connection`.
@@ -224,9 +227,10 @@ Requirements:
 - Tie `edge_analysis.problem_statement` to the same process, the same metric/comparator, and the same operator decision already used in `prediction` / `test`.
 - Make `edge_analysis.problem_statement` read like a missed operator problem, not an essay.
 - Reject field-summary prose, restatements of the whole domain, and generic `systems are complex` wording in `edge_analysis.problem_statement`.
-- `edge_analysis.actionable_lever` must name one concrete operator action, heuristic, filter, design change, or search direction that follows from the mechanism.
+- `edge_analysis.actionable_lever` must name exactly one concrete operator move, setting change, filter, routing rule, threshold adjustment, replay, audit, or workflow intervention that follows from the mechanism.
 - `edge_analysis.actionable_lever` must reuse the current mechanism, metric, or operator context. Do not write advisory phrasing like `consider`, `explore`, `may help`, `investigate`, or other non-operational wording.
-- `edge_analysis.cheap_test` must include setup, metric, confirm, falsify, and optional time_to_signal. It must be a fast realistic validation path, not a multi-month research program by default.
+- Reject vague levers such as `investigate further`, `optimize process`, `improve monitoring`, or `apply insights`.
+- `edge_analysis.cheap_test` must be one cheap operator-facing check on an existing workflow slice and must include setup, metric, confirm, falsify, and time_to_signal. It must be a fast realistic validation path, not a multi-month research program by default.
 - `edge_analysis.cheap_test.setup` must read like one real operator move on a narrow slice of the target-domain workflow. Name one real operator move, dataset, simulation, or measurement path, reuse the same process, comparator, and metric from `mechanism`/`prediction`/`test`, and make the setup smaller, cheaper, and more decision-facing than the main test.
 - `edge_analysis.cheap_test.metric` must stay aligned with `test.metric`; name the same measurable quantity or a narrow comparator on that same quantity, not a generic proxy.
 - `edge_analysis.cheap_test.metric` must not drift into generic validation wording or a broad proxy metric.
@@ -234,8 +238,10 @@ Requirements:
 - `edge_analysis.edge_if_right` must state one concrete operator advantage if the test confirms the claim. Keep it contingent and scoped to the retrieved evidence.
 - `edge_analysis.edge_if_right` must name exactly one operator, one decision change unlocked by the cheap test, and one concrete advantage if confirmed, not just say the result would be useful.
 - `edge_analysis.edge_if_right` must say what the operator will do differently if the cheap test confirms, not just that the result has novelty or value.
+- `edge_analysis.edge_if_right` must explicitly say who acts, what they do differently, and what concrete advantage they gain if confirmed.
 - `edge_analysis.edge_if_right` must stay concise and operator-facing, with no extra generic value framing before or after the operator decision.
 - Do not use generic novelty or value phrasing in `edge_analysis.edge_if_right` such as `this could be useful`, `this may provide an edge`, `novel insight`, or `valuable perspective`.
+- Keep `edge_analysis.actionable_lever`, `edge_analysis.cheap_test`, and `edge_analysis.edge_if_right` tied to the same operator and the same metric/comparator. Do not let the lever, cheap test, and edge consequence point to different workflow slices or different success criteria.
 - `edge_analysis.primary_operator` must name the specific operator who would use the lever.
 - `edge_analysis.why_missed` must explain one concrete search, framing, workflow, metric, or discipline-boundary reason the target-domain problem or lever may be undernoticed.
 - `edge_analysis.expected_asymmetry` must explain why the lever is plausibly underused rather than already standard target-domain wisdom.
@@ -3568,7 +3574,7 @@ def _repair_guidance_for_missing_fields(
             "- Treat `edge_analysis.actionable_lever` + `edge_analysis.cheap_test` as one coordinated operator package. The lever should name the operator move, and the cheap test should be the cheapest grounded way to try, replay, filter, or audit that same move on the same workflow slice."
         )
         guidance.append(
-            "- Complete or tighten the lever and cheap test together around one shared mechanism, operator decision, metric, comparator, and workflow context. Do not let the lever describe one move while the cheap test evaluates a different intervention."
+            "- Complete only the missing lever/test package around one shared target-domain process, operator decision, metric, comparator, and workflow context. Do not let the lever describe one move while the cheap test evaluates a different intervention."
         )
         if lever_anchor:
             guidance.append(
@@ -3592,6 +3598,40 @@ def _repair_guidance_for_missing_fields(
             )
         guidance.append(
             "- If the current payload and evidence do not support both the lever and cheap test as one grounded operator package, return `{\"no_connection\": true}` instead of fabricating the missing half."
+        )
+    if {
+        "edge_analysis.actionable_lever",
+        "edge_analysis.cheap_test",
+        "edge_analysis.edge_if_right",
+    }.issubset(missing_field_set):
+        guidance.append(
+            "- Treat `edge_analysis.actionable_lever` + `edge_analysis.cheap_test` + `edge_analysis.edge_if_right` as one coordinated edge package: one operator move, one cheap check of that move on the same workflow slice, and one decision change plus concrete advantage if it confirms."
+        )
+        guidance.append(
+            "- Preserve the already grounded target-domain process, operator, metric, and comparator. Complete only the missing edge package and do not rewrite `mechanism`, `prediction`, `test`, or unrelated evidence when the current core is usable."
+        )
+        if operator_anchor:
+            guidance.append(
+                f"- Keep the full edge package tied to the current operator: `{operator_anchor}`."
+            )
+        if metric_anchor:
+            guidance.append(
+                f"- Keep the full edge package tied to the current metric/comparator boundary: `{metric_anchor}`."
+            )
+        if current_mechanism:
+            guidance.append(
+                f"- Keep the full edge package tied to the current target-domain process wording: `{current_mechanism}`."
+            )
+        if lever_anchor:
+            guidance.append(
+                f"- Preserve any grounded lever wording already present and make the cheap test and `edge_if_right` inherit that same move: `{lever_anchor}`."
+            )
+        if cheap_test_setup_anchor:
+            guidance.append(
+                f"- Preserve any grounded cheap-test move already present and make the lever and `edge_if_right` describe that same move directly: `{cheap_test_setup_anchor}`."
+            )
+        guidance.append(
+            "- If the current payload and evidence cannot support the full edge package as one coherent operator-metric story, prefer `{\"no_connection\": true}` over generic edge filler or malformed partial JSON."
         )
     if {"test.confirm", "test.falsify"}.issubset(missing_field_set):
         guidance.append(
@@ -3788,7 +3828,7 @@ def _repair_guidance_for_missing_fields(
         )
     if "edge_analysis.actionable_lever" in missing_fields:
         guidance.append(
-            "- Rewrite `edge_analysis.actionable_lever` so it names one concrete operator action, filter, intervention, design choice, or decision rule that reuses the current mechanism, metric, or operator context. Reject advisory phrasing like `investigate further`, `study this`, or `consider this`."
+            "- Rewrite `edge_analysis.actionable_lever` so it names exactly one concrete operator move, setting change, filter, routing rule, threshold adjustment, replay, audit, workflow intervention, design choice, or decision rule that reuses the current mechanism, metric, or operator context. Reject vague filler like `investigate further`, `optimize process`, `improve monitoring`, `apply insights`, `study this`, or `consider this`."
         )
     if "edge_analysis.cheap_test" in missing_fields:
         if missing_field_set == {"edge_analysis.cheap_test"}:
@@ -3799,7 +3839,7 @@ def _repair_guidance_for_missing_fields(
                 "- If only this field is missing, prefer returning only `{\"edge_analysis\": {\"cheap_test\": {\"setup\": ..., \"metric\": ..., \"confirm\": ..., \"falsify\": ..., \"time_to_signal\": ...}}}` instead of rewriting the full candidate."
             )
         guidance.append(
-            "- Rewrite `edge_analysis.cheap_test` so it includes `setup`, `metric`, `confirm`, `falsify`, and optional `time_to_signal`. `setup` must name one cheap operator move on a narrow slice of the workflow, not a generic validation suggestion and not a restatement of the main test."
+            "- Rewrite `edge_analysis.cheap_test` so it includes `setup`, `metric`, `confirm`, `falsify`, and `time_to_signal`. It must be one cheap operator-facing check on an existing workflow slice, and `setup` must name one cheap operator move on a narrow slice of the workflow, not a generic validation suggestion and not a restatement of the main test."
         )
         guidance.append(
             "- Make `setup` one concrete operator move, replay, simulation, filter, audit, or measurement path inside the current operator workflow. Do not turn the repair into a generic validation study, broader research program, or different workflow."
@@ -3891,7 +3931,7 @@ def _repair_guidance_for_missing_fields(
             "- Rewrite `edge_analysis.edge_if_right` so it states one concrete operator gain such as lower collision rate, earlier warning, lower cost, higher throughput, or reduced false positives. Reject generic usefulness language and name the decision or workflow advantage unlocked if the cheap test confirms."
         )
         guidance.append(
-            "- Write exactly one operator, one decision change unlocked by confirmation, and one concrete measurable or workflow advantage if confirmed. State what the operator will do differently if the cheap test confirms. Do not add a new stakeholder, KPI, roadmap claim, or strategic narrative."
+            "- Write exactly one operator, one decision change unlocked by confirmation, and one concrete measurable or workflow advantage if confirmed. Explicitly say who acts, what they do differently, and what concrete advantage they gain if the cheap test confirms. Do not add a new stakeholder, KPI, roadmap claim, or strategic narrative."
         )
         guidance.append(
             "- Keep the same operator, the same decision unlocked by the cheap test, and the same measured advantage family already implied by the current metric/comparator. Do not introduce a new benefit axis, stakeholder, or unrelated KPI."
@@ -3912,6 +3952,10 @@ def _repair_guidance_for_missing_fields(
         if current_edge_confirm_anchor:
             guidance.append(
                 f"- Reuse the current cheap-test / confirm-side wording as closely as possible so the operator advantage stays on the same decision boundary: `{current_edge_confirm_anchor}`."
+            )
+        if cheap_test_setup_anchor:
+            guidance.append(
+                f"- Preserve the current cheap-test workflow move and make `edge_analysis.edge_if_right` describe what changes if that same move confirms: `{cheap_test_setup_anchor}`."
             )
         if confirm_anchor:
             guidance.append(
@@ -4073,13 +4117,16 @@ def _repair_guidance_for_missing_fields(
             "- Produce at least one specific `evidence_map.mechanism_assertions` entry using already grounded target-domain evidence from the current payload. Do not invent a new mechanism, broaden the target claim, or swap in a different process."
         )
         guidance.append(
-            "- Rewrite `evidence_map.mechanism_assertions` so at least one entry uses a direct target-domain snippet that explicitly names the same process noun phrase as `mechanism` or the same canonical metric as `test.metric`."
+            "- Rewrite `evidence_map.mechanism_assertions` so at least one concise entry uses a direct target-domain snippet that explicitly names the same process noun phrase as `mechanism` or the same canonical metric as `test.metric`."
         )
         guidance.append(
-            "- Do not let `mechanism_claim` carry stronger process wording than the `evidence_snippet` itself. Prefer direct process or metric support over broad contextual target evidence."
+            "- Keep each `mechanism_claim` concise and tied to the same target-domain process. Do not let `mechanism_claim` carry stronger process wording than the `evidence_snippet` itself. Prefer direct process or metric support over broad contextual target evidence."
         )
         guidance.append(
             "- Prefer filling one missing mechanism-assertion entry from the strongest current target-domain snippet already in the payload. Reuse exact or near-exact target-domain wording where available instead of rewriting the whole evidence map."
+        )
+        guidance.append(
+            "- Do not use broad literature-summary assertions, background context, or adjacent field framing as `evidence_map.mechanism_assertions`."
         )
         if current_mechanism:
             guidance.append(
@@ -4104,6 +4151,9 @@ def _repair_guidance_for_missing_fields(
             guidance.append(
                 "- Use that strongest current target snippet as the default `evidence_snippet` anchor for at least one repaired mechanism assertion entry unless another existing snippet in the payload is even more direct."
             )
+        guidance.append(
+            "- If the current payload and evidence cannot directly support the named mechanism with a concise same-process assertion, prefer `{\"no_connection\": true}` over vague mechanism-summary filler."
+        )
         core_reasons = [
             str(reason).strip()
             for reason in (repair_context.get("core_target_reasons") or [])
