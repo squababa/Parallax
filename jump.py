@@ -5108,11 +5108,12 @@ def _stage_one_detect_with_diagnostics(
     solution_evidence = str(data.get("solution_evidence", "")).strip()
     if not target_domain or not signal or not evidence:
         return None, "invalid_payload"
-    if not solution_evidence:
-        return None, "missing_solution_evidence"
     data["target_domain"] = target_domain
     data["signal"] = signal
     data["evidence"] = evidence
+    if not solution_evidence:
+        data.pop("solution_evidence", None)
+        return data, "missing_solution_evidence"
     data["solution_evidence"] = solution_evidence
     return data, None
 
@@ -5127,7 +5128,45 @@ def _stage_one_detect(
         abstract_structure=abstract_structure,
         search_results=search_results,
     )
+    if _failure_hint is not None:
+        return None
     return data
+
+
+def _is_stage_one_weak_signal(stage_one: dict | None, failure_hint: str | None) -> bool:
+    if failure_hint != "missing_solution_evidence" or not isinstance(stage_one, dict):
+        return False
+    return all(
+        str(stage_one.get(field, "") or "").strip()
+        for field in ("target_domain", "signal", "evidence")
+    )
+
+
+def _classify_stage_one_outcome(
+    stage_one: dict | None,
+    failure_hint: str | None,
+) -> str:
+    if _is_stage_one_weak_signal(stage_one, failure_hint):
+        return "weak_signal"
+    if isinstance(stage_one, dict) and failure_hint is None:
+        return "detect_signal"
+    if failure_hint == "no_connection":
+        return "detect_no_signal"
+    return "no_results"
+
+
+def _build_stage_one_soft_gate_query(
+    built_jump_query: str,
+    target_domain: str,
+) -> str:
+    return re.sub(
+        r"\s+",
+        " ",
+        (
+            f"{str(built_jump_query or '').strip()} "
+            f"{str(target_domain or '').strip()} workaround mitigation intervention control"
+        ),
+    ).strip()
 
 
 def _short_stage_two_failure_hint(payload: object) -> str | None:
@@ -5447,6 +5486,375 @@ def _stage_two_hypothesize(
     return data
 
 
+def _build_jump_search_content(
+    merged_results: list[dict],
+    blocked_cluster_tokens: set[str],
+    strong_anchor_tokens: set[str],
+) -> tuple[str, list[dict], list[str], list[dict], bool]:
+    def _excerpt_rank(text: str, labels: list[str]) -> tuple[int, int, int, int, int]:
+        tokens = _tokenize_query_terms(text)
+        return (
+            _jump_solution_marker_count(text),
+            len(set(tokens)),
+            len(tokens),
+            len(text),
+            1 if "solution-biased" in labels else 0,
+        )
+
+    def _clustered_result_rank(
+        result: dict,
+    ) -> tuple[int, int, int, int, int, int, int, int, int, int, int]:
+        clean = str(result.get("clean", "") or "").strip()
+        query_labels = [
+            str(label).strip()
+            for label in (result.get("query_labels") or [])
+            if str(label).strip()
+        ]
+        title_signature = tuple(result.get("title_signature") or ())
+        excerpt_rank = _excerpt_rank(clean, query_labels)
+        intervention_evidence = bool(result.get("intervention_evidence"))
+        triage_class = str(result.get("triage_class") or "keep").strip() or "keep"
+        return (
+            1 if triage_class == "keep" else 0,
+            int(result.get("anchor_overlap") or 0),
+            1 if result.get("preferred_phrase_match") else 0,
+            1 if intervention_evidence else 0,
+            int(result.get("intervention_marker_count") or 0)
+            if intervention_evidence
+            else 0,
+            1 if "solution-biased" in query_labels else 0,
+            int(result.get("solution_marker_count") or excerpt_rank[0]),
+            len(title_signature),
+            excerpt_rank[1],
+            excerpt_rank[2],
+            excerpt_rank[3],
+        )
+
+    def _stage_one_mechanism_evidence_rank(
+        result: dict,
+    ) -> tuple[int, int, int, int, int, int, int]:
+        clean = str(result.get("clean", "") or "").strip()
+        title_text = str(result.get("title_text", "") or "").strip()
+        query_labels = [
+            str(label).strip()
+            for label in (result.get("query_labels") or [])
+            if str(label).strip()
+        ]
+        token_set = set(_tokenize_query_terms(f"{title_text} {clean}"))
+        mechanism_token_count = len(token_set.intersection(MECHANISM_QUERY_TOKENS))
+        anchor_token_count = len(token_set.intersection(strong_anchor_tokens))
+        excerpt_rank = _excerpt_rank(clean, query_labels)
+        triage_class = str(result.get("triage_class") or "keep").strip() or "keep"
+        return (
+            1 if triage_class == "keep" else 0,
+            1 if result.get("preferred_phrase_match") else 0,
+            int(result.get("anchor_overlap") or 0),
+            anchor_token_count + mechanism_token_count,
+            excerpt_rank[0],
+            excerpt_rank[1],
+            excerpt_rank[2],
+        )
+
+    def _stage_one_intervention_evidence_rank(
+        result: dict,
+    ) -> tuple[int, int, int, int, int, int, int]:
+        clean = str(result.get("clean", "") or "").strip()
+        query_labels = [
+            str(label).strip()
+            for label in (result.get("query_labels") or [])
+            if str(label).strip()
+        ]
+        excerpt_rank = _excerpt_rank(clean, query_labels)
+        return (
+            1 if result.get("intervention_evidence") else 0,
+            int(result.get("intervention_marker_count") or 0),
+            int(result.get("solution_marker_count") or 0),
+            1 if "solution-biased" in query_labels else 0,
+            int(result.get("anchor_overlap") or 0),
+            1 if result.get("preferred_phrase_match") else 0,
+            excerpt_rank[1],
+        )
+
+    def _stage_one_packet_result_key(result: dict) -> str:
+        return (
+            str(result.get("url", "") or "").strip().lower()
+            or str(result.get("title_text", "") or "").strip().lower()
+            or str(result.get("clean", "") or "").strip().lower()
+        )
+
+    def _select_stage_one_evidence_highlights(
+        cluster_results: list[dict],
+    ) -> list[dict[str, object]]:
+        highlight_order: list[str] = []
+        highlights_by_key: dict[str, dict[str, object]] = {}
+
+        def _pick_highlight(label: str, predicate, ranker) -> None:
+            candidates = [result for result in cluster_results if predicate(result)]
+            if not candidates:
+                return
+            best_result = max(candidates, key=ranker)
+            key = _stage_one_packet_result_key(best_result)
+            existing = highlights_by_key.get(key)
+            if existing is None:
+                highlight_order.append(key)
+                highlights_by_key[key] = {
+                    "result": best_result,
+                    "labels": [label],
+                }
+                return
+            labels = existing.setdefault("labels", [])
+            if label not in labels:
+                labels.append(label)
+
+        _pick_highlight(
+            "Mechanism evidence",
+            lambda result: (
+                bool(result.get("preferred_phrase_match"))
+                or int(result.get("anchor_overlap") or 0) >= 2
+                or _stage_one_mechanism_evidence_rank(result)[3] >= 3
+            ),
+            _stage_one_mechanism_evidence_rank,
+        )
+        _pick_highlight(
+            "Intervention/workaround evidence",
+            lambda result: (
+                bool(result.get("intervention_evidence"))
+                or int(result.get("solution_marker_count") or 0) > 0
+            ),
+            _stage_one_intervention_evidence_rank,
+        )
+        _pick_highlight(
+            "Operator response evidence",
+            lambda result: (
+                bool(str(result.get("intervention_signal", "") or "").strip())
+                or bool(result.get("intervention_evidence"))
+                or int(result.get("solution_marker_count") or 0) > 0
+            ),
+            lambda result: (
+                1 if str(result.get("intervention_signal", "") or "").strip() else 0,
+                *_stage_one_intervention_evidence_rank(result),
+            ),
+        )
+        return [highlights_by_key[key] for key in highlight_order]
+
+    clustered_results: list[dict] = []
+    for merged_result in merged_results:
+        title_signature = _build_jump_title_signature(
+            str(merged_result.get("title_text", "") or ""),
+            blocked_cluster_tokens,
+        )
+        normalized_host = _normalize_jump_result_host(str(merged_result.get("url", "") or ""))
+        result_entry = {
+            **merged_result,
+            "title_signature": title_signature,
+            "normalized_host": normalized_host,
+        }
+        matching_cluster: dict | None = None
+        if title_signature:
+            signature_set = set(title_signature)
+            for cluster in clustered_results:
+                cluster_signature = tuple(cluster.get("title_signature") or ())
+                if cluster_signature and cluster_signature == title_signature:
+                    matching_cluster = cluster
+                    break
+            if matching_cluster is None and normalized_host:
+                for cluster in clustered_results:
+                    cluster_signature = tuple(cluster.get("title_signature") or ())
+                    if (
+                        not cluster_signature
+                        or str(cluster.get("normalized_host", "") or "") != normalized_host
+                        or len(signature_set.intersection(cluster_signature)) < 2
+                    ):
+                        continue
+                    matching_cluster = cluster
+                    break
+        if matching_cluster is None:
+            clustered_results.append(
+                {
+                    "title_signature": title_signature,
+                    "normalized_host": normalized_host,
+                    "results": [result_entry],
+                }
+            )
+        else:
+            matching_cluster["results"].append(result_entry)
+
+    for cluster in clustered_results:
+        cluster_results = sorted(
+            cluster.get("results") or [],
+            key=_clustered_result_rank,
+            reverse=True,
+        )
+        cluster["results"] = cluster_results
+        cluster_signature = tuple(cluster.get("title_signature") or ())
+        best_result = cluster_results[0] if cluster_results else {}
+        cluster_hint = " ".join(cluster_signature).strip()
+        if not cluster_hint:
+            cluster_hint = str(best_result.get("title_text", "") or "").strip()
+        if not cluster_hint:
+            cluster_hint = str(cluster.get("normalized_host", "") or "").strip()
+        cluster["cluster_hint"] = cluster_hint or "singleton result"
+        marker_density = (
+            sum(
+                int(
+                    result.get("solution_marker_count")
+                    or _jump_solution_marker_count(str(result.get("clean", "") or ""))
+                )
+                for result in cluster_results
+            )
+            / max(len(cluster_results), 1)
+        )
+        anchor_overlap_total = sum(
+            int(result.get("anchor_overlap") or 0) for result in cluster_results
+        )
+        preferred_phrase_matches = sum(
+            1 for result in cluster_results if result.get("preferred_phrase_match")
+        )
+        keep_hits = sum(
+            1
+            for result in cluster_results
+            if str(result.get("triage_class") or "keep").strip() == "keep"
+        )
+        intervention_hits = sum(
+            1 for result in cluster_results if result.get("intervention_evidence")
+        )
+        intervention_score = sum(
+            int(result.get("intervention_marker_count") or 0)
+            for result in cluster_results
+            if result.get("intervention_evidence")
+        ) + intervention_hits * 2
+        cluster_intervention_signal = next(
+            (
+                str(result.get("intervention_signal") or "").strip()
+                for result in cluster_results
+                if result.get("intervention_evidence")
+                and str(result.get("intervention_signal") or "").strip()
+            ),
+            "",
+        )
+        cluster["intervention_score"] = intervention_score
+        cluster["intervention_signal"] = cluster_intervention_signal
+        best_result_rank = (
+            _clustered_result_rank(best_result)
+            if cluster_results
+            else (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        )
+        cluster["rank"] = (
+            len(cluster_results),
+            keep_hits,
+            intervention_hits,
+            intervention_score,
+            anchor_overlap_total,
+            preferred_phrase_matches,
+            1
+            if any(
+                "solution-biased" in (result.get("query_labels") or [])
+                for result in cluster_results
+            )
+            else 0,
+            marker_density,
+            best_result_rank[4],
+            best_result_rank[5],
+            best_result_rank[6],
+            len(cluster_signature),
+        )
+
+    clustered_results.sort(
+        key=lambda cluster: cluster.get("rank")
+        or (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+        reverse=True,
+    )
+
+    search_content: list[str] = []
+    raw_target_candidates: list[dict] = []
+    top_titles: list[str] = []
+    enriched_packet = False
+
+    for cluster_index, cluster in enumerate(clustered_results, start=1):
+        cluster_hint = str(cluster.get("cluster_hint", "") or "").strip() or "Unknown"
+        cluster_results = list(cluster.get("results") or [])
+        search_content.append(f"Candidate cluster {cluster_index}:")
+        search_content.append(f"Cluster hint: {cluster_hint}")
+        search_content.append(f"Supporting results: {len(cluster_results)}")
+        if str(cluster.get("intervention_signal", "") or "").strip():
+            search_content.append(
+                f"Intervention signal: {str(cluster.get('intervention_signal') or '').strip()}"
+            )
+        elif int(cluster.get("intervention_score") or 0) > 0:
+            search_content.append("Intervention evidence: yes")
+        highlighted_result_keys: set[str] = set()
+        highlights = _select_stage_one_evidence_highlights(cluster_results)
+        if highlights:
+            enriched_packet = True
+        for highlight in highlights:
+            highlighted_result = dict(highlight.get("result") or {})
+            title_text = str(highlighted_result.get("title_text", "") or "").strip()
+            clean = str(highlighted_result.get("clean", "") or "").strip()
+            url = str(highlighted_result.get("url", "") or "").strip()
+            query_label_text = ", ".join(
+                str(label).strip()
+                for label in (highlighted_result.get("query_labels") or [])
+                if str(label).strip()
+            )
+            label_texts = [
+                str(label).strip()
+                for label in (highlight.get("labels") or [])
+                if str(label).strip()
+            ]
+            highlighted_result_keys.add(_stage_one_packet_result_key(highlighted_result))
+            for label_text in label_texts:
+                search_content.append(f"{label_text}:")
+            if query_label_text:
+                search_content.append(f"Retrieved via: {query_label_text}")
+            search_content.append(f"Title: {title_text or 'Unknown'}")
+            if url:
+                search_content.append(f"URL: {url}")
+            search_content.append(f"Snippet: {clean}")
+        fallback_results: list[dict] = []
+        for merged_result in cluster_results:
+            title_text = str(merged_result.get("title_text", "") or "").strip()
+            clean = str(merged_result.get("clean", "") or "").strip()
+            url = str(merged_result.get("url", "") or "").strip()
+            source_reference = url or title_text
+            raw_target_candidates.append(
+                {
+                    "target_excerpt": clean[:500],
+                    "target_url": source_reference or None,
+                    "evaluation_source_reference": " ".join(
+                        part for part in (title_text, url) if part
+                    )
+                    or source_reference
+                    or None,
+                }
+            )
+            if title_text and title_text not in top_titles and len(top_titles) < 3:
+                top_titles.append(title_text)
+            if _stage_one_packet_result_key(merged_result) not in highlighted_result_keys:
+                fallback_results.append(merged_result)
+        for result_index, merged_result in enumerate(fallback_results[:2], start=1):
+            title_text = str(merged_result.get("title_text", "") or "").strip()
+            clean = str(merged_result.get("clean", "") or "").strip()
+            url = str(merged_result.get("url", "") or "").strip()
+            if result_index <= 2:
+                search_content.append(f"Search result {result_index}:")
+                search_content.append(
+                    f"Retrieved via: {', '.join(merged_result.get('query_labels', []))}"
+                )
+                search_content.append(f"Title: {title_text or 'Unknown'}")
+                if url:
+                    search_content.append(f"URL: {url}")
+                search_content.append(f"Snippet: {clean}")
+        search_content.append("")
+
+    return (
+        "\n".join(search_content),
+        raw_target_candidates,
+        top_titles,
+        clustered_results,
+        enriched_packet,
+    )
+
+
 def lateral_jump_with_diagnostics(
     pattern: dict,
     source_domain: str,
@@ -5483,6 +5891,8 @@ def lateral_jump_with_diagnostics(
         "stage1_outcome": None,
         "stage1_target_domain": None,
         "stage1_failure_hint": None,
+        "stage1_soft_gate_attempted": False,
+        "stage1_soft_gate_recovered": False,
         "stage2_outcome": None,
         "stage2_target_domain": None,
         "stage2_failure_hint": None,
@@ -5506,11 +5916,8 @@ def lateral_jump_with_diagnostics(
         diagnostic["stage1_failure_hint"] = "empty_jump_query"
         return None, diagnostic
 
-    search_content = []
     source_lower = source_domain.lower()
     category_lower = source_category.lower()
-    raw_target_candidates: list[dict] = []
-    top_titles: list[str] = []
     merged_results: list[dict] = []
     merged_result_index: dict[str, int] = {}
     query_labels = ("base", "solution-biased")
@@ -5718,274 +6125,13 @@ def lateral_jump_with_diagnostics(
         diagnostic["stage1_failure_hint"] = "search_error"
         return None, diagnostic
 
-    def _clustered_result_rank(result: dict) -> tuple[int, int, int, int, int, int, int, int, int, int, int]:
-        clean = str(result.get("clean", "") or "").strip()
-        query_labels = [
-            str(label).strip()
-            for label in (result.get("query_labels") or [])
-            if str(label).strip()
-        ]
-        title_signature = tuple(result.get("title_signature") or ())
-        excerpt_rank = _excerpt_rank(clean, query_labels)
-        intervention_evidence = bool(result.get("intervention_evidence"))
-        triage_class = str(result.get("triage_class") or "keep").strip() or "keep"
-        return (
-            1 if triage_class == "keep" else 0,
-            int(result.get("anchor_overlap") or 0),
-            1 if result.get("preferred_phrase_match") else 0,
-            1 if intervention_evidence else 0,
-            int(result.get("intervention_marker_count") or 0) if intervention_evidence else 0,
-            1 if "solution-biased" in query_labels else 0,
-            int(result.get("solution_marker_count") or excerpt_rank[0]),
-            len(title_signature),
-            excerpt_rank[1],
-            excerpt_rank[2],
-            excerpt_rank[3],
+    combined, raw_target_candidates, top_titles, clustered_results, enriched_packet = (
+        _build_jump_search_content(
+            merged_results,
+            blocked_cluster_tokens,
+            strong_anchor_tokens,
         )
-
-    def _stage_one_mechanism_evidence_rank(result: dict) -> tuple[int, int, int, int, int, int, int]:
-        clean = str(result.get("clean", "") or "").strip()
-        title_text = str(result.get("title_text", "") or "").strip()
-        query_labels = [
-            str(label).strip()
-            for label in (result.get("query_labels") or [])
-            if str(label).strip()
-        ]
-        token_set = set(_tokenize_query_terms(f"{title_text} {clean}"))
-        mechanism_token_count = len(token_set.intersection(MECHANISM_QUERY_TOKENS))
-        anchor_token_count = len(token_set.intersection(strong_anchor_tokens))
-        excerpt_rank = _excerpt_rank(clean, query_labels)
-        triage_class = str(result.get("triage_class") or "keep").strip() or "keep"
-        return (
-            1 if triage_class == "keep" else 0,
-            1 if result.get("preferred_phrase_match") else 0,
-            int(result.get("anchor_overlap") or 0),
-            anchor_token_count + mechanism_token_count,
-            excerpt_rank[0],
-            excerpt_rank[1],
-            excerpt_rank[2],
-        )
-
-    def _stage_one_intervention_evidence_rank(result: dict) -> tuple[int, int, int, int, int, int, int]:
-        clean = str(result.get("clean", "") or "").strip()
-        query_labels = [
-            str(label).strip()
-            for label in (result.get("query_labels") or [])
-            if str(label).strip()
-        ]
-        excerpt_rank = _excerpt_rank(clean, query_labels)
-        return (
-            1 if result.get("intervention_evidence") else 0,
-            int(result.get("intervention_marker_count") or 0),
-            int(result.get("solution_marker_count") or 0),
-            1 if "solution-biased" in query_labels else 0,
-            int(result.get("anchor_overlap") or 0),
-            1 if result.get("preferred_phrase_match") else 0,
-            excerpt_rank[1],
-        )
-
-    def _stage_one_packet_result_key(result: dict) -> str:
-        return (
-            str(result.get("url", "") or "").strip().lower()
-            or str(result.get("title_text", "") or "").strip().lower()
-            or str(result.get("clean", "") or "").strip().lower()
-        )
-
-    def _select_stage_one_evidence_highlights(cluster_results: list[dict]) -> list[dict[str, object]]:
-        highlight_order: list[str] = []
-        highlights_by_key: dict[str, dict[str, object]] = {}
-
-        def _pick_highlight(
-            label: str,
-            predicate,
-            ranker,
-        ) -> None:
-            candidates = [result for result in cluster_results if predicate(result)]
-            if not candidates:
-                return
-            best_result = max(candidates, key=ranker)
-            key = _stage_one_packet_result_key(best_result)
-            existing = highlights_by_key.get(key)
-            if existing is None:
-                highlight_order.append(key)
-                highlights_by_key[key] = {
-                    "result": best_result,
-                    "labels": [label],
-                }
-                return
-            labels = existing.setdefault("labels", [])
-            if label not in labels:
-                labels.append(label)
-
-        _pick_highlight(
-            "Mechanism evidence",
-            lambda result: (
-                bool(result.get("preferred_phrase_match"))
-                or int(result.get("anchor_overlap") or 0) >= 2
-                or _stage_one_mechanism_evidence_rank(result)[3] >= 3
-            ),
-            _stage_one_mechanism_evidence_rank,
-        )
-        _pick_highlight(
-            "Intervention/workaround evidence",
-            lambda result: (
-                bool(result.get("intervention_evidence"))
-                or int(result.get("solution_marker_count") or 0) > 0
-            ),
-            _stage_one_intervention_evidence_rank,
-        )
-        _pick_highlight(
-            "Operator response evidence",
-            lambda result: (
-                bool(str(result.get("intervention_signal", "") or "").strip())
-                or bool(result.get("intervention_evidence"))
-                or int(result.get("solution_marker_count") or 0) > 0
-            ),
-            lambda result: (
-                1 if str(result.get("intervention_signal", "") or "").strip() else 0,
-                *_stage_one_intervention_evidence_rank(result),
-            ),
-        )
-        return [highlights_by_key[key] for key in highlight_order]
-
-    def _cluster_merged_results() -> list[dict]:
-        clustered_results: list[dict] = []
-        for merged_result in merged_results:
-            title_signature = _build_jump_title_signature(
-                str(merged_result.get("title_text", "") or ""),
-                blocked_cluster_tokens,
-            )
-            normalized_host = _normalize_jump_result_host(str(merged_result.get("url", "") or ""))
-            result_entry = {
-                **merged_result,
-                "title_signature": title_signature,
-                "normalized_host": normalized_host,
-            }
-            matching_cluster: dict | None = None
-            if title_signature:
-                signature_set = set(title_signature)
-                for cluster in clustered_results:
-                    cluster_signature = tuple(cluster.get("title_signature") or ())
-                    if cluster_signature and cluster_signature == title_signature:
-                        matching_cluster = cluster
-                        break
-                if matching_cluster is None and normalized_host:
-                    for cluster in clustered_results:
-                        cluster_signature = tuple(cluster.get("title_signature") or ())
-                        if (
-                            not cluster_signature
-                            or str(cluster.get("normalized_host", "") or "") != normalized_host
-                            or len(signature_set.intersection(cluster_signature)) < 2
-                        ):
-                            continue
-                        matching_cluster = cluster
-                        break
-            if matching_cluster is None:
-                clustered_results.append(
-                    {
-                        "title_signature": title_signature,
-                        "normalized_host": normalized_host,
-                        "results": [result_entry],
-                    }
-                )
-            else:
-                matching_cluster["results"].append(result_entry)
-
-        for cluster in clustered_results:
-            cluster_results = sorted(
-                cluster.get("results") or [],
-                key=_clustered_result_rank,
-                reverse=True,
-            )
-            cluster["results"] = cluster_results
-            cluster_signature = tuple(cluster.get("title_signature") or ())
-            best_result = cluster_results[0] if cluster_results else {}
-            cluster_hint = " ".join(cluster_signature).strip()
-            if not cluster_hint:
-                cluster_hint = str(best_result.get("title_text", "") or "").strip()
-            if not cluster_hint:
-                cluster_hint = str(cluster.get("normalized_host", "") or "").strip()
-            cluster["cluster_hint"] = cluster_hint or "singleton result"
-            marker_density = (
-                sum(
-                    int(
-                        result.get("solution_marker_count")
-                        or _jump_solution_marker_count(str(result.get("clean", "") or ""))
-                    )
-                    for result in cluster_results
-                )
-                / max(len(cluster_results), 1)
-            )
-            anchor_overlap_total = sum(
-                int(result.get("anchor_overlap") or 0) for result in cluster_results
-            )
-            preferred_phrase_matches = sum(
-                1 for result in cluster_results if result.get("preferred_phrase_match")
-            )
-            keep_hits = sum(
-                1
-                for result in cluster_results
-                if str(result.get("triage_class") or "keep").strip() == "keep"
-            )
-            intervention_hits = sum(
-                1 for result in cluster_results if result.get("intervention_evidence")
-            )
-            intervention_score = sum(
-                int(result.get("intervention_marker_count") or 0)
-                for result in cluster_results
-                if result.get("intervention_evidence")
-            ) + intervention_hits * 2
-            cluster_intervention_signal = next(
-                (
-                    str(result.get("intervention_signal") or "").strip()
-                    for result in cluster_results
-                    if result.get("intervention_evidence")
-                    and str(result.get("intervention_signal") or "").strip()
-                ),
-                "",
-            )
-            cluster["intervention_score"] = intervention_score
-            cluster["intervention_signal"] = cluster_intervention_signal
-            best_result_rank = _clustered_result_rank(best_result) if cluster_results else (
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-            )
-            cluster["rank"] = (
-                len(cluster_results),
-                keep_hits,
-                intervention_hits,
-                intervention_score,
-                anchor_overlap_total,
-                preferred_phrase_matches,
-                1
-                if any(
-                    "solution-biased" in (result.get("query_labels") or [])
-                    for result in cluster_results
-                )
-                else 0,
-                marker_density,
-                best_result_rank[4],
-                best_result_rank[5],
-                best_result_rank[6],
-                len(cluster_signature),
-            )
-
-        clustered_results.sort(
-            key=lambda cluster: cluster.get("rank") or (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
-            reverse=True,
-        )
-        return clustered_results
-
-    clustered_results = _cluster_merged_results()
+    )
     if _should_attempt_alternate_jump_retrieval(merged_results, clustered_results):
         alternate_query = _build_alternate_jump_search_query(
             pattern,
@@ -6012,7 +6158,13 @@ def lateral_jump_with_diagnostics(
                 raw_alternate_results = []
             diagnostic["alternate_result_count"] = len(raw_alternate_results)
             _merge_search_results(raw_alternate_results, "alternate")
-            clustered_results = _cluster_merged_results()
+            combined, raw_target_candidates, top_titles, clustered_results, enriched_packet = (
+                _build_jump_search_content(
+                    merged_results,
+                    blocked_cluster_tokens,
+                    strong_anchor_tokens,
+                )
+            )
 
     diagnostic["intervention_promoted_result_count"] = sum(
         1 for result in merged_results if result.get("intervention_evidence")
@@ -6023,7 +6175,6 @@ def lateral_jump_with_diagnostics(
     diagnostic["adjacent_result_count"] = adjacent_result_count
     diagnostic["adjacent_retained_result_count"] = adjacent_result_count
     diagnostic["retained_adjacent_result_count"] = adjacent_result_count
-
     diagnostic["result_count"] = len(merged_results)
     diagnostic["cluster_count"] = len(clustered_results)
     diagnostic["top_cluster_hints"] = [
@@ -6035,88 +6186,9 @@ def lateral_jump_with_diagnostics(
         int(cluster.get("intervention_score") or 0)
         for cluster in clustered_results[:3]
     ]
-
-    enriched_packet = False
-    for cluster_index, cluster in enumerate(clustered_results, start=1):
-        cluster_hint = str(cluster.get("cluster_hint", "") or "").strip() or "Unknown"
-        cluster_results = list(cluster.get("results") or [])
-        search_content.append(f"Candidate cluster {cluster_index}:")
-        search_content.append(f"Cluster hint: {cluster_hint}")
-        search_content.append(f"Supporting results: {len(cluster_results)}")
-        if str(cluster.get("intervention_signal", "") or "").strip():
-            search_content.append(
-                f"Intervention signal: {str(cluster.get('intervention_signal') or '').strip()}"
-            )
-        elif int(cluster.get("intervention_score") or 0) > 0:
-            search_content.append("Intervention evidence: yes")
-        highlighted_result_keys: set[str] = set()
-        highlights = _select_stage_one_evidence_highlights(cluster_results)
-        if highlights:
-            enriched_packet = True
-        for highlight in highlights:
-            highlighted_result = dict(highlight.get("result") or {})
-            title_text = str(highlighted_result.get("title_text", "") or "").strip()
-            clean = str(highlighted_result.get("clean", "") or "").strip()
-            url = str(highlighted_result.get("url", "") or "").strip()
-            query_label_text = ", ".join(
-                str(label).strip()
-                for label in (highlighted_result.get("query_labels") or [])
-                if str(label).strip()
-            )
-            label_texts = [
-                str(label).strip()
-                for label in (highlight.get("labels") or [])
-                if str(label).strip()
-            ]
-            highlighted_result_keys.add(_stage_one_packet_result_key(highlighted_result))
-            for label_text in label_texts:
-                search_content.append(f"{label_text}:")
-            if query_label_text:
-                search_content.append(f"Retrieved via: {query_label_text}")
-            search_content.append(f"Title: {title_text or 'Unknown'}")
-            if url:
-                search_content.append(f"URL: {url}")
-            search_content.append(f"Snippet: {clean}")
-        fallback_results: list[dict] = []
-        for merged_result in cluster_results:
-            title_text = str(merged_result.get("title_text", "") or "").strip()
-            clean = str(merged_result.get("clean", "") or "").strip()
-            url = str(merged_result.get("url", "") or "").strip()
-            source_reference = url or title_text
-            raw_target_candidates.append(
-                {
-                    "target_excerpt": clean[:500],
-                    "target_url": source_reference or None,
-                    "evaluation_source_reference": " ".join(
-                        part for part in (title_text, url) if part
-                    )
-                    or source_reference
-                    or None,
-                }
-            )
-            if title_text and title_text not in top_titles and len(top_titles) < 3:
-                top_titles.append(title_text)
-            if _stage_one_packet_result_key(merged_result) not in highlighted_result_keys:
-                fallback_results.append(merged_result)
-        for result_index, merged_result in enumerate(fallback_results[:2], start=1):
-            title_text = str(merged_result.get("title_text", "") or "").strip()
-            clean = str(merged_result.get("clean", "") or "").strip()
-            url = str(merged_result.get("url", "") or "").strip()
-            if result_index <= 2:
-                search_content.append(f"Search result {result_index}:")
-                search_content.append(
-                    f"Retrieved via: {', '.join(merged_result.get('query_labels', []))}"
-                )
-                search_content.append(f"Title: {title_text or 'Unknown'}")
-                if url:
-                    search_content.append(f"URL: {url}")
-                search_content.append(f"Snippet: {clean}")
-        search_content.append("")
-
     diagnostic["top_result_titles"] = top_titles
     diagnostic["enriched_packet"] = enriched_packet
 
-    combined = "\n".join(search_content)
     if not combined.strip():
         diagnostic["stage1_outcome"] = "no_results"
         diagnostic["stage1_failure_hint"] = "no_usable_results"
@@ -6135,17 +6207,119 @@ def lateral_jump_with_diagnostics(
         abstract_structure=pattern.get("abstract_structure", ""),
         search_results=combined,
     )
-    if stage_one is None:
-        diagnostic["stage1_outcome"] = (
-            "detect_no_signal"
-            if stage_one_failure_hint in ("no_connection", "missing_solution_evidence")
-            else "no_results"
+    stage_one_outcome = _classify_stage_one_outcome(stage_one, stage_one_failure_hint)
+    initial_stage_one = stage_one
+    initial_stage_one_failure_hint = stage_one_failure_hint
+
+    if stage_one_outcome == "weak_signal":
+        diagnostic["stage1_soft_gate_attempted"] = True
+        recovery_query = _build_stage_one_soft_gate_query(
+            query,
+            str(stage_one.get("target_domain", "") or "").strip(),
         )
+        if recovery_query:
+            try:
+                recovery_results = _tavily.search(
+                    query=recovery_query,
+                    max_results=5,
+                    include_answer=False,
+                    search_depth="basic",
+                )
+                increment_tavily_calls(1)
+            except Exception as e:
+                print(
+                    f"  [!] Tavily soft-gate search failed for jump query '{recovery_query}': {e}"
+                )
+                recovery_results = {"results": []}
+            raw_recovery_results = recovery_results.get("results", [])
+            if not isinstance(raw_recovery_results, list):
+                raw_recovery_results = []
+            general_result_count += len(raw_recovery_results)
+            _merge_search_results(raw_recovery_results, "soft-gate")
+
+            try:
+                recovery_academic_results = _tavily.search(
+                    query=recovery_query,
+                    max_results=5,
+                    include_answer=False,
+                    search_depth="basic",
+                    include_domains=list(ACADEMIC_JUMP_INCLUDE_DOMAINS),
+                )
+                increment_tavily_calls(1)
+            except Exception as e:
+                print(
+                    "[!] Tavily academic soft-gate search failed for jump query "
+                    f"'{recovery_query}': {e}"
+                )
+                recovery_academic_results = {"results": []}
+            raw_recovery_academic_results = recovery_academic_results.get("results", [])
+            if not isinstance(raw_recovery_academic_results, list):
+                raw_recovery_academic_results = []
+            academic_result_count += len(raw_recovery_academic_results)
+            _merge_search_results(
+                raw_recovery_academic_results,
+                "soft-gate-academic",
+                include_domains=ACADEMIC_JUMP_INCLUDE_DOMAINS,
+            )
+
+        diagnostic["general_result_count"] = general_result_count
+        diagnostic["academic_result_count"] = academic_result_count
+        diagnostic["intervention_promoted_result_count"] = sum(
+            1 for result in merged_results if result.get("intervention_evidence")
+        )
+        combined, raw_target_candidates, top_titles, clustered_results, enriched_packet = _build_jump_search_content(
+            merged_results,
+            blocked_cluster_tokens,
+            strong_anchor_tokens,
+        )
+        diagnostic["result_count"] = len(merged_results)
+        diagnostic["cluster_count"] = len(clustered_results)
+        diagnostic["top_cluster_hints"] = [
+            str(cluster.get("cluster_hint", "") or "").strip()
+            for cluster in clustered_results[:3]
+            if str(cluster.get("cluster_hint", "") or "").strip()
+        ]
+        diagnostic["top_cluster_intervention_scores"] = [
+            int(cluster.get("intervention_score") or 0)
+            for cluster in clustered_results[:3]
+        ]
+        diagnostic["top_result_titles"] = top_titles
+        diagnostic["enriched_packet"] = enriched_packet
+        if isinstance(diagnostic.get("benchmark_snapshot"), dict):
+            diagnostic["benchmark_snapshot"]["search_results"] = combined
+
+        recovered_stage_one, recovered_stage_one_failure_hint = _stage_one_detect_with_diagnostics(
+            source_domain=source_domain,
+            abstract_structure=pattern.get("abstract_structure", ""),
+            search_results=combined,
+        )
+        recovered_stage_one_outcome = _classify_stage_one_outcome(
+            recovered_stage_one,
+            recovered_stage_one_failure_hint,
+        )
+        if recovered_stage_one_outcome == "detect_signal":
+            stage_one = recovered_stage_one
+            stage_one_failure_hint = None
+            stage_one_outcome = "detect_signal"
+            diagnostic["stage1_soft_gate_recovered"] = True
+        else:
+            stage_one = initial_stage_one
+            stage_one_failure_hint = initial_stage_one_failure_hint
+            stage_one_outcome = "weak_signal"
+
+    if stage_one_outcome != "detect_signal":
+        diagnostic["stage1_outcome"] = stage_one_outcome
+        diagnostic["stage1_target_domain"] = (
+            str(stage_one.get("target_domain", "") or "").strip()
+            if isinstance(stage_one, dict)
+            else None
+        ) or None
         diagnostic["stage1_failure_hint"] = stage_one_failure_hint
         return None, diagnostic
 
     diagnostic["stage1_outcome"] = "detect_signal"
     diagnostic["stage1_target_domain"] = str(stage_one.get("target_domain", "") or "").strip() or None
+    diagnostic["stage1_failure_hint"] = None
     if isinstance(diagnostic.get("benchmark_snapshot"), dict):
         diagnostic["benchmark_snapshot"]["stage_one_success"] = dict(stage_one)
 

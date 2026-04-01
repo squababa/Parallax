@@ -957,7 +957,7 @@ def test_stage_one_detect_requires_solution_evidence_field_on_positive_payload(
     )
 
 
-def test_stage_one_detect_rejects_problem_only_positive_payload_without_solution_evidence(
+def test_stage_one_detect_returns_partial_payload_without_solution_evidence(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
@@ -979,8 +979,12 @@ def test_stage_one_detect_rejects_problem_only_positive_payload_without_solution
         search_results="Retrieved via: base\nTitle: Target paper\nproblem description only",
     )
 
-    assert data is None
+    assert data is not None
     assert failure_hint == "missing_solution_evidence"
+    assert data["target_domain"] == "Safety Interlock Monitoring"
+    assert data["signal"] == "shared thresholded gating structure"
+    assert data["evidence"] == "diagnostic comparison reveals the same constraint"
+    assert "solution_evidence" not in data
 
 
 def test_dive_filters_weak_patterns_and_records_only_weak_diagnostics(
@@ -1574,7 +1578,7 @@ def test_lateral_jump_with_diagnostics_does_not_mislabel_stage1_generation_failu
     assert diagnostic["stage2_outcome"] is None
 
 
-def test_lateral_jump_with_diagnostics_treats_missing_solution_evidence_as_detect_no_signal(
+def test_lateral_jump_with_diagnostics_preserves_missing_solution_evidence_as_weak_signal(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
@@ -1614,9 +1618,207 @@ def test_lateral_jump_with_diagnostics_treats_missing_solution_evidence_as_detec
     )
 
     assert connection is None
-    assert diagnostic["stage1_outcome"] == "detect_no_signal"
+    assert diagnostic["stage1_outcome"] == "weak_signal"
+    assert diagnostic["stage1_target_domain"] == "Wireless Scheduling"
     assert diagnostic["stage1_failure_hint"] == "missing_solution_evidence"
+    assert diagnostic["stage1_soft_gate_attempted"] is True
+    assert diagnostic["stage1_soft_gate_recovered"] is False
     assert diagnostic["stage2_outcome"] is None
+
+
+def test_lateral_jump_with_diagnostics_runs_one_bounded_stage1_soft_gate_recovery_pass(
+    monkeypatch,
+) -> None:
+    seen_calls: list[tuple[str, tuple[str, ...] | None]] = []
+    stage_one_calls: list[str] = []
+
+    def fake_search(**kwargs):
+        query = kwargs["query"]
+        include_domains = tuple(kwargs.get("include_domains") or ())
+        seen_calls.append((query, include_domains or None))
+        return {
+            "results": [
+                {
+                    "title": "Wireless scheduling paper",
+                    "content": (
+                        "Queue threshold gating in wireless scheduling shows the same "
+                        "collision-control structure."
+                    ),
+                    "url": "https://target.test/wireless-scheduling",
+                }
+            ]
+        }
+
+    def fake_stage_one(**kwargs):
+        stage_one_calls.append(kwargs["search_results"])
+        return (
+            {
+                "target_domain": "Wireless Scheduling",
+                "signal": "shared structural signal",
+                "evidence": "specific evidence",
+            },
+            "missing_solution_evidence",
+        )
+
+    monkeypatch.setattr(jump._tavily, "search", fake_search)
+    monkeypatch.setattr(
+        jump,
+        "_build_jump_search_queries",
+        lambda *_args, **_kwargs: [
+            "queue threshold throttling latency",
+            "queue threshold throttling latency workaround",
+        ],
+    )
+    monkeypatch.setattr(
+        jump,
+        "_classify_weak_jump_result",
+        lambda *_args, **_kwargs: (
+            False,
+            {
+                "anchor_overlap": 2,
+                "preferred_phrase_match": True,
+                "solution_marker_count": 0,
+                "intervention_marker_count": 0,
+                "intervention_evidence": False,
+                "intervention_signal": "",
+            },
+        ),
+    )
+    monkeypatch.setattr(jump, "_stage_one_detect_with_diagnostics", fake_stage_one)
+    monkeypatch.setattr(
+        jump,
+        "_stage_two_hypothesize_with_diagnostics",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Stage 2 should not run for an unrecovered weak signal")
+        ),
+    )
+
+    connection, diagnostic = jump.lateral_jump_with_diagnostics(
+        {
+            "pattern_name": "Queue-threshold congestion gating",
+            "abstract_structure": "load compared against a queue threshold",
+            "search_query": "queue threshold throttling latency",
+        },
+        "Network Protocols",
+        "Technology",
+    )
+
+    recovery_query = (
+        "queue threshold throttling latency Wireless Scheduling "
+        "workaround mitigation intervention control"
+    )
+
+    assert connection is None
+    assert diagnostic["stage1_outcome"] == "weak_signal"
+    assert diagnostic["stage1_soft_gate_attempted"] is True
+    assert diagnostic["stage1_soft_gate_recovered"] is False
+    assert len(stage_one_calls) == 2
+    assert seen_calls == [
+        ("queue threshold throttling latency", None),
+        ("queue threshold throttling latency workaround", None),
+        ("queue threshold throttling latency", jump.ACADEMIC_JUMP_INCLUDE_DOMAINS),
+        (recovery_query, None),
+        (recovery_query, jump.ACADEMIC_JUMP_INCLUDE_DOMAINS),
+    ]
+
+
+def test_lateral_jump_with_diagnostics_upgrades_weak_signal_after_soft_gate_recovery(
+    monkeypatch,
+) -> None:
+    stage_one_calls: list[str] = []
+    stage_two_calls: list[dict] = []
+
+    monkeypatch.setattr(
+        jump._tavily,
+        "search",
+        lambda **_kwargs: {
+            "results": [
+                {
+                    "title": "Wireless scheduling paper",
+                    "content": (
+                        "Queue threshold gating in wireless scheduling reveals the same "
+                        "collision-control structure and one operator intervention."
+                    ),
+                    "url": "https://target.test/wireless-scheduling",
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        jump,
+        "_classify_weak_jump_result",
+        lambda *_args, **_kwargs: (
+            False,
+            {
+                "anchor_overlap": 2,
+                "preferred_phrase_match": True,
+                "solution_marker_count": 1,
+                "intervention_marker_count": 1,
+                "intervention_evidence": True,
+                "intervention_signal": "operator intervention present",
+            },
+        ),
+    )
+
+    def fake_stage_one(**kwargs):
+        stage_one_calls.append(kwargs["search_results"])
+        if len(stage_one_calls) == 1:
+            return (
+                {
+                    "target_domain": "Wireless Scheduling",
+                    "signal": "shared structural signal",
+                    "evidence": "specific evidence",
+                },
+                "missing_solution_evidence",
+            )
+        return (
+            {
+                "target_domain": "Wireless Scheduling",
+                "signal": "shared structural signal",
+                "evidence": "specific evidence",
+                "solution_evidence": "threshold gate lowers collision pressure",
+            },
+            None,
+        )
+
+    def fake_stage_two(**kwargs):
+        stage_two_calls.append(kwargs)
+        return (
+            _safety_interlock_jump_payload()
+            | {
+                "target_domain": "Wireless Scheduling",
+                "connection": "Specific connection",
+            },
+            None,
+            None,
+        )
+
+    monkeypatch.setattr(jump, "_stage_one_detect_with_diagnostics", fake_stage_one)
+    monkeypatch.setattr(jump, "_stage_two_hypothesize_with_diagnostics", fake_stage_two)
+
+    connection, diagnostic = jump.lateral_jump_with_diagnostics(
+        {
+            "pattern_name": "Queue-threshold congestion gating",
+            "abstract_structure": "load compared against a queue threshold",
+            "search_query": "queue threshold throttling latency",
+        },
+        "Network Protocols",
+        "Technology",
+    )
+
+    assert connection is not None
+    assert diagnostic["stage1_outcome"] == "detect_signal"
+    assert diagnostic["stage1_target_domain"] == "Wireless Scheduling"
+    assert diagnostic["stage1_failure_hint"] is None
+    assert diagnostic["stage1_soft_gate_attempted"] is True
+    assert diagnostic["stage1_soft_gate_recovered"] is True
+    assert diagnostic["stage2_outcome"] == "connection_found"
+    assert len(stage_one_calls) == 2
+    assert len(stage_two_calls) == 1
+    assert (
+        stage_two_calls[0]["stage_one"]["solution_evidence"]
+        == "threshold gate lowers collision pressure"
+    )
 
 
 def test_lateral_jump_with_diagnostics_records_stage2_no_connection(monkeypatch) -> None:
@@ -3724,6 +3926,112 @@ def test_jump_diagnostics_report_prints_repair_incomplete_fields(
     assert "incomplete_fields=mechanism, edge_analysis.actionable_lever" in output
 
 
+def test_jump_diagnostics_report_prints_soft_gate_status_for_weak_signal(
+    temp_db,
+    capsys,
+) -> None:
+    store.save_exploration(
+        seed_domain="Network Protocols",
+        seed_category="Technology",
+        pattern_diagnostics={
+            "summary": "patterns_ready: kept 1/1 patterns; jump_outcome=patterns_present_but_no_connection",
+            "jump_attempts": [
+                {
+                    "pattern_name": "Pattern Weak",
+                    "built_jump_query": "query weak",
+                    "result_count": 2,
+                    "top_result_titles": ["Target Weak"],
+                    "stage1_outcome": "weak_signal",
+                    "stage1_target_domain": "Wireless Scheduling",
+                    "stage1_failure_hint": "missing_solution_evidence",
+                    "stage1_soft_gate_attempted": True,
+                    "stage1_soft_gate_recovered": False,
+                    "stage2_outcome": None,
+                },
+            ],
+        },
+        transmitted=False,
+    )
+
+    main._print_jump_diagnostics(limit=5)
+    output = capsys.readouterr().out
+
+    assert (
+        "pattern=Pattern Weak | query=query weak | results=2 | "
+        "stage1=weak_signal | stage2=—"
+    ) in output
+    assert "soft_gate=attempted,not_recovered" in output
+
+
+def test_jump_diagnostics_report_prints_soft_gate_status_for_recovered_detect_signal(
+    temp_db,
+    capsys,
+) -> None:
+    store.save_exploration(
+        seed_domain="Network Protocols",
+        seed_category="Technology",
+        pattern_diagnostics={
+            "summary": "patterns_ready: kept 1/1 patterns; jump_outcome=patterns_present_but_no_connection",
+            "jump_attempts": [
+                {
+                    "pattern_name": "Pattern Recovered",
+                    "built_jump_query": "query recovered",
+                    "result_count": 3,
+                    "top_result_titles": ["Target Recovered"],
+                    "stage1_outcome": "detect_signal",
+                    "stage1_target_domain": "Wireless Scheduling",
+                    "stage1_soft_gate_attempted": True,
+                    "stage1_soft_gate_recovered": True,
+                    "stage2_outcome": "stage2_no_connection",
+                    "stage2_failure_hint": "returned_no_connection",
+                },
+            ],
+        },
+        transmitted=False,
+    )
+
+    main._print_jump_diagnostics(limit=5)
+    output = capsys.readouterr().out
+
+    assert (
+        "pattern=Pattern Recovered | query=query recovered | results=3 | "
+        "stage1=detect_signal | stage2=stage2_no_connection"
+    ) in output
+    assert "soft_gate=attempted,recovered" in output
+
+
+def test_jump_diagnostics_report_omits_soft_gate_line_for_ordinary_attempts(
+    temp_db,
+    capsys,
+) -> None:
+    store.save_exploration(
+        seed_domain="Network Protocols",
+        seed_category="Technology",
+        pattern_diagnostics={
+            "summary": "patterns_ready: kept 1/1 patterns; jump_outcome=patterns_present_but_no_connection",
+            "jump_attempts": [
+                {
+                    "pattern_name": "Pattern Ordinary",
+                    "built_jump_query": "query ordinary",
+                    "result_count": 2,
+                    "top_result_titles": ["Target Ordinary"],
+                    "stage1_outcome": "detect_signal",
+                    "stage1_target_domain": "Wireless Scheduling",
+                    "stage2_outcome": "stage2_no_connection",
+                    "stage2_failure_hint": "returned_no_connection",
+                },
+            ],
+        },
+        transmitted=False,
+    )
+
+    main._print_jump_diagnostics(limit=5)
+    output = capsys.readouterr().out
+
+    assert "pattern=Pattern Ordinary | query=query ordinary | results=2" in output
+    assert "soft_gate=" not in output
+
+
 def test_lateral_jump_with_diagnostics_records_benchmark_snapshot(monkeypatch) -> None:
     monkeypatch.setattr(
         jump._tavily,
@@ -4131,6 +4439,63 @@ def test_run_jump_benchmark_marks_jump_case_improved(tmp_path, capsys, monkeypat
     assert "IMPROVED\tjump_attempt\tjump-case-1" in output
     assert "replay_mode=full" in output
     assert "actual=detect_signal -> connection_found" in output
+
+
+def test_run_jump_benchmark_marks_jump_case_improved_to_weak_signal(
+    tmp_path,
+    capsys,
+    monkeypatch,
+) -> None:
+    benchmark_file = tmp_path / "jump_replay_benchmark.json"
+    benchmark_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "cases": [
+                    {
+                        "id": "jump-case-weak",
+                        "label": "jump case weak",
+                        "type": "jump_attempt",
+                        "source_domain": "Network Protocols",
+                        "pattern_name": "Queue-threshold congestion gating",
+                        "abstract_structure": "load compared against a queue threshold",
+                        "search_results": "Candidate cluster 1:\nTitle: Wireless scheduling paper",
+                        "expected": {
+                            "stage1_outcome": "detect_no_signal",
+                            "stage2_outcome": None,
+                        },
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        main.jump_module,
+        "_stage_one_detect_with_diagnostics",
+        lambda **_kwargs: (
+            {
+                "target_domain": "Wireless Scheduling",
+                "signal": "shared structural signal",
+                "evidence": "specific evidence",
+            },
+            "missing_solution_evidence",
+        ),
+    )
+    monkeypatch.setattr(
+        main.jump_module,
+        "_stage_two_hypothesize_with_diagnostics",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Stage 2 replay should not run for a weak signal")
+        ),
+    )
+
+    assert main._run_jump_benchmark(benchmark_file, 0.6) is True
+    output = capsys.readouterr().out
+    assert "IMPROVED\tjump_attempt\tjump-case-weak" in output
+    assert "actual=weak_signal -> —" in output
+    assert "stage1_failure_hint=missing_solution_evidence" in output
 
 
 def test_run_jump_benchmark_uses_stage2_only_replay_when_stage_one_success_present(
