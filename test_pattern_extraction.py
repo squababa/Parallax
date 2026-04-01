@@ -2277,6 +2277,128 @@ def test_lateral_jump_with_diagnostics_keeps_broad_result_with_anchor_overlap(
     assert "Overview of relay gating mismatch suppression" in stage_inputs["stage1"]
 
 
+def test_classify_weak_jump_result_marks_specific_intervention_hit_as_adjacent() -> None:
+    should_drop, context = jump._classify_weak_jump_result(
+        title_text="Overview of electrochemical gas phase suppression",
+        url="https://medium.com/electrochemical-overview",
+        clean=(
+            "Operators suppress bubble carryover by adjusting flow rate "
+            "during startup in two-phase electrochemical reactors."
+        ),
+        preferred_anchor_phrases=["relay gating mismatch"],
+        strong_anchor_tokens={"relay", "gating", "mismatch", "actuator"},
+    )
+
+    assert should_drop is False
+    assert context["triage_class"] == "adjacent"
+    assert context["intervention_evidence"] is True
+
+
+def test_classify_weak_jump_result_drops_broad_specificity_only_result() -> None:
+    should_drop, context = jump._classify_weak_jump_result(
+        title_text="Overview of electrochemical gas phase dynamics",
+        url="https://medium.com/electrochemical-overview",
+        clean=(
+            "Two-phase electrochemical reactors exhibit bubble carryover, "
+            "recirculation asymmetry, electrode flooding, gas-channel "
+            "maldistribution, impedance spikes, and transient pressure coupling "
+            "across parallel manifolds."
+        ),
+        preferred_anchor_phrases=["relay gating mismatch"],
+        strong_anchor_tokens={"relay", "gating", "mismatch", "actuator"},
+    )
+
+    assert should_drop is True
+    assert context["triage_class"] == "drop"
+    assert context["intervention_evidence"] is False
+
+
+def test_lateral_jump_with_diagnostics_retains_adjacent_specific_hit_but_drops_broad_junk(
+    monkeypatch,
+) -> None:
+    stage_inputs: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        jump,
+        "_build_jump_search_queries",
+        lambda *_args, **_kwargs: ["relay gating mismatch suppression"],
+    )
+
+    def fake_search(**kwargs):
+        if kwargs.get("include_domains"):
+            return {"results": []}
+        return {
+            "results": [
+                {
+                    "title": "Relay gating mismatch suppression",
+                    "content": (
+                        "Relay gating mismatch suppression isolates the mismatched lane "
+                        "before actuator switching."
+                    ),
+                    "url": "https://target.test/anchored",
+                },
+                {
+                    "title": "Overview of electrochemical gas phase suppression",
+                    "content": (
+                        "Operators suppress bubble carryover by adjusting flow rate "
+                        "during startup in two-phase electrochemical reactors."
+                    ),
+                    "url": "https://medium.com/electrochemical-overview",
+                },
+                {
+                    "title": "What is actuator routing",
+                    "content": "broad background context only",
+                    "url": "https://medium.com/overview",
+                },
+            ]
+        }
+
+    monkeypatch.setattr(jump._tavily, "search", fake_search)
+
+    def fake_stage_one(**kwargs):
+        stage_inputs["stage1"] = kwargs["search_results"]
+        return (
+            {
+                "target_domain": "Safety Interlock Monitoring",
+                "signal": "shared structural signal",
+                "evidence": "specific evidence",
+                "solution_evidence": "concrete workaround",
+            },
+            None,
+        )
+
+    monkeypatch.setattr(jump, "_stage_one_detect_with_diagnostics", fake_stage_one)
+    monkeypatch.setattr(
+        jump,
+        "_stage_two_hypothesize_with_diagnostics",
+        lambda **_kwargs: (_safety_interlock_jump_payload(), None, None),
+    )
+
+    connection, diagnostic = jump.lateral_jump_with_diagnostics(
+        {
+            "pattern_name": "Relay-gated mismatch suppression",
+            "abstract_structure": "relay gating suppresses mismatch faults before actuator switching",
+            "search_query": "relay gating mismatch suppression",
+        },
+        "Network Protocols",
+        "Technology",
+    )
+
+    assert connection is not None
+    assert diagnostic["general_result_count"] == 3
+    assert diagnostic["filtered_result_count"] == 1
+    assert diagnostic["result_count"] == 2
+    assert diagnostic["adjacent_retained_result_count"] == 1
+    assert "What is actuator routing" not in stage_inputs["stage1"]
+    assert "Title: Relay gating mismatch suppression" in stage_inputs["stage1"]
+    assert "Title: Overview of electrochemical gas phase suppression" in stage_inputs["stage1"]
+    assert stage_inputs["stage1"].index(
+        "Title: Relay gating mismatch suppression"
+    ) < stage_inputs["stage1"].index(
+        "Title: Overview of electrochemical gas phase suppression"
+    )
+
+
 def test_lateral_jump_with_diagnostics_prefers_anchored_cluster_over_collision_prone_result(
     monkeypatch,
 ) -> None:
@@ -2853,15 +2975,18 @@ def test_lateral_jump_with_diagnostics_prefers_evidence_map_core_target_anchor(
         jump._tavily,
         "search",
         lambda **_kwargs: {
-            "results": [
-                {
-                    "title": "Industrial safety overview",
-                    "content": "Safety systems reduce faults across manufacturing plants.",
-                    "url": "https://magazine.test/safety-overview",
-                }
-            ]
-        },
-    )
+                "results": [
+                    {
+                        "title": "Industrial safety diagnostic controls",
+                        "content": (
+                            "Safety diagnostic controls reduce faults across "
+                            "manufacturing plants."
+                        ),
+                        "url": "https://magazine.test/safety-diagnostics",
+                    }
+                ]
+            },
+        )
     monkeypatch.setattr(
         jump,
         "_stage_one_detect_with_diagnostics",
@@ -2931,17 +3056,18 @@ def test_lateral_jump_with_diagnostics_sets_aligned_source_display_fields(
         jump._tavily,
         "search",
         lambda **_kwargs: {
-            "results": [
-                {
-                    "title": "Industrial safety overview",
-                    "content": (
-                        "Safety systems reduce faults across manufacturing plants."
-                    ),
-                    "url": "https://magazine.test/safety-overview",
-                }
-            ]
-        },
-    )
+                "results": [
+                    {
+                        "title": "Industrial safety diagnostic controls",
+                        "content": (
+                            "Safety diagnostic controls reduce faults across "
+                            "manufacturing plants."
+                        ),
+                        "url": "https://magazine.test/safety-diagnostics",
+                    }
+                ]
+            },
+        )
     monkeypatch.setattr(
         jump,
         "_stage_one_detect_with_diagnostics",
@@ -3024,17 +3150,18 @@ def test_lateral_jump_with_diagnostics_prefers_grounded_seed_excerpt_over_descri
         jump._tavily,
         "search",
         lambda **_kwargs: {
-            "results": [
-                {
-                    "title": "Industrial safety overview",
-                    "content": (
-                        "Safety systems reduce faults across manufacturing plants."
-                    ),
-                    "url": "https://magazine.test/safety-overview",
-                }
-            ]
-        },
-    )
+                "results": [
+                    {
+                        "title": "Industrial safety diagnostic controls",
+                        "content": (
+                            "Safety diagnostic controls reduce faults across "
+                            "manufacturing plants."
+                        ),
+                        "url": "https://magazine.test/safety-diagnostics",
+                    }
+                ]
+            },
+        )
     monkeypatch.setattr(
         jump,
         "_stage_one_detect_with_diagnostics",

@@ -2407,14 +2407,23 @@ def _classify_weak_jump_result(
         solution_marker_count=solution_marker_count,
         specificity_score=specificity_score,
     )
+    intervention_evidence = bool(intervention_context.get("intervention_evidence"))
+    strong_grounding_signal = intervention_evidence or reliable_solution_evidence
+    adjacent_retained = (
+        anchor_overlap < 2
+        and not preferred_phrase_match
+        and (
+            ((weak_source or broad_page) and strong_grounding_signal)
+            or (not weak_source and not broad_page and specificity_score >= 6)
+        )
+    )
     should_drop = (
         (weak_source or broad_page)
         and anchor_overlap < 2
         and not preferred_phrase_match
-        and not reliable_solution_evidence
-        and not bool(intervention_context.get("intervention_evidence"))
-        and specificity_score < 5
+        and not strong_grounding_signal
     )
+    triage_class = "drop" if should_drop else ("adjacent" if adjacent_retained else "keep")
     reason_codes: list[str] = []
     if should_drop:
         if weak_source:
@@ -2430,12 +2439,11 @@ def _classify_weak_jump_result(
         "preferred_phrase_match": preferred_phrase_match,
         "solution_marker_count": solution_marker_count,
         "specificity_score": specificity_score,
+        "triage_class": triage_class,
         "intervention_marker_count": int(
             intervention_context.get("intervention_marker_count") or 0
         ),
-        "intervention_evidence": bool(
-            intervention_context.get("intervention_evidence")
-        ),
+        "intervention_evidence": intervention_evidence,
         "intervention_signal": str(
             intervention_context.get("intervention_signal") or ""
         ).strip(),
@@ -5345,6 +5353,7 @@ def lateral_jump_with_diagnostics(
         "top_cluster_hints": [],
         "top_cluster_intervention_scores": [],
         "intervention_promoted_result_count": 0,
+        "adjacent_retained_result_count": 0,
         "top_result_titles": [],
         "stage1_outcome": None,
         "stage1_target_domain": None,
@@ -5465,6 +5474,7 @@ def lateral_jump_with_diagnostics(
             intervention_signal = str(
                 weak_result_context.get("intervention_signal") or ""
             ).strip()
+            triage_class = str(weak_result_context.get("triage_class") or "keep").strip() or "keep"
             dedupe_key = (url or title_text or clean).lower()
             existing_index = merged_result_index.get(dedupe_key)
             if existing_index is None:
@@ -5481,6 +5491,7 @@ def lateral_jump_with_diagnostics(
                         "intervention_marker_count": intervention_marker_count,
                         "intervention_evidence": intervention_evidence,
                         "intervention_signal": intervention_signal,
+                        "triage_class": triage_class,
                     }
                 )
                 continue
@@ -5502,6 +5513,7 @@ def lateral_jump_with_diagnostics(
                 existing_result["intervention_marker_count"] = intervention_marker_count
                 existing_result["intervention_evidence"] = intervention_evidence
                 existing_result["intervention_signal"] = intervention_signal
+                existing_result["triage_class"] = triage_class
             else:
                 existing_result["intervention_marker_count"] = max(
                     int(existing_result.get("intervention_marker_count") or 0),
@@ -5515,6 +5527,11 @@ def lateral_jump_with_diagnostics(
                     and not str(existing_result.get("intervention_signal") or "").strip()
                 ):
                     existing_result["intervention_signal"] = intervention_signal
+                existing_triage = str(existing_result.get("triage_class") or "keep").strip() or "keep"
+                if existing_triage != "keep":
+                    existing_result["triage_class"] = (
+                        "keep" if triage_class == "keep" else "adjacent"
+                    )
             if query_label not in existing_result["query_labels"]:
                 existing_result["query_labels"].append(query_label)
 
@@ -5573,13 +5590,16 @@ def lateral_jump_with_diagnostics(
     diagnostic["intervention_promoted_result_count"] = sum(
         1 for result in merged_results if result.get("intervention_evidence")
     )
+    diagnostic["adjacent_retained_result_count"] = sum(
+        1 for result in merged_results if result.get("triage_class") == "adjacent"
+    )
 
     if query_error_count == len(queries) + 1:
         diagnostic["stage1_outcome"] = "no_results"
         diagnostic["stage1_failure_hint"] = "search_error"
         return None, diagnostic
 
-    def _clustered_result_rank(result: dict) -> tuple[int, int, int, int, int, int, int, int, int, int]:
+    def _clustered_result_rank(result: dict) -> tuple[int, int, int, int, int, int, int, int, int, int, int]:
         clean = str(result.get("clean", "") or "").strip()
         query_labels = [
             str(label).strip()
@@ -5589,7 +5609,9 @@ def lateral_jump_with_diagnostics(
         title_signature = tuple(result.get("title_signature") or ())
         excerpt_rank = _excerpt_rank(clean, query_labels)
         intervention_evidence = bool(result.get("intervention_evidence"))
+        triage_class = str(result.get("triage_class") or "keep").strip() or "keep"
         return (
+            1 if triage_class == "keep" else 0,
             int(result.get("anchor_overlap") or 0),
             1 if result.get("preferred_phrase_match") else 0,
             1 if intervention_evidence else 0,
@@ -5675,6 +5697,11 @@ def lateral_jump_with_diagnostics(
         preferred_phrase_matches = sum(
             1 for result in cluster_results if result.get("preferred_phrase_match")
         )
+        keep_hits = sum(
+            1
+            for result in cluster_results
+            if str(result.get("triage_class") or "keep").strip() == "keep"
+        )
         intervention_hits = sum(
             1 for result in cluster_results if result.get("intervention_evidence")
         )
@@ -5705,9 +5732,11 @@ def lateral_jump_with_diagnostics(
             0,
             0,
             0,
+            0,
         )
         cluster["rank"] = (
             len(cluster_results),
+            keep_hits,
             intervention_hits,
             intervention_score,
             anchor_overlap_total,
@@ -5719,14 +5748,14 @@ def lateral_jump_with_diagnostics(
             )
             else 0,
             marker_density,
-            best_result_rank[3],
             best_result_rank[4],
             best_result_rank[5],
+            best_result_rank[6],
             len(cluster_signature),
         )
 
     clustered_results.sort(
-        key=lambda cluster: cluster.get("rank") or (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+        key=lambda cluster: cluster.get("rank") or (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
         reverse=True,
     )
 
