@@ -725,6 +725,176 @@ def test_lateral_jump_with_diagnostics_reports_preserved_natural_language_built_
     assert stage_inputs["stage1"] == stage_inputs["stage2"]
 
 
+def test_lateral_jump_with_diagnostics_attempts_one_alternate_retrieval_for_adjacent_first_packet(
+    monkeypatch,
+) -> None:
+    seen_calls: list[tuple[str, tuple[str, ...] | None]] = []
+    tavily_call_counts: list[int] = []
+    stage_inputs: dict[str, object] = {}
+    alternate_query = "relay gating control mechanism workaround"
+
+    monkeypatch.setattr(
+        jump,
+        "_build_jump_search_queries",
+        lambda *_args, **_kwargs: [
+            "relay gating mismatch suppression",
+            "relay gating mismatch suppression workaround",
+        ],
+    )
+    monkeypatch.setattr(
+        jump,
+        "_build_alternate_jump_search_query",
+        lambda *_args, **_kwargs: alternate_query,
+    )
+
+    def fake_search(**kwargs):
+        query = kwargs["query"]
+        include_domains = tuple(kwargs.get("include_domains") or ())
+        seen_calls.append((query, include_domains or None))
+        if include_domains:
+            return {"results": []}
+        if query == alternate_query:
+            return {
+                "results": [
+                    {
+                        "title": "Relay gating mismatch suppression",
+                        "content": (
+                            "Relay gating mismatch suppression isolates the mismatched lane "
+                            "before actuator switching."
+                        ),
+                        "url": "https://target.test/relay-alt",
+                    }
+                ]
+            }
+        if query.endswith("workaround"):
+            return {
+                "results": [
+                    {
+                        "title": "Electrochemical phase-routing asymmetry",
+                        "content": (
+                            "Electrochemical phase-routing asymmetry produces bubble "
+                            "carryover, startup maldistribution, manifold drift, and "
+                            "transient lane mismatch across parallel channels."
+                        ),
+                        "url": "https://target.test/electrochemical-asymmetry",
+                    }
+                ]
+            }
+        return {
+            "results": [
+                {
+                    "title": "Mismatch monitor note",
+                    "content": (
+                        "Lane monitor detects mismatch before launch."
+                    ),
+                    "url": "https://target.test/mismatch-monitor",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(jump._tavily, "search", fake_search)
+    monkeypatch.setattr(
+        jump,
+        "increment_tavily_calls",
+        lambda count=1: tavily_call_counts.append(count),
+    )
+
+    def fake_stage_one(**kwargs):
+        stage_inputs["stage1"] = kwargs["search_results"]
+        return (
+            {
+                "target_domain": "Safety Interlock Monitoring",
+                "signal": "shared structural signal",
+                "evidence": "specific evidence",
+                "solution_evidence": "concrete workaround",
+            },
+            None,
+        )
+
+    def fake_stage_two(**kwargs):
+        stage_inputs["stage2"] = kwargs["search_results"]
+        return (_safety_interlock_jump_payload(), None, None)
+
+    monkeypatch.setattr(jump, "_stage_one_detect_with_diagnostics", fake_stage_one)
+    monkeypatch.setattr(jump, "_stage_two_hypothesize_with_diagnostics", fake_stage_two)
+
+    connection, diagnostic = jump.lateral_jump_with_diagnostics(
+        {
+            "pattern_name": "Relay-gated mismatch suppression",
+            "abstract_structure": "relay gating suppresses mismatch faults before actuator switching",
+            "search_query": "relay gating mismatch suppression",
+        },
+        "Network Protocols",
+        "Technology",
+    )
+
+    assert connection is not None
+    assert seen_calls == [
+        ("relay gating mismatch suppression", None),
+        ("relay gating mismatch suppression workaround", None),
+        ("relay gating mismatch suppression", jump.ACADEMIC_JUMP_INCLUDE_DOMAINS),
+        (alternate_query, None),
+    ]
+    assert tavily_call_counts == [1, 1, 1, 1]
+    assert diagnostic["alternate_retrieval_attempted"] is True
+    assert diagnostic["alternate_jump_query"] == alternate_query
+    assert diagnostic["alternate_result_count"] == 1
+    assert diagnostic["result_count"] == 3
+    assert diagnostic["adjacent_retained_result_count"] == 1
+    assert stage_inputs["stage1"] == stage_inputs["stage2"]
+    assert "Retrieved via: alternate" in stage_inputs["stage1"]
+    assert "Title: Relay gating mismatch suppression" in stage_inputs["stage1"]
+    assert "Title: Mismatch monitor note" in stage_inputs["stage1"]
+
+
+def test_should_attempt_alternate_jump_retrieval_allows_one_weak_keep_in_thin_packet() -> None:
+    merged_results = [
+        {
+            "triage_class": "keep",
+            "anchor_overlap": 1,
+            "intervention_evidence": False,
+        },
+        {
+            "triage_class": "adjacent",
+            "anchor_overlap": 0,
+            "intervention_evidence": False,
+        },
+    ]
+    clustered_results = [{"results": list(merged_results)}]
+
+    assert (
+        jump._should_attempt_alternate_jump_retrieval(
+            merged_results,
+            clustered_results,
+        )
+        is True
+    )
+
+
+def test_should_attempt_alternate_jump_retrieval_skips_strong_anchored_top_cluster() -> None:
+    merged_results = [
+        {
+            "triage_class": "keep",
+            "anchor_overlap": 3,
+            "intervention_evidence": False,
+        },
+        {
+            "triage_class": "adjacent",
+            "anchor_overlap": 1,
+            "intervention_evidence": False,
+        },
+    ]
+    clustered_results = [{"results": list(merged_results)}]
+
+    assert (
+        jump._should_attempt_alternate_jump_retrieval(
+            merged_results,
+            clustered_results,
+        )
+        is False
+    )
+
+
 def test_stage_one_detect_prompt_prefers_solution_bearing_analogues(
     monkeypatch,
 ) -> None:

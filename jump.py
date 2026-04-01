@@ -2299,6 +2299,125 @@ def _build_jump_search_queries(
 _build_jump_search_queries.last_collision_guard_applied = False
 
 
+def _build_alternate_jump_search_query(
+    pattern: dict,
+    source_domain: str,
+    source_category: str,
+    base_query: str,
+) -> str:
+    clean_base_query = re.sub(r"\s+", " ", str(base_query or "").strip())
+    blocked_tokens, preferred_anchor_phrases, support_tokens = _jump_query_support_context(
+        pattern,
+        source_domain,
+        source_category,
+    )
+    selected: list[str] = []
+    covered_tokens: set[str] = set()
+    base_tokens = set(_tokenize_query_terms(clean_base_query))
+
+    def _append_part(part: str) -> None:
+        normalized = re.sub(r"\s+", " ", str(part or "").strip().lower())
+        if not normalized or normalized in selected:
+            return
+        selected.append(normalized)
+        covered_tokens.update(_tokenize_query_terms(normalized))
+
+    anchor_phrase = _select_best_jump_anchor_phrase(preferred_anchor_phrases)
+    if anchor_phrase:
+        _append_part(anchor_phrase)
+
+    for token in support_tokens:
+        if (
+            token in covered_tokens
+            or token in base_tokens
+            or token in GENERIC_QUERY_TOKENS
+            or token in WEAK_QUERY_TOKENS
+            or token in OVERLOADED_JUMP_QUERY_TOKENS
+            or len(token) <= 2
+        ):
+            continue
+        _append_part(token)
+        if len(_tokenize_query_terms(" ".join(selected))) >= 4:
+            break
+
+    for term in ("control", "mechanism", "workaround"):
+        if term not in covered_tokens:
+            _append_part(term)
+
+    alternate_query = " ".join(_tokenize_query_terms(" ".join(selected))[:8]).strip()
+    if len(_tokenize_query_terms(alternate_query)) < 4:
+        fallback_tokens = [
+            token
+            for token in _tokenize_query_terms(clean_base_query)
+            if (
+                token not in GENERIC_QUERY_TOKENS
+                and token not in WEAK_QUERY_TOKENS
+                and token not in OVERLOADED_JUMP_QUERY_TOKENS
+            )
+        ]
+        alternate_query = " ".join((fallback_tokens[:4] + ["control", "mechanism", "workaround"])[:8]).strip()
+    if alternate_query == clean_base_query:
+        alternate_query = f"{alternate_query} control workaround".strip()
+    return alternate_query
+
+
+def _should_attempt_alternate_jump_retrieval(
+    merged_results: list[dict],
+    clustered_results: list[dict],
+) -> bool:
+    if not merged_results or not clustered_results:
+        return False
+
+    top_cluster_results = list(clustered_results[0].get("results") or [])
+    if not top_cluster_results:
+        return False
+
+    top_cluster_keep_hits = sum(
+        1
+        for result in top_cluster_results
+        if str(result.get("triage_class") or "keep").strip() == "keep"
+    )
+    top_cluster_anchor_max = max(
+        (int(result.get("anchor_overlap") or 0) for result in top_cluster_results),
+        default=0,
+    )
+    top_cluster_intervention_hits = sum(
+        1 for result in top_cluster_results if result.get("intervention_evidence")
+    )
+    total_keep_count = sum(
+        1
+        for result in merged_results
+        if str(result.get("triage_class") or "keep").strip() == "keep"
+    )
+    adjacent_count = sum(
+        1
+        for result in merged_results
+        if str(result.get("triage_class") or "keep").strip() == "adjacent"
+    )
+    thin_underanchored_top_cluster = (
+        top_cluster_anchor_max < 2
+        and top_cluster_intervention_hits == 0
+        and top_cluster_keep_hits <= 1
+    )
+    low_coherence_top_cluster = (
+        len(clustered_results) >= 2 and len(top_cluster_results) <= 1
+    )
+    underanchored_adjacent_packet = (
+        adjacent_count > 0
+        and len(merged_results) >= 2
+        and total_keep_count <= 1
+        and thin_underanchored_top_cluster
+    )
+    broad_underanchored_packet = (
+        low_coherence_top_cluster
+        and len(merged_results) >= 2
+        and adjacent_count > 0
+        and total_keep_count <= 1
+        and thin_underanchored_top_cluster
+    )
+    return underanchored_adjacent_packet or broad_underanchored_packet
+
+
 def _jump_result_anchor_context(
     pattern: dict,
     source_domain: str,
@@ -5354,6 +5473,9 @@ def lateral_jump_with_diagnostics(
         "top_cluster_intervention_scores": [],
         "intervention_promoted_result_count": 0,
         "adjacent_retained_result_count": 0,
+        "alternate_retrieval_attempted": False,
+        "alternate_jump_query": None,
+        "alternate_result_count": 0,
         "top_result_titles": [],
         "stage1_outcome": None,
         "stage1_target_domain": None,
@@ -5587,12 +5709,6 @@ def lateral_jump_with_diagnostics(
     )
 
     diagnostic["filtered_result_reason_counts"] = filtered_result_reason_counts
-    diagnostic["intervention_promoted_result_count"] = sum(
-        1 for result in merged_results if result.get("intervention_evidence")
-    )
-    diagnostic["adjacent_retained_result_count"] = sum(
-        1 for result in merged_results if result.get("triage_class") == "adjacent"
-    )
 
     if query_error_count == len(queries) + 1:
         diagnostic["stage1_outcome"] = "no_results"
@@ -5729,139 +5845,177 @@ def lateral_jump_with_diagnostics(
         )
         return [highlights_by_key[key] for key in highlight_order]
 
-    clustered_results: list[dict] = []
-    for merged_result in merged_results:
-        title_signature = _build_jump_title_signature(
-            str(merged_result.get("title_text", "") or ""),
-            blocked_cluster_tokens,
-        )
-        normalized_host = _normalize_jump_result_host(str(merged_result.get("url", "") or ""))
-        result_entry = {
-            **merged_result,
-            "title_signature": title_signature,
-            "normalized_host": normalized_host,
-        }
-        matching_cluster: dict | None = None
-        if title_signature:
-            signature_set = set(title_signature)
-            for cluster in clustered_results:
-                cluster_signature = tuple(cluster.get("title_signature") or ())
-                if cluster_signature and cluster_signature == title_signature:
-                    matching_cluster = cluster
-                    break
-            if matching_cluster is None and normalized_host:
+    def _cluster_merged_results() -> list[dict]:
+        clustered_results: list[dict] = []
+        for merged_result in merged_results:
+            title_signature = _build_jump_title_signature(
+                str(merged_result.get("title_text", "") or ""),
+                blocked_cluster_tokens,
+            )
+            normalized_host = _normalize_jump_result_host(str(merged_result.get("url", "") or ""))
+            result_entry = {
+                **merged_result,
+                "title_signature": title_signature,
+                "normalized_host": normalized_host,
+            }
+            matching_cluster: dict | None = None
+            if title_signature:
+                signature_set = set(title_signature)
                 for cluster in clustered_results:
                     cluster_signature = tuple(cluster.get("title_signature") or ())
-                    if (
-                        not cluster_signature
-                        or str(cluster.get("normalized_host", "") or "") != normalized_host
-                        or len(signature_set.intersection(cluster_signature)) < 2
-                    ):
-                        continue
-                    matching_cluster = cluster
-                    break
-        if matching_cluster is None:
-            clustered_results.append(
-                {
-                    "title_signature": title_signature,
-                    "normalized_host": normalized_host,
-                    "results": [result_entry],
-                }
-            )
-        else:
-            matching_cluster["results"].append(result_entry)
-
-    for cluster in clustered_results:
-        cluster_results = sorted(
-            cluster.get("results") or [],
-            key=_clustered_result_rank,
-            reverse=True,
-        )
-        cluster["results"] = cluster_results
-        cluster_signature = tuple(cluster.get("title_signature") or ())
-        best_result = cluster_results[0] if cluster_results else {}
-        cluster_hint = " ".join(cluster_signature).strip()
-        if not cluster_hint:
-            cluster_hint = str(best_result.get("title_text", "") or "").strip()
-        if not cluster_hint:
-            cluster_hint = str(cluster.get("normalized_host", "") or "").strip()
-        cluster["cluster_hint"] = cluster_hint or "singleton result"
-        marker_density = (
-            sum(
-                int(
-                    result.get("solution_marker_count")
-                    or _jump_solution_marker_count(str(result.get("clean", "") or ""))
+                    if cluster_signature and cluster_signature == title_signature:
+                        matching_cluster = cluster
+                        break
+                if matching_cluster is None and normalized_host:
+                    for cluster in clustered_results:
+                        cluster_signature = tuple(cluster.get("title_signature") or ())
+                        if (
+                            not cluster_signature
+                            or str(cluster.get("normalized_host", "") or "") != normalized_host
+                            or len(signature_set.intersection(cluster_signature)) < 2
+                        ):
+                            continue
+                        matching_cluster = cluster
+                        break
+            if matching_cluster is None:
+                clustered_results.append(
+                    {
+                        "title_signature": title_signature,
+                        "normalized_host": normalized_host,
+                        "results": [result_entry],
+                    }
                 )
-                for result in cluster_results
+            else:
+                matching_cluster["results"].append(result_entry)
+
+        for cluster in clustered_results:
+            cluster_results = sorted(
+                cluster.get("results") or [],
+                key=_clustered_result_rank,
+                reverse=True,
             )
-            / max(len(cluster_results), 1)
-        )
-        anchor_overlap_total = sum(
-            int(result.get("anchor_overlap") or 0) for result in cluster_results
-        )
-        preferred_phrase_matches = sum(
-            1 for result in cluster_results if result.get("preferred_phrase_match")
-        )
-        keep_hits = sum(
-            1
-            for result in cluster_results
-            if str(result.get("triage_class") or "keep").strip() == "keep"
-        )
-        intervention_hits = sum(
-            1 for result in cluster_results if result.get("intervention_evidence")
-        )
-        intervention_score = sum(
-            int(result.get("intervention_marker_count") or 0)
-            for result in cluster_results
-            if result.get("intervention_evidence")
-        ) + intervention_hits * 2
-        cluster_intervention_signal = next(
-            (
-                str(result.get("intervention_signal") or "").strip()
+            cluster["results"] = cluster_results
+            cluster_signature = tuple(cluster.get("title_signature") or ())
+            best_result = cluster_results[0] if cluster_results else {}
+            cluster_hint = " ".join(cluster_signature).strip()
+            if not cluster_hint:
+                cluster_hint = str(best_result.get("title_text", "") or "").strip()
+            if not cluster_hint:
+                cluster_hint = str(cluster.get("normalized_host", "") or "").strip()
+            cluster["cluster_hint"] = cluster_hint or "singleton result"
+            marker_density = (
+                sum(
+                    int(
+                        result.get("solution_marker_count")
+                        or _jump_solution_marker_count(str(result.get("clean", "") or ""))
+                    )
+                    for result in cluster_results
+                )
+                / max(len(cluster_results), 1)
+            )
+            anchor_overlap_total = sum(
+                int(result.get("anchor_overlap") or 0) for result in cluster_results
+            )
+            preferred_phrase_matches = sum(
+                1 for result in cluster_results if result.get("preferred_phrase_match")
+            )
+            keep_hits = sum(
+                1
+                for result in cluster_results
+                if str(result.get("triage_class") or "keep").strip() == "keep"
+            )
+            intervention_hits = sum(
+                1 for result in cluster_results if result.get("intervention_evidence")
+            )
+            intervention_score = sum(
+                int(result.get("intervention_marker_count") or 0)
                 for result in cluster_results
                 if result.get("intervention_evidence")
-                and str(result.get("intervention_signal") or "").strip()
-            ),
-            "",
-        )
-        cluster["intervention_score"] = intervention_score
-        cluster["intervention_signal"] = cluster_intervention_signal
-        best_result_rank = _clustered_result_rank(best_result) if cluster_results else (
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        )
-        cluster["rank"] = (
-            len(cluster_results),
-            keep_hits,
-            intervention_hits,
-            intervention_score,
-            anchor_overlap_total,
-            preferred_phrase_matches,
-            1
-            if any(
-                "solution-biased" in (result.get("query_labels") or [])
-                for result in cluster_results
+            ) + intervention_hits * 2
+            cluster_intervention_signal = next(
+                (
+                    str(result.get("intervention_signal") or "").strip()
+                    for result in cluster_results
+                    if result.get("intervention_evidence")
+                    and str(result.get("intervention_signal") or "").strip()
+                ),
+                "",
             )
-            else 0,
-            marker_density,
-            best_result_rank[4],
-            best_result_rank[5],
-            best_result_rank[6],
-            len(cluster_signature),
-        )
+            cluster["intervention_score"] = intervention_score
+            cluster["intervention_signal"] = cluster_intervention_signal
+            best_result_rank = _clustered_result_rank(best_result) if cluster_results else (
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
+            cluster["rank"] = (
+                len(cluster_results),
+                keep_hits,
+                intervention_hits,
+                intervention_score,
+                anchor_overlap_total,
+                preferred_phrase_matches,
+                1
+                if any(
+                    "solution-biased" in (result.get("query_labels") or [])
+                    for result in cluster_results
+                )
+                else 0,
+                marker_density,
+                best_result_rank[4],
+                best_result_rank[5],
+                best_result_rank[6],
+                len(cluster_signature),
+            )
 
-    clustered_results.sort(
-        key=lambda cluster: cluster.get("rank") or (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
-        reverse=True,
+        clustered_results.sort(
+            key=lambda cluster: cluster.get("rank") or (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+            reverse=True,
+        )
+        return clustered_results
+
+    clustered_results = _cluster_merged_results()
+    if _should_attempt_alternate_jump_retrieval(merged_results, clustered_results):
+        alternate_query = _build_alternate_jump_search_query(
+            pattern,
+            source_domain,
+            source_category,
+            query,
+        )
+        if alternate_query and alternate_query not in queries:
+            diagnostic["alternate_retrieval_attempted"] = True
+            diagnostic["alternate_jump_query"] = alternate_query
+            try:
+                alternate_results = _tavily.search(
+                    query=alternate_query,
+                    max_results=5,
+                    include_answer=False,
+                    search_depth="basic",
+                )
+                increment_tavily_calls(1)
+            except Exception as e:
+                print(f"  [!] Tavily alternate jump search failed for query '{alternate_query}': {e}")
+                alternate_results = {"results": []}
+            raw_alternate_results = alternate_results.get("results", [])
+            if not isinstance(raw_alternate_results, list):
+                raw_alternate_results = []
+            diagnostic["alternate_result_count"] = len(raw_alternate_results)
+            _merge_search_results(raw_alternate_results, "alternate")
+            clustered_results = _cluster_merged_results()
+
+    diagnostic["intervention_promoted_result_count"] = sum(
+        1 for result in merged_results if result.get("intervention_evidence")
+    )
+    diagnostic["adjacent_retained_result_count"] = sum(
+        1 for result in merged_results if result.get("triage_class") == "adjacent"
     )
 
     diagnostic["result_count"] = len(merged_results)
