@@ -417,11 +417,17 @@ PATTERN_ANCHOR_STOPWORDS = {
     "within",
 }
 PATTERN_SOURCE_LEAKAGE_GENERIC_TERMS = {
+    "abundance",
+    "aperture",
+    "composition",
     "declaration",
     "event",
     "initial",
+    "limits",
+    "lower",
     "response",
     "state",
+    "stress",
 }
 
 
@@ -594,6 +600,14 @@ def _profile_transferable_pattern_quality(pattern: dict, seed: dict) -> dict:
     )
     if len(source_shape_terms) >= 2:
         concerns.append("transferable_source_shaped")
+    strong_source_leakage_terms = _strong_pattern_source_terms(leakage_terms)
+    strong_source_shape_terms = _strong_pattern_source_terms(
+        [
+            token
+            for token in source_shape_terms
+            if token in source_tokens
+        ]
+    )
 
     overlap_pairs: list[str] = []
     for left_name, right_name in (
@@ -614,12 +628,20 @@ def _profile_transferable_pattern_quality(pattern: dict, seed: dict) -> dict:
 
     return {
         "usable": not any(
-            concern != "transferable_source_shaped"
+            concern
+            not in {
+                "transferable_source_leakage",
+                "transferable_source_shaped",
+            }
             for concern in concerns
-        ),
+        )
+        and not strong_source_leakage_terms
+        and not strong_source_shape_terms,
         "concerns": concerns[:4],
         "source_overlap_terms": leakage_terms[:4],
+        "strong_source_overlap_terms": strong_source_leakage_terms[:4],
         "source_shape_terms": source_shape_terms[:4],
+        "strong_source_shape_terms": strong_source_shape_terms[:4],
         "field_token_counts": {
             field_name: len(tokens)
             for field_name, tokens in field_tokens.items()
@@ -819,6 +841,28 @@ def _pattern_grounded_source_tokens(*values: object) -> set[str]:
         for token in _pattern_anchor_tokens(*values)
         if not _is_generic_grounded_source_token(token)
     }
+
+
+def _is_strong_pattern_source_term(token: str) -> bool:
+    """Return True for overlap tokens that look strongly source-specific."""
+    candidate = str(token or "").strip().lower()
+    if (
+        len(candidate) < 4
+        or candidate in PATTERN_SOURCE_LEAKAGE_GENERIC_TERMS
+        or candidate in PATTERN_ANCHOR_STOPWORDS
+        or candidate in PATTERN_GENERIC_TERMS
+    ):
+        return False
+    return "-" in candidate or any(char.isdigit() for char in candidate) or len(candidate) >= 6
+
+
+def _strong_pattern_source_terms(terms: list[str]) -> list[str]:
+    """Keep only overlap terms that are strong enough to block transferable use."""
+    return sorted(
+        token
+        for token in terms
+        if _is_strong_pattern_source_term(token)
+    )
 
 
 def _transferable_source_shaped_terms(

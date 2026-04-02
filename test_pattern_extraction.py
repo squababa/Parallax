@@ -243,6 +243,35 @@ def test_profile_transferable_pattern_quality_ignores_broad_seed_domain_vocab() 
     assert profile["source_overlap_terms"] == []
 
 
+def test_profile_transferable_pattern_quality_keeps_broad_overlap_nonblocking() -> None:
+    profile = explore._profile_transferable_pattern_quality(
+        explore._normalize_pattern_schema(
+            {
+                "pattern_name": "Stress limits lower abundance composition",
+                "description": "Stress rises until a broad limit lowers abundance and composition.",
+                "abstract_structure": "Broad stress accumulates until lower limits redirect abundance and composition.",
+                "search_query": "stress lower limits abundance composition",
+                "measurable_signal": "stress abundance composition ratio",
+                "control_lever": "lower stress limits after abundance drift",
+                "transferable": {
+                    "mechanism": "stress abundance composition reroutes load through side channels",
+                    "control_logic": "lower limits after stress drift by retiming release pulses",
+                    "signal_shape": "abundance composition rises gradually before delayed settling",
+                },
+                "grounded": {
+                    "source_control": "lower stress limits after abundance composition drift",
+                    "source_metric": "stress abundance composition level",
+                },
+            }
+        ),
+        {"name": "Stress abundance composition control", "category": "Ecology"},
+    )
+
+    assert profile["usable"] is True
+    assert profile["strong_source_overlap_terms"] == []
+    assert profile["strong_source_shape_terms"] == []
+
+
 def test_profile_transferable_pattern_quality_flags_true_source_noun_leakage() -> None:
     profile = explore._profile_transferable_pattern_quality(
         explore._normalize_pattern_schema(
@@ -270,6 +299,9 @@ def test_profile_transferable_pattern_quality_flags_true_source_noun_leakage() -
     assert "transferable_source_leakage" in profile["concerns"]
     assert {"c-fiber", "dorsal", "horn", "nociceptor"}.intersection(
         profile["source_overlap_terms"]
+    )
+    assert {"c-fiber", "dorsal", "nociceptor"}.intersection(
+        profile["strong_source_overlap_terms"]
     )
 
 
@@ -1236,6 +1268,7 @@ def test_jump_transferable_query_profile_rejects_source_leaky_transferable_field
     assert profile["usable"] is False
     assert "transferable_source_leakage" in profile["concerns"]
     assert "permeability" in profile["source_leakage_terms"]
+    assert "permeability" in profile["strong_source_leakage_terms"]
 
 
 def test_jump_transferable_query_profile_ignores_portable_mechanism_and_connector_overlap() -> None:
@@ -1302,8 +1335,42 @@ def test_jump_transferable_query_profile_ignores_broad_lifecycle_words_as_source
         "Software",
     )
 
+    assert profile["usable"] is True
     assert "transferable_source_leakage" not in profile["concerns"]
     assert profile["source_leakage_terms"] == []
+    assert profile["strong_source_leakage_terms"] == []
+
+
+def test_jump_transferable_query_profile_keeps_broad_overlap_diagnostic_but_nonblocking() -> None:
+    profile = jump._jump_transferable_query_profile(
+        {
+            "pattern_name": "Stress limits lower abundance composition",
+            "search_query": "stress lower limits abundance composition how",
+            "measurable_signal": "stress abundance composition",
+            "control_lever": "lower stress limits",
+            "transferable": {
+                "mechanism": "stress abundance composition reroutes load through side channels",
+                "control_logic": "lower limits after stress drift by retiming release pulses",
+                "signal_shape": "how abundance composition rises before lower limits trigger a delayed settling tail",
+                "_backfilled_fields": [],
+            },
+            "grounded": {
+                "source_control": "lower stress limits after abundance composition",
+                "source_metric": "stress abundance composition",
+            },
+        },
+        "Stress Limits",
+        "Ecology",
+    )
+
+    assert profile["usable"] is True
+    assert "transferable_source_leakage" in profile["concerns"]
+    assert "transferable_source_shaped" in profile["concerns"]
+    assert {"stress", "limits", "lower", "abundance", "composition"}.intersection(
+        profile["source_leakage_terms"]
+    )
+    assert profile["strong_source_leakage_terms"] == []
+    assert profile["strong_source_shape_terms"] == []
 
 
 def test_jump_transferable_query_profile_rejects_overlap_collapsed_fields() -> None:
@@ -1724,6 +1791,41 @@ def test_lateral_jump_with_diagnostics_marks_transferable_used_but_source_shaped
     assert {"additive", "multiplicative"}.intersection(
         diagnostic["transferable_used_source_shape_terms"]
     )
+
+
+def test_lateral_jump_with_diagnostics_keeps_broad_overlap_transferable_path_nonblocking(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(jump, "_generate_llm_jump_search_query", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(jump._tavily, "search", lambda **_kwargs: {"results": []})
+
+    _connection, diagnostic = jump.lateral_jump_with_diagnostics(
+        {
+            "pattern_name": "Stress limits lower abundance composition",
+            "abstract_structure": "Broad stress accumulates until lower limits redirect abundance and composition.",
+            "search_query": "stress lower limits abundance composition how",
+            "measurable_signal": "stress abundance composition",
+            "control_lever": "lower stress limits",
+            "transfer_rationale": "",
+            "transferable": {
+                "mechanism": "stress abundance composition reroutes load through side channels",
+                "control_logic": "lower limits after stress drift by retiming release pulses",
+                "signal_shape": "how abundance composition rises before lower limits trigger a delayed settling tail",
+                "_backfilled_fields": [],
+            },
+            "grounded": {
+                "source_control": "lower stress limits after abundance composition",
+                "source_metric": "stress abundance composition",
+            },
+        },
+        "Stress Limits",
+        "Ecology",
+    )
+
+    assert diagnostic["transferable_query_profile"]["usable"] is True
+    assert "transferable_source_shaped" in diagnostic["transferable_query_profile"]["concerns"]
+    assert diagnostic["transferable_fallback_gate_blocked"] is False
+    assert diagnostic["transferable_used_but_source_shaped"] is True
 
 
 def test_lateral_jump_with_diagnostics_attempts_one_alternate_retrieval_for_adjacent_first_packet(

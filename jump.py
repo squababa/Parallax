@@ -1232,6 +1232,17 @@ JUMP_SOURCE_LEAKAGE_GENERIC_TOKENS = {
     "signal",
     "state",
 }
+JUMP_BROAD_SOURCE_OVERLAP_TOKENS = JUMP_SOURCE_LEAKAGE_GENERIC_TOKENS.union(
+    {
+        "abundance",
+        "aperture",
+        "composition",
+        "how",
+        "limits",
+        "lower",
+        "stress",
+    }
+)
 
 
 def _tokenize_query_terms(text: str) -> list[str]:
@@ -1292,6 +1303,33 @@ def _is_generic_jump_grounded_source_token(token: str) -> bool:
         if len(term_token) >= 6 and candidate.startswith(term_token[:6]):
             return True
     return False
+
+
+def _is_strong_jump_source_specific_token(token: str) -> bool:
+    """Return True when an overlap term is specific enough to block fallback use."""
+    candidate = str(token or "").strip().lower()
+    if (
+        len(candidate) < 3
+        or candidate in GENERIC_QUERY_TOKENS
+        or candidate in WEAK_QUERY_TOKENS
+        or candidate in JUMP_QUERY_FILLER_TOKENS
+        or candidate in QUERY_PHRASE_STOPWORDS
+        or candidate in OVERLOADED_JUMP_QUERY_TOKENS
+        or candidate in AMBIGUOUS_JUMP_QUERY_TOKENS
+        or candidate in JUMP_BROAD_SOURCE_OVERLAP_TOKENS
+        or _is_generic_jump_grounded_source_token(candidate)
+    ):
+        return False
+    return "-" in candidate or any(char.isdigit() for char in candidate) or len(candidate) >= 6
+
+
+def _strong_jump_source_terms(terms: list[str]) -> list[str]:
+    """Keep only source overlap terms that are strong enough to make usable=false."""
+    return sorted(
+        token
+        for token in terms
+        if _is_strong_jump_source_specific_token(token)
+    )
 
 
 def _jump_grounded_source_tokens(grounded: dict) -> set[str]:
@@ -1592,6 +1630,17 @@ def _jump_transferable_query_profile(
     )
     if len(source_shape_terms) >= 2:
         concerns.append("transferable_source_shaped")
+    strong_source_leakage_terms = _strong_jump_source_terms(source_leakage_terms)
+    source_context_tokens = set(grounded_source_tokens)
+    source_context_tokens.update(_tokenize_query_terms(source_domain))
+    source_context_tokens.update(_tokenize_query_terms(source_category))
+    strong_source_shape_terms = _strong_jump_source_terms(
+        [
+            token
+            for token in source_shape_terms
+            if token in source_context_tokens
+        ]
+    )
 
     overlap_pairs: list[str] = []
     for left_name, right_name in (
@@ -1616,7 +1665,6 @@ def _jump_transferable_query_profile(
         concerns.append("transferable_field_overlap")
 
     blocking_concerns = {
-        "transferable_source_leakage",
         "transferable_field_overlap",
     }
     return {
@@ -1624,13 +1672,17 @@ def _jump_transferable_query_profile(
         and not any(
             str(concern).endswith("_too_generic") or concern in blocking_concerns
             for concern in concerns
-        ),
+        )
+        and not strong_source_leakage_terms
+        and not strong_source_shape_terms,
         "backfilled": has_transferable_fields and not has_native_transferable_fields,
         "backfilled_fields": backfilled_fields,
         "has_transferable_fields": has_transferable_fields,
         "concerns": concerns[:4],
         "source_leakage_terms": source_leakage_terms[:4],
+        "strong_source_leakage_terms": strong_source_leakage_terms[:4],
         "source_shape_terms": source_shape_terms[:4],
+        "strong_source_shape_terms": strong_source_shape_terms[:4],
         "overlap_pairs": overlap_pairs[:3],
         "fields": fields,
     }
