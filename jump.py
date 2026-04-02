@@ -1672,6 +1672,99 @@ def _has_source_surface_jump_query_overhang(
     return surface_hit_count > transferable_hit_count
 
 
+def _unsupported_llm_jump_query_tokens(
+    candidate_tokens: list[str],
+    pattern: dict,
+    source_domain: str,
+    source_category: str,
+    heuristic_query: str,
+) -> list[str]:
+    blocked_tokens, preferred_anchor_phrases, support_tokens = _jump_query_support_context(
+        pattern,
+        source_domain,
+        source_category,
+    )
+    connector_tokens = {
+        "after",
+        "before",
+        "during",
+        "under",
+        "when",
+        "where",
+        "with",
+        "without",
+    }
+    grounded_tokens = set(support_tokens)
+    for phrase in preferred_anchor_phrases:
+        grounded_tokens.update(_tokenize_query_terms(phrase))
+    for text in (
+        str(pattern.get("search_query", "") or ""),
+        str(pattern.get("control_lever", "") or ""),
+        str(pattern.get("abstract_structure", "") or ""),
+        str(pattern.get("measurable_signal", "") or ""),
+        str(pattern.get("pattern_name", "") or ""),
+        str(pattern.get("transfer_rationale", "") or ""),
+        heuristic_query,
+    ):
+        for token in _tokenize_query_terms(text):
+            if (
+                token in blocked_tokens
+                or token in GENERIC_QUERY_TOKENS
+                or token in WEAK_QUERY_TOKENS
+                or token in OVERLOADED_JUMP_QUERY_TOKENS
+                or token in JUMP_QUERY_FILLER_TOKENS
+                or token in QUERY_PHRASE_STOPWORDS
+                or token in connector_tokens
+                or len(token) <= 2
+            ):
+                continue
+            grounded_tokens.add(token)
+
+    def _is_grounded_candidate_token(token: str) -> bool:
+        if token in grounded_tokens:
+            return True
+        if token.endswith("s") and len(token) > 4 and token[:-1] in grounded_tokens:
+            return True
+        if f"{token}s" in grounded_tokens:
+            return True
+        return False
+
+    unsupported_tokens: list[str] = []
+    seen_tokens: set[str] = set()
+    for token in candidate_tokens:
+        singular_token = token[:-1] if token.endswith("s") else token
+        if (
+            token in seen_tokens
+            or _is_grounded_candidate_token(token)
+            or token in blocked_tokens
+            or token in GENERIC_QUERY_TOKENS
+            or token in WEAK_QUERY_TOKENS
+            or token in OVERLOADED_JUMP_QUERY_TOKENS
+            or token in JUMP_QUERY_FILLER_TOKENS
+            or token in QUERY_PHRASE_STOPWORDS
+            or token in connector_tokens
+            or token in MECHANISM_QUERY_TOKENS
+            or singular_token in MECHANISM_QUERY_TOKENS
+            or token in JUMP_QUERY_CAUSAL_OUTCOME_HINTS
+            or singular_token in JUMP_QUERY_CAUSAL_OUTCOME_HINTS
+            or _is_causal_jump_query_token(token)
+            or any(
+                token.startswith(marker)
+                for marker in (
+                    SOLUTION_EVIDENCE_MARKERS
+                    + INTERVENTION_CONTROL_MARKERS
+                    + INTERVENTION_RESPONSE_MARKERS
+                )
+            )
+            or not _is_specific_jump_query_token(token)
+            or len(token) <= 3
+        ):
+            continue
+        seen_tokens.add(token)
+        unsupported_tokens.append(token)
+    return unsupported_tokens
+
+
 def _select_best_jump_anchor_phrase(preferred_anchor_phrases: list[str]) -> str:
     best_phrase = ""
     best_rank = (-1, -1, -1, -1)
@@ -2143,6 +2236,13 @@ def _is_acceptable_llm_jump_query(
         source_category,
     ):
         return False
+    unsupported_tokens = _unsupported_llm_jump_query_tokens(
+        candidate_tokens,
+        pattern,
+        source_domain,
+        source_category,
+        heuristic_query,
+    )
 
     strong_tokens = [
         token
@@ -2201,14 +2301,28 @@ def _is_acceptable_llm_jump_query(
         return False
 
     candidate_token_set = set(candidate_tokens)
-    if candidate_token_set.intersection(anchor_tokens):
+    anchor_token_overlap = candidate_token_set.intersection(anchor_tokens)
+    if unsupported_tokens:
+        return False
+
+    clause_score = _score_jump_query_clause(candidate, blocked_tokens)
+    if len(anchor_token_overlap) >= 2:
         return True
 
     if any(phrase in lowered_candidate for phrase in anchor_phrases):
-        return True
+        return (
+            not unsupported_tokens
+            and natural_language_query
+            and clause_score[1] >= 2
+            and clause_score[2] >= 3
+        )
 
-    clause_score = _score_jump_query_clause(candidate, blocked_tokens)
-    return natural_language_query and clause_score[1] >= 2 and clause_score[2] >= 3
+    return (
+        not unsupported_tokens
+        and natural_language_query
+        and clause_score[1] >= 2
+        and clause_score[2] >= 3
+    )
 
 
 def _preserve_jump_query_causal_shape(
