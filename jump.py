@@ -1577,6 +1577,101 @@ def _jump_query_anchor_support(
     return has_preferred_phrase, concrete_tokens
 
 
+def _has_strong_jump_query_support_beyond_preferred_phrase(
+    candidate: str,
+    preferred_anchor_phrases: list[str],
+    blocked_tokens: set[str],
+) -> bool:
+    lowered_candidate = str(candidate or "").lower()
+    matched_anchor_phrase = _select_best_jump_anchor_phrase(
+        [
+            phrase
+            for phrase in preferred_anchor_phrases
+            if phrase and phrase in lowered_candidate
+        ]
+    )
+    matched_phrase_tokens = set(_tokenize_query_terms(matched_anchor_phrase))
+
+    extra_support_tokens = [
+        token
+        for token in _tokenize_query_terms(candidate)
+        if (
+            token not in matched_phrase_tokens
+            and token not in blocked_tokens
+            and token not in GENERIC_QUERY_TOKENS
+            and token not in WEAK_QUERY_TOKENS
+            and token not in OVERLOADED_JUMP_QUERY_TOKENS
+            and token not in JUMP_QUERY_FILLER_TOKENS
+            and (
+                _is_concrete_jump_query_token(token)
+                or _is_causal_jump_query_token(token)
+                or token in MECHANISM_QUERY_TOKENS
+                or token in JUMP_QUERY_CAUSAL_OUTCOME_HINTS
+            )
+        )
+    ]
+    clause_score = _score_jump_query_clause(candidate, blocked_tokens)
+    return (
+        len(extra_support_tokens) >= 2
+        and clause_score[1] >= 2
+        and clause_score[2] >= 3
+    )
+
+
+def _has_source_surface_jump_query_overhang(
+    candidate_tokens: list[str],
+    pattern: dict,
+    source_domain: str,
+    source_category: str,
+) -> bool:
+    blocked_tokens, _preferred_anchor_phrases, support_tokens = _jump_query_support_context(
+        pattern,
+        source_domain,
+        source_category,
+    )
+    support_token_set = set(support_tokens)
+    source_surface_tokens = {
+        token
+        for token in _tokenize_query_terms(str(pattern.get("search_query", "") or ""))
+        if (
+            token not in support_token_set
+            and token not in blocked_tokens
+            and token not in GENERIC_QUERY_TOKENS
+            and token not in WEAK_QUERY_TOKENS
+            and token not in OVERLOADED_JUMP_QUERY_TOKENS
+            and token not in MECHANISM_QUERY_TOKENS
+            and not _is_causal_jump_query_token(token)
+            and len(token) > 3
+        )
+    }
+    if not source_surface_tokens:
+        return False
+
+    surface_hit_count = sum(token in source_surface_tokens for token in candidate_tokens)
+    if surface_hit_count < 2:
+        return False
+
+    transferable_hit_count = sum(
+        1
+        for token in candidate_tokens
+        if (
+            token not in source_surface_tokens
+            and token not in blocked_tokens
+            and token not in GENERIC_QUERY_TOKENS
+            and token not in WEAK_QUERY_TOKENS
+            and token not in OVERLOADED_JUMP_QUERY_TOKENS
+            and token not in JUMP_QUERY_FILLER_TOKENS
+            and (
+                _is_concrete_jump_query_token(token)
+                or _is_causal_jump_query_token(token)
+                or token in MECHANISM_QUERY_TOKENS
+                or token in JUMP_QUERY_CAUSAL_OUTCOME_HINTS
+            )
+        )
+    )
+    return surface_hit_count > transferable_hit_count
+
+
 def _select_best_jump_anchor_phrase(preferred_anchor_phrases: list[str]) -> str:
     best_phrase = ""
     best_rank = (-1, -1, -1, -1)
@@ -2041,6 +2136,13 @@ def _is_acceptable_llm_jump_query(
         return False
     if _looks_like_formal_jump_query_token_soup(raw_candidate, candidate_tokens):
         return False
+    if _has_source_surface_jump_query_overhang(
+        candidate_tokens,
+        pattern,
+        source_domain,
+        source_category,
+    ):
+        return False
 
     strong_tokens = [
         token
@@ -2055,8 +2157,18 @@ def _is_acceptable_llm_jump_query(
 
     preferred_anchor_phrases = _preferred_jump_query_anchor_phrases(pattern, blocked_tokens)
     lowered_candidate = candidate.lower()
+    matched_preferred_anchor_phrase = any(
+        phrase in lowered_candidate for phrase in preferred_anchor_phrases
+    )
     if preferred_anchor_phrases:
-        if not any(phrase in lowered_candidate for phrase in preferred_anchor_phrases):
+        if matched_preferred_anchor_phrase:
+            if not _has_strong_jump_query_support_beyond_preferred_phrase(
+                candidate,
+                preferred_anchor_phrases,
+                blocked_tokens,
+            ):
+                return False
+        else:
             if _needs_jump_query_disambiguation(candidate, preferred_anchor_phrases):
                 return False
     elif _needs_jump_query_disambiguation(candidate, preferred_anchor_phrases):
@@ -2089,9 +2201,6 @@ def _is_acceptable_llm_jump_query(
         return False
 
     candidate_token_set = set(candidate_tokens)
-    if preferred_anchor_phrases:
-        return True
-
     if candidate_token_set.intersection(anchor_tokens):
         return True
 
@@ -2259,6 +2368,14 @@ def _build_jump_search_query_with_metadata(
             source_domain,
             source_category,
         )
+        if not _is_acceptable_llm_jump_query(
+            llm_query,
+            pattern,
+            source_domain,
+            source_category,
+            heuristic_query,
+        ):
+            llm_query = None
     return (
         llm_query or heuristic_query,
         heuristic_collision_guard_applied or llm_collision_guard_applied,
@@ -2270,12 +2387,15 @@ def _build_jump_search_queries(
     source_domain: str,
     source_category: str,
 ) -> list[str]:
+    raw_source_query = str(pattern.get("search_query", "") or "").strip()
+
     def _family_support_terms(*texts: str) -> list[str]:
         blocked_tokens, _preferred_anchor_phrases, _support_tokens = _jump_query_support_context(
             pattern,
             source_domain,
             source_category,
         )
+        support_token_set = set(_support_tokens)
         terms: list[str] = []
         seen_terms: set[str] = set()
         base_tokens = set(_tokenize_query_terms(base_query))
@@ -2307,11 +2427,40 @@ def _build_jump_search_queries(
                         _is_specific_jump_query_token(token)
                         or _is_causal_jump_query_token(token)
                     )
+                    or (
+                        clean_text == raw_source_query
+                        and token not in support_token_set
+                        and token not in MECHANISM_QUERY_TOKENS
+                        and not _is_causal_jump_query_token(token)
+                    )
                 ):
                     continue
                 seen_terms.add(token)
                 terms.append(token)
         return terms
+
+    def _needs_mechanism_family_support(current_query: str) -> bool:
+        blocked_tokens = set(_tokenize_query_terms(source_domain))
+        blocked_tokens.update(_tokenize_query_terms(source_category))
+        clause_score = _score_jump_query_clause(current_query, blocked_tokens)
+        concrete_tokens = [
+            token
+            for token in _tokenize_query_terms(current_query)
+            if (
+                token not in blocked_tokens
+                and token not in GENERIC_QUERY_TOKENS
+                and token not in WEAK_QUERY_TOKENS
+                and token not in OVERLOADED_JUMP_QUERY_TOKENS
+                and token not in JUMP_QUERY_FILLER_TOKENS
+                and (
+                    _is_concrete_jump_query_token(token)
+                    or _is_causal_jump_query_token(token)
+                    or token in MECHANISM_QUERY_TOKENS
+                    or token in JUMP_QUERY_CAUSAL_OUTCOME_HINTS
+                )
+            )
+        ]
+        return clause_score[1] < 2 or clause_score[2] < 3 or len(concrete_tokens) < 3
 
     def _build_family_variant(
         family_terms: list[str],
@@ -2373,6 +2522,15 @@ def _build_jump_search_queries(
         intervention_terms[0],
     )
     mechanism_query = base_query
+    if _needs_mechanism_family_support(base_query):
+        mechanism_query = _build_family_variant(
+            _family_support_terms(
+                str(pattern.get("abstract_structure", "") or ""),
+                str(pattern.get("pattern_name", "") or ""),
+                raw_source_query,
+            ),
+            ("mechanism",),
+        )
     intervention_query = _build_family_variant(
         _family_support_terms(
             str(pattern.get("control_lever", "") or ""),
