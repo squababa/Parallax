@@ -1124,10 +1124,12 @@ INTERVENTION_CONDITION_TOKENS = {
 }
 QUERY_PHRASE_STOPWORDS = {
     "a",
+    "after",
     "an",
     "and",
     "as",
     "at",
+    "before",
     "by",
     "for",
     "from",
@@ -1137,12 +1139,17 @@ QUERY_PHRASE_STOPWORDS = {
     "on",
     "or",
     "the",
+    "that",
+    "this",
     "to",
     "under",
     "until",
     "via",
+    "when",
     "where",
+    "which",
     "with",
+    "without",
 }
 
 JUMP_QUERY_CAUSAL_VERB_STEMS = (
@@ -1211,16 +1218,131 @@ JUMP_QUERY_FILLER_TOKENS = {
     "long",
     "most",
     "one",
+    "raise",
     "same",
     "term",
     "the",
     "toward",
+}
+JUMP_SOURCE_LEAKAGE_GENERIC_TOKENS = {
+    "declaration",
+    "event",
+    "initial",
+    "response",
+    "signal",
+    "state",
 }
 
 
 def _tokenize_query_terms(text: str) -> list[str]:
     """Extract lowercase query tokens while preserving hyphenated mechanism words."""
     return re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)?", (text or "").lower())
+
+
+def _jump_transferable_source_leakage_terms(
+    transferable_tokens: set[str],
+    grounded_source_tokens: set[str],
+) -> list[str]:
+    """Return only source-specific grounded overlap terms."""
+    return sorted(
+        token
+        for token in transferable_tokens.intersection(grounded_source_tokens)
+        if token not in GENERIC_QUERY_TOKENS
+        and token not in WEAK_QUERY_TOKENS
+        and token not in JUMP_QUERY_FILLER_TOKENS
+        and token not in QUERY_PHRASE_STOPWORDS
+        and not _is_generic_jump_grounded_source_token(token)
+        and len(token) > 2
+    )
+
+
+def _jump_exact_domain_blocker_tokens(*values: str) -> set[str]:
+    """Block exact one-token domain names without adding broad domain vocabulary."""
+    blockers: set[str] = set()
+    for value in values:
+        domain_tokens = _tokenize_query_terms(str(value or ""))
+        if len(domain_tokens) == 1:
+            blockers.add(domain_tokens[0])
+    return blockers
+
+
+def _is_generic_jump_grounded_source_token(token: str) -> bool:
+    """Filter broad mechanism/control terms using existing query vocab."""
+    candidate = str(token or "").strip().lower()
+    if not candidate:
+        return True
+    if (
+        candidate in AMBIGUOUS_JUMP_QUERY_TOKENS
+        or candidate in JUMP_SOURCE_LEAKAGE_GENERIC_TOKENS
+    ):
+        return True
+    broad_terms = (
+        tuple(MECHANISM_QUERY_TOKENS)
+        + tuple(INTERVENTION_CONDITION_TOKENS)
+        + INTERVENTION_CONTROL_MARKERS
+        + INTERVENTION_RESPONSE_MARKERS
+        + JUMP_QUERY_CAUSAL_VERB_STEMS
+    )
+    for term in broad_terms:
+        term_token = str(term or "").strip().lower()
+        if len(term_token) < 4:
+            continue
+        if candidate == term_token:
+            return True
+        if len(term_token) >= 6 and candidate.startswith(term_token[:6]):
+            return True
+    return False
+
+
+def _jump_grounded_source_tokens(grounded: dict) -> set[str]:
+    """Derive a bounded source-specific term bag from grounded source fields only."""
+    return {
+        token
+        for token in _tokenize_query_terms(str(grounded.get("source_control", "") or ""))
+        + _tokenize_query_terms(str(grounded.get("source_metric", "") or ""))
+        if token not in GENERIC_QUERY_TOKENS
+        and token not in WEAK_QUERY_TOKENS
+        and token not in JUMP_QUERY_FILLER_TOKENS
+        and token not in QUERY_PHRASE_STOPWORDS
+        and not _is_generic_jump_grounded_source_token(token)
+        and len(token) > 2
+    }
+
+
+def _jump_source_shaped_terms(candidate_text: str, pattern: dict) -> list[str]:
+    """Return overlap terms showing transferable text still mirrors source-native labels."""
+    candidate_tokens = {
+        token
+        for token in _tokenize_query_terms(candidate_text)
+        if token not in GENERIC_QUERY_TOKENS
+        and token not in WEAK_QUERY_TOKENS
+        and token not in JUMP_QUERY_FILLER_TOKENS
+        and token not in QUERY_PHRASE_STOPWORDS
+        and token not in OVERLOADED_JUMP_QUERY_TOKENS
+        and not _is_generic_jump_grounded_source_token(token)
+        and len(token) > 2
+    }
+    source_tokens = {
+        token
+        for token in _tokenize_query_terms(
+            " ".join(
+                [
+                    str(pattern.get("pattern_name", "") or ""),
+                    str(pattern.get("search_query", "") or ""),
+                    str(pattern.get("measurable_signal", "") or ""),
+                    str(pattern.get("control_lever", "") or ""),
+                ]
+            )
+        )
+        if token not in GENERIC_QUERY_TOKENS
+        and token not in WEAK_QUERY_TOKENS
+        and token not in JUMP_QUERY_FILLER_TOKENS
+        and token not in QUERY_PHRASE_STOPWORDS
+        and token not in OVERLOADED_JUMP_QUERY_TOKENS
+        and not _is_generic_jump_grounded_source_token(token)
+        and len(token) > 2
+    }
+    return sorted(candidate_tokens.intersection(source_tokens))
 
 
 def _is_specific_jump_query_token(token: str) -> bool:
@@ -1407,10 +1529,11 @@ def _jump_transferable_query_profile(
     else:
         backfilled_fields = []
     backfilled_field_set = set(backfilled_fields)
-    grounded_tokens = set(_tokenize_query_terms(str(grounded.get("source_control", "") or "")))
-    grounded_tokens.update(_tokenize_query_terms(str(grounded.get("source_metric", "") or "")))
-    grounded_tokens.update(_tokenize_query_terms(source_domain))
-    grounded_tokens.update(_tokenize_query_terms(source_category))
+    grounded_source_tokens = _jump_grounded_source_tokens(grounded)
+    domain_blocker_tokens = _jump_exact_domain_blocker_tokens(
+        source_domain,
+        source_category,
+    )
     field_token_sets: dict[str, set[str]] = {}
     concerns: list[str] = []
     for field_name, text in fields.items():
@@ -1428,7 +1551,10 @@ def _jump_transferable_query_profile(
         field_token_sets[field_name] = token_set
         if field_name in backfilled_field_set:
             continue
-        clause_score = _score_jump_query_clause(text, grounded_tokens)
+        clause_score = _score_jump_query_clause(
+            text,
+            grounded_source_tokens.union(domain_blocker_tokens),
+        )
         if len(token_set) < 2 or clause_score[1] < 1 or clause_score[2] < 2:
             concerns.append(f"{field_name}_too_generic")
 
@@ -1438,12 +1564,34 @@ def _jump_transferable_query_profile(
         if field_name not in backfilled_field_set
     ]
     source_leakage_terms = sorted(
-        set().union(*native_field_token_sets).intersection(grounded_tokens)
+            _jump_transferable_source_leakage_terms(
+                set().union(*native_field_token_sets),
+                grounded_source_tokens,
+            )
         if native_field_token_sets
-        else set()
+        else []
     )
     if source_leakage_terms:
         concerns.append("transferable_source_leakage")
+    has_transferable_fields = any(fields.values())
+    has_native_transferable_fields = any(
+        text and field_name not in backfilled_field_set
+        for field_name, text in fields.items()
+    )
+    source_shape_terms = (
+        _jump_source_shaped_terms(
+            " ".join(
+                fields[field_name]
+                for field_name in fields
+                if field_name not in backfilled_field_set
+            ),
+            pattern,
+        )
+        if has_native_transferable_fields
+        else []
+    )
+    if len(source_shape_terms) >= 2:
+        concerns.append("transferable_source_shaped")
 
     overlap_pairs: list[str] = []
     for left_name, right_name in (
@@ -1467,11 +1615,6 @@ def _jump_transferable_query_profile(
     if overlap_pairs:
         concerns.append("transferable_field_overlap")
 
-    has_transferable_fields = any(fields.values())
-    has_native_transferable_fields = any(
-        text and field_name not in backfilled_field_set
-        for field_name, text in fields.items()
-    )
     blocking_concerns = {
         "transferable_source_leakage",
         "transferable_field_overlap",
@@ -1487,6 +1630,7 @@ def _jump_transferable_query_profile(
         "has_transferable_fields": has_transferable_fields,
         "concerns": concerns[:4],
         "source_leakage_terms": source_leakage_terms[:4],
+        "source_shape_terms": source_shape_terms[:4],
         "overlap_pairs": overlap_pairs[:3],
         "fields": fields,
     }
@@ -6851,6 +6995,9 @@ def lateral_jump_with_diagnostics(
         "built_jump_queries": [],
         "built_jump_query_labels": [],
         "transferable_query_profile": {},
+        "transferable_fallback_gate_blocked": False,
+        "transferable_used_but_source_shaped": False,
+        "transferable_used_source_shape_terms": [],
         "query_collision_guard_applied": False,
         "result_count": 0,
         "general_result_count": 0,
@@ -6915,6 +7062,14 @@ def lateral_jump_with_diagnostics(
     diagnostic["built_jump_query"] = query
     diagnostic["built_jump_queries"] = queries
     diagnostic["built_jump_query_labels"] = query_labels[: len(queries)]
+    source_shape_terms = _jump_source_shaped_terms(query, pattern)
+    diagnostic["transferable_fallback_gate_blocked"] = not bool(
+        diagnostic["transferable_query_profile"].get("usable")
+    )
+    diagnostic["transferable_used_but_source_shaped"] = bool(
+        diagnostic["transferable_query_profile"].get("usable")
+    ) and len(source_shape_terms) >= 2
+    diagnostic["transferable_used_source_shape_terms"] = source_shape_terms[:4]
     if not query:
         diagnostic["stage1_outcome"] = "no_results"
         diagnostic["stage1_failure_hint"] = "empty_jump_query"

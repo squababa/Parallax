@@ -53,6 +53,28 @@ def temp_db(monkeypatch, tmp_path):
     return db_path
 
 
+def test_extract_prompt_requires_domain_neutral_transferable_rewrites() -> None:
+    assert (
+        "transferable.mechanism should describe only the functional causal relation"
+        in explore.EXTRACT_PROMPT
+    )
+    assert "additive increase multiplicative decrease" in explore.EXTRACT_PROMPT
+    assert (
+        "gradual linear ramp-up interrupted by proportional rollback after threshold breach"
+        in explore.EXTRACT_PROMPT
+    )
+    assert "TCP retry timeout" in explore.EXTRACT_PROMPT
+    assert (
+        "geometrically expanding wait intervals capped by a finite retry ceiling"
+        in explore.EXTRACT_PROMPT
+    )
+    assert "nociceptive inhibitory gating" in explore.EXTRACT_PROMPT
+    assert (
+        "sustained suppressive bias that shifts a downstream activation threshold"
+        in explore.EXTRACT_PROMPT
+    )
+
+
 def test_profile_pattern_quality_prefers_operational_mechanism() -> None:
     seed = {"name": "Network Protocols", "category": "Technology"}
     strong = explore._profile_pattern_quality(
@@ -156,6 +178,128 @@ def test_profile_transferable_pattern_quality_flags_generic_leakage_and_overlap(
     assert any("too_generic" in concern for concern in profile["concerns"])
     assert "transferable_source_leakage" in profile["concerns"]
     assert "transferable_field_overlap" in profile["concerns"]
+
+
+def test_profile_transferable_pattern_quality_ignores_portable_mechanism_overlap() -> None:
+    profile = explore._profile_transferable_pattern_quality(
+        explore._normalize_pattern_schema(
+            {
+                "pattern_name": "Inhibitory gate stabilization",
+                "description": "An inhibitory gate suppresses runaway activation before spikes cascade.",
+                "abstract_structure": "A transferable inhibitory gate limits activation before a threshold cascade.",
+                "search_query": "inhibitory gate threshold cascade suppression",
+                "measurable_signal": "dorsal horn nociceptor firing rate",
+                "control_lever": "raise dorsal horn inhibitory gate threshold",
+                "transferable": {
+                    "mechanism": "an inhibitory gate suppresses activation before that threshold cascade",
+                    "control_logic": "raise the inhibitory gate threshold before runaway activation",
+                    "signal_shape": "activation accumulates until a threshold then suppression dampens cascade",
+                },
+                "grounded": {
+                    "source_control": "raise dorsal horn inhibitory gate threshold",
+                    "source_metric": "dorsal horn nociceptor c-fiber firing rate",
+                },
+            }
+        ),
+        {"name": "Dorsal Horn Nociceptor Gating", "category": "Neuroscience"},
+    )
+
+    assert "transferable_source_leakage" not in profile["concerns"]
+    assert profile["source_overlap_terms"] == []
+
+
+def test_profile_transferable_pattern_quality_ignores_broad_seed_domain_vocab() -> None:
+    profile = explore._profile_transferable_pattern_quality(
+        explore._normalize_pattern_schema(
+            {
+                "pattern_name": "Seismic envelope drift",
+                "description": "A broad wave envelope drifts when local phase offsets accumulate.",
+                "abstract_structure": "Amplitude and distance cues interact with angle shifts before a localized correction burst.",
+                "search_query": "amplitude distance angle correction",
+                "measurable_signal": "P-wave pick residual and travel-time jitter",
+                "control_lever": "calibrate station azimuth and clock offset",
+                "transferable": {
+                    "mechanism": "amplitude distance coupling concentrates angle shifts into localized phase drift",
+                    "control_logic": "counter misalignment with high-frequency gating before phase drift spreads",
+                    "signal_shape": "density-normalized residuals widen gradually before a sharp correction burst",
+                },
+                "grounded": {
+                    "source_control": "calibrate station azimuth and clock offset",
+                    "source_metric": "P-wave pick residual and travel-time jitter",
+                },
+            }
+        ),
+        {
+            "name": (
+                "Amplitude Distance Angle Density Misalignment High-Frequency "
+                "Seismology"
+            ),
+            "category": "Seismology",
+        },
+    )
+
+    assert profile["usable"] is True
+    assert "transferable_source_leakage" not in profile["concerns"]
+    assert profile["source_overlap_terms"] == []
+
+
+def test_profile_transferable_pattern_quality_flags_true_source_noun_leakage() -> None:
+    profile = explore._profile_transferable_pattern_quality(
+        explore._normalize_pattern_schema(
+            {
+                "pattern_name": "Inhibitory gate stabilization",
+                "description": "A spinal control pattern limits runaway nociceptor activation.",
+                "abstract_structure": "A transferable inhibitory gate limits activation before a threshold cascade.",
+                "search_query": "inhibitory gate threshold cascade suppression",
+                "measurable_signal": "dorsal horn nociceptor firing rate",
+                "control_lever": "raise dorsal horn inhibitory gate threshold",
+                "transferable": {
+                    "mechanism": "dorsal horn nociceptor activation crosses a c-fiber threshold",
+                    "control_logic": "raise the inhibitory gate threshold",
+                    "signal_shape": "activation accumulates until a threshold then suppression dampens cascade",
+                },
+                "grounded": {
+                    "source_control": "raise dorsal horn inhibitory gate threshold",
+                    "source_metric": "dorsal horn nociceptor c-fiber firing rate",
+                },
+            }
+        ),
+        {"name": "Dorsal Horn Nociceptor Gating", "category": "Neuroscience"},
+    )
+
+    assert "transferable_source_leakage" in profile["concerns"]
+    assert {"c-fiber", "dorsal", "horn", "nociceptor"}.intersection(
+        profile["source_overlap_terms"]
+    )
+
+
+def test_profile_transferable_pattern_quality_marks_source_shaped_transferable_without_blocking() -> None:
+    profile = explore._profile_transferable_pattern_quality(
+        explore._normalize_pattern_schema(
+            {
+                "pattern_name": "Additive increase multiplicative decrease",
+                "description": "Sender updates grow gradually and then shrink proportionally after congestion.",
+                "abstract_structure": "A control variable ramps upward until overload feedback triggers proportional rollback.",
+                "search_query": "additive increase multiplicative decrease",
+                "measurable_signal": "window growth slope and rollback ratio",
+                "control_lever": "tune additive step and multiplicative decrease factor",
+                "transferable": {
+                    "mechanism": "additive increase continues until multiplicative decrease follows overload",
+                    "control_logic": "shift ramp slope and rollback ratio after overload",
+                    "signal_shape": "linear climb punctuated by proportional rollback drops",
+                },
+                "grounded": {
+                    "source_control": "retune sender pacing gain",
+                    "source_metric": "ack delay and retransmission count",
+                },
+            }
+        ),
+        {"name": "TCP congestion control", "category": "Networking"},
+    )
+
+    assert profile["usable"] is True
+    assert "transferable_source_shaped" in profile["concerns"]
+    assert {"additive", "multiplicative"}.intersection(profile["source_shape_terms"])
 
 
 def test_build_jump_search_query_replaces_weak_feedback_style_terms() -> None:
@@ -1094,6 +1238,74 @@ def test_jump_transferable_query_profile_rejects_source_leaky_transferable_field
     assert "permeability" in profile["source_leakage_terms"]
 
 
+def test_jump_transferable_query_profile_ignores_portable_mechanism_and_connector_overlap() -> None:
+    profile = jump._jump_transferable_query_profile(
+        {
+            "transferable": {
+                "mechanism": "that inhibitory gate suppresses activation before threshold cascade",
+                "control_logic": "raise inhibitory gating threshold before runaway activation",
+                "signal_shape": "activation accumulates before suppression dampens cascade",
+                "_backfilled_fields": [],
+            },
+            "grounded": {
+                "source_control": "raise dorsal horn inhibitory gate threshold",
+                "source_metric": "dorsal horn nociceptor firing before cascade",
+            },
+        },
+        "Dorsal Horn",
+        "Neuroscience",
+    )
+
+    assert profile["usable"] is True
+    assert "transferable_source_leakage" not in profile["concerns"]
+    assert profile["source_leakage_terms"] == []
+
+
+def test_jump_transferable_query_profile_ignores_broad_source_domain_vocab_and_stays_usable() -> None:
+    profile = jump._jump_transferable_query_profile(
+        {
+            "transferable": {
+                "mechanism": "amplitude distance coupling concentrates angle shifts into localized phase drift",
+                "control_logic": "counter misalignment with high-frequency gating before phase drift spreads",
+                "signal_shape": "density-normalized amplitude rises toward high-frequency saturation bursts",
+                "_backfilled_fields": [],
+            },
+            "grounded": {
+                "source_control": "calibrate station azimuth and clock offset",
+                "source_metric": "P-wave pick residual and travel-time jitter",
+            },
+        },
+        "Amplitude Distance Angle Density Misalignment High-Frequency",
+        "Seismology",
+    )
+
+    assert profile["usable"] is True
+    assert "transferable_source_leakage" not in profile["concerns"]
+    assert profile["source_leakage_terms"] == []
+
+
+def test_jump_transferable_query_profile_ignores_broad_lifecycle_words_as_source_leakage() -> None:
+    profile = jump._jump_transferable_query_profile(
+        {
+            "transferable": {
+                "mechanism": "initial declaration signal routes delayed updates around a narrow handoff",
+                "control_logic": "delay the declaration event until response state stabilizes",
+                "signal_shape": "response state drift stabilizes through delayed handoff routing",
+                "_backfilled_fields": [],
+            },
+            "grounded": {
+                "source_control": "delay initial declaration event after response state check",
+                "source_metric": "initial signal response state declaration event count",
+            },
+        },
+        "Event Protocols",
+        "Software",
+    )
+
+    assert "transferable_source_leakage" not in profile["concerns"]
+    assert profile["source_leakage_terms"] == []
+
+
 def test_jump_transferable_query_profile_rejects_overlap_collapsed_fields() -> None:
     profile = jump._jump_transferable_query_profile(
         {
@@ -1113,6 +1325,62 @@ def test_jump_transferable_query_profile_rejects_overlap_collapsed_fields() -> N
 
     assert profile["usable"] is False
     assert "transferable_field_overlap" in profile["concerns"]
+
+
+def test_build_jump_search_queries_falls_back_on_true_source_specific_transferable_leakage(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(jump, "_generate_llm_jump_search_query", lambda *_args, **_kwargs: None)
+
+    pattern = {
+        "pattern_name": "Inhibitory gate stabilization",
+        "description": "A spinal control pattern limits runaway nociceptor activation.",
+        "abstract_structure": "Generic inhibition limits runaway activation before a threshold cascade.",
+        "search_query": "inhibitory gate threshold cascade suppression",
+        "measurable_signal": "dorsal horn nociceptor firing rate",
+        "control_lever": "raise dorsal horn inhibitory gate threshold",
+        "transfer_rationale": "",
+        "transferable": {
+            "mechanism": "dorsal horn nociceptor activation crosses a c-fiber threshold",
+            "control_logic": "raise inhibitory gate threshold before runaway activation",
+            "signal_shape": "activation accumulates before suppression dampens cascade",
+            "_backfilled_fields": [],
+        },
+        "grounded": {
+            "source_control": "raise dorsal horn inhibitory gate threshold",
+            "source_metric": "dorsal horn nociceptor c-fiber firing rate",
+        },
+    }
+
+    queries = jump._build_jump_search_queries(
+        pattern,
+        "Dorsal Horn",
+        "Neuroscience",
+    )
+
+    assert jump._build_jump_search_queries.last_transferable_query_profile["usable"] is False
+    assert (
+        "transferable_source_leakage"
+        in jump._build_jump_search_queries.last_transferable_query_profile["concerns"]
+    )
+    assert "c-fiber" in jump._build_jump_search_queries.last_transferable_query_profile[
+        "source_leakage_terms"
+    ]
+    assert "nociceptor" in jump._build_jump_search_queries.last_transferable_query_profile[
+        "source_leakage_terms"
+    ]
+    assert queries[0] == jump._build_jump_search_query(
+        {
+            "pattern_name": "Inhibitory gate stabilization",
+            "abstract_structure": "Generic inhibition limits runaway activation before a threshold cascade.",
+            "search_query": "inhibitory gate threshold cascade suppression",
+            "measurable_signal": "dorsal horn nociceptor firing rate",
+            "control_lever": "raise dorsal horn inhibitory gate threshold",
+            "transfer_rationale": "",
+        },
+        "Dorsal Horn",
+        "Neuroscience",
+    )
 
 
 def test_lateral_jump_with_diagnostics_academic_lane_uses_improved_base_query(
@@ -1293,6 +1561,8 @@ def test_lateral_jump_with_diagnostics_records_legacy_and_transferable_query_spi
     assert diagnostic["transferable_query_profile"]["backfilled_fields"] == []
     assert diagnostic["transferable_query_profile"]["usable"] is True
     assert diagnostic["transferable_query_profile"]["concerns"] == []
+    assert diagnostic["transferable_fallback_gate_blocked"] is False
+    assert diagnostic["transferable_used_but_source_shaped"] is False
 
 
 def test_lateral_jump_with_diagnostics_reports_preserved_natural_language_built_queries(
@@ -1387,6 +1657,73 @@ def test_lateral_jump_with_diagnostics_reports_preserved_natural_language_built_
         ),
     ]
     assert stage_inputs["stage1"] == stage_inputs["stage2"]
+
+
+def test_lateral_jump_with_diagnostics_distinguishes_transferable_fallback_gate_blocked(
+    monkeypatch,
+) -> None:
+    def fake_build_jump_search_queries(*_args, **_kwargs):
+        return ["threshold cascade fallback query"]
+
+    fake_build_jump_search_queries.last_collision_guard_applied = False
+    fake_build_jump_search_queries.last_legacy_query = "threshold cascade fallback query"
+    fake_build_jump_search_queries.last_transferable_query_profile = {
+        "usable": False,
+        "concerns": ["transferable_source_leakage"],
+    }
+    fake_build_jump_search_queries.last_query_labels = ["base"]
+
+    monkeypatch.setattr(jump, "_build_jump_search_queries", fake_build_jump_search_queries)
+    monkeypatch.setattr(jump._tavily, "search", lambda **_kwargs: {"results": []})
+
+    _connection, diagnostic = jump.lateral_jump_with_diagnostics(
+        {
+            "pattern_name": "Inhibitory gate stabilization",
+            "abstract_structure": "Generic inhibition limits runaway activation before threshold cascade.",
+            "search_query": "inhibitory gate threshold cascade suppression",
+        },
+        "Dorsal Horn",
+        "Neuroscience",
+    )
+
+    assert diagnostic["transferable_fallback_gate_blocked"] is True
+    assert diagnostic["transferable_used_but_source_shaped"] is False
+
+
+def test_lateral_jump_with_diagnostics_marks_transferable_used_but_source_shaped(
+    monkeypatch,
+) -> None:
+    def fake_build_jump_search_queries(*_args, **_kwargs):
+        return ["additive increase multiplicative decrease rollback"]
+
+    fake_build_jump_search_queries.last_collision_guard_applied = False
+    fake_build_jump_search_queries.last_legacy_query = "additive increase multiplicative decrease"
+    fake_build_jump_search_queries.last_transferable_query_profile = {
+        "usable": True,
+        "concerns": ["transferable_source_shaped"],
+    }
+    fake_build_jump_search_queries.last_query_labels = ["mechanism-family"]
+
+    monkeypatch.setattr(jump, "_build_jump_search_queries", fake_build_jump_search_queries)
+    monkeypatch.setattr(jump._tavily, "search", lambda **_kwargs: {"results": []})
+
+    _connection, diagnostic = jump.lateral_jump_with_diagnostics(
+        {
+            "pattern_name": "Additive increase multiplicative decrease",
+            "abstract_structure": "A sender ramps transmission upward before proportional rollback.",
+            "search_query": "additive increase multiplicative decrease",
+            "measurable_signal": "window slope and rollback depth",
+            "control_lever": "tune additive increase step and multiplicative decrease factor",
+        },
+        "TCP Congestion Control",
+        "Networking",
+    )
+
+    assert diagnostic["transferable_fallback_gate_blocked"] is False
+    assert diagnostic["transferable_used_but_source_shaped"] is True
+    assert {"additive", "multiplicative"}.intersection(
+        diagnostic["transferable_used_source_shape_terms"]
+    )
 
 
 def test_lateral_jump_with_diagnostics_attempts_one_alternate_retrieval_for_adjacent_first_packet(
