@@ -379,6 +379,8 @@ PATTERN_GROUNDED_FIELDS = (
 PATTERN_ANCHOR_STOPWORDS = {
     "across",
     "against",
+    "after",
+    "before",
     "because",
     "control",
     "controls",
@@ -401,10 +403,40 @@ PATTERN_ANCHOR_STOPWORDS = {
     "sources",
     "system",
     "systems",
+    "that",
+    "this",
     "through",
     "using",
+    "when",
     "where",
+    "which",
+    "with",
+    "without",
     "within",
+}
+PATTERN_PORTABLE_TRANSFERABLE_LEAKAGE_TERMS = {
+    "activation",
+    "accumulate",
+    "accumulation",
+    "bias",
+    "cascade",
+    "dampen",
+    "damping",
+    "feedback",
+    "gate",
+    "gating",
+    "inhibit",
+    "inhibition",
+    "inhibitory",
+    "oscillate",
+    "oscillation",
+    "raise",
+    "relay",
+    "saturate",
+    "saturation",
+    "suppression",
+    "suppressive",
+    "threshold",
 }
 
 
@@ -490,6 +522,21 @@ def _pattern_source_tokens(seed: dict) -> set[str]:
     return blocked
 
 
+def _transferable_source_leakage_terms(
+    transferable_tokens: set[str],
+    source_tokens: set[str],
+) -> list[str]:
+    """Return only source-specific overlap terms, not portable mechanism words."""
+    return sorted(
+        token
+        for token in transferable_tokens.intersection(source_tokens)
+        if token not in PATTERN_ANCHOR_STOPWORDS
+        and token not in PATTERN_GENERIC_TERMS
+        and token not in PATTERN_PORTABLE_TRANSFERABLE_LEAKAGE_TERMS
+        and len(token) >= 4
+    )
+
+
 def _is_low_signal_pattern(pattern: dict) -> bool:
     """Reject obviously generic patterns that are unlikely to help jump/search."""
     name = _normalize_text(pattern.get("pattern_name")).lower()
@@ -548,7 +595,10 @@ def _profile_transferable_pattern_quality(pattern: dict, seed: dict) -> dict:
         concerns.append("transferable_fields_too_generic")
 
     transferable_tokens = set().union(*field_tokens.values()) if field_tokens else set()
-    leakage_terms = sorted(transferable_tokens.intersection(source_tokens))
+    leakage_terms = _transferable_source_leakage_terms(
+        transferable_tokens,
+        source_tokens,
+    )
     if leakage_terms:
         concerns.append("transferable_source_leakage")
 

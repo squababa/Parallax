@@ -158,6 +158,62 @@ def test_profile_transferable_pattern_quality_flags_generic_leakage_and_overlap(
     assert "transferable_field_overlap" in profile["concerns"]
 
 
+def test_profile_transferable_pattern_quality_ignores_portable_mechanism_overlap() -> None:
+    profile = explore._profile_transferable_pattern_quality(
+        explore._normalize_pattern_schema(
+            {
+                "pattern_name": "Inhibitory gate stabilization",
+                "description": "An inhibitory gate suppresses runaway activation before spikes cascade.",
+                "abstract_structure": "A transferable inhibitory gate limits activation before a threshold cascade.",
+                "search_query": "inhibitory gate threshold cascade suppression",
+                "measurable_signal": "dorsal horn nociceptor firing rate",
+                "control_lever": "raise dorsal horn inhibitory gate threshold",
+                "transferable": {
+                    "mechanism": "an inhibitory gate suppresses activation before that threshold cascade",
+                    "control_logic": "raise the inhibitory gate threshold before runaway activation",
+                    "signal_shape": "activation accumulates until a threshold then suppression dampens cascade",
+                },
+                "grounded": {
+                    "source_control": "raise dorsal horn inhibitory gate threshold",
+                    "source_metric": "dorsal horn nociceptor c-fiber firing rate",
+                },
+            }
+        ),
+        {"name": "Dorsal Horn Nociceptor Gating", "category": "Neuroscience"},
+    )
+
+    assert "transferable_source_leakage" not in profile["concerns"]
+    assert profile["source_overlap_terms"] == []
+
+
+def test_profile_transferable_pattern_quality_flags_true_source_noun_leakage() -> None:
+    profile = explore._profile_transferable_pattern_quality(
+        explore._normalize_pattern_schema(
+            {
+                "pattern_name": "Inhibitory gate stabilization",
+                "description": "A spinal control pattern limits runaway nociceptor activation.",
+                "abstract_structure": "A transferable inhibitory gate limits activation before a threshold cascade.",
+                "search_query": "inhibitory gate threshold cascade suppression",
+                "measurable_signal": "dorsal horn nociceptor firing rate",
+                "control_lever": "raise dorsal horn inhibitory gate threshold",
+                "transferable": {
+                    "mechanism": "dorsal horn nociceptor activation crosses a c-fiber threshold",
+                    "control_logic": "raise the inhibitory gate threshold",
+                    "signal_shape": "activation accumulates until a threshold then suppression dampens cascade",
+                },
+                "grounded": {
+                    "source_control": "raise dorsal horn inhibitory gate threshold",
+                    "source_metric": "dorsal horn nociceptor c-fiber firing rate",
+                },
+            }
+        ),
+        {"name": "Dorsal Horn Nociceptor Gating", "category": "Neuroscience"},
+    )
+
+    assert "transferable_source_leakage" in profile["concerns"]
+    assert {"dorsal", "nociceptor"}.intersection(profile["source_overlap_terms"])
+
+
 def test_build_jump_search_query_replaces_weak_feedback_style_terms() -> None:
     raw_query = "deficiency threshold triggered directed recruitment feedback"
     query = jump._build_jump_search_query(
@@ -1094,6 +1150,29 @@ def test_jump_transferable_query_profile_rejects_source_leaky_transferable_field
     assert "permeability" in profile["source_leakage_terms"]
 
 
+def test_jump_transferable_query_profile_ignores_portable_mechanism_and_connector_overlap() -> None:
+    profile = jump._jump_transferable_query_profile(
+        {
+            "transferable": {
+                "mechanism": "that inhibitory gate suppresses activation before threshold cascade",
+                "control_logic": "raise inhibitory gating threshold before runaway activation",
+                "signal_shape": "activation accumulates before suppression dampens cascade",
+                "_backfilled_fields": [],
+            },
+            "grounded": {
+                "source_control": "raise dorsal horn inhibitory gate threshold",
+                "source_metric": "dorsal horn nociceptor firing before cascade",
+            },
+        },
+        "Dorsal Horn",
+        "Neuroscience",
+    )
+
+    assert profile["usable"] is True
+    assert "transferable_source_leakage" not in profile["concerns"]
+    assert profile["source_leakage_terms"] == []
+
+
 def test_jump_transferable_query_profile_rejects_overlap_collapsed_fields() -> None:
     profile = jump._jump_transferable_query_profile(
         {
@@ -1113,6 +1192,59 @@ def test_jump_transferable_query_profile_rejects_overlap_collapsed_fields() -> N
 
     assert profile["usable"] is False
     assert "transferable_field_overlap" in profile["concerns"]
+
+
+def test_build_jump_search_queries_falls_back_on_true_source_specific_transferable_leakage(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(jump, "_generate_llm_jump_search_query", lambda *_args, **_kwargs: None)
+
+    pattern = {
+        "pattern_name": "Inhibitory gate stabilization",
+        "description": "A spinal control pattern limits runaway nociceptor activation.",
+        "abstract_structure": "Generic inhibition limits runaway activation before a threshold cascade.",
+        "search_query": "inhibitory gate threshold cascade suppression",
+        "measurable_signal": "dorsal horn nociceptor firing rate",
+        "control_lever": "raise dorsal horn inhibitory gate threshold",
+        "transfer_rationale": "",
+        "transferable": {
+            "mechanism": "dorsal horn nociceptor activation crosses a c-fiber threshold",
+            "control_logic": "raise inhibitory gate threshold before runaway activation",
+            "signal_shape": "activation accumulates before suppression dampens cascade",
+            "_backfilled_fields": [],
+        },
+        "grounded": {
+            "source_control": "raise dorsal horn inhibitory gate threshold",
+            "source_metric": "dorsal horn nociceptor c-fiber firing rate",
+        },
+    }
+
+    queries = jump._build_jump_search_queries(
+        pattern,
+        "Dorsal Horn",
+        "Neuroscience",
+    )
+
+    assert jump._build_jump_search_queries.last_transferable_query_profile["usable"] is False
+    assert (
+        "transferable_source_leakage"
+        in jump._build_jump_search_queries.last_transferable_query_profile["concerns"]
+    )
+    assert "nociceptor" in jump._build_jump_search_queries.last_transferable_query_profile[
+        "source_leakage_terms"
+    ]
+    assert queries[0] == jump._build_jump_search_query(
+        {
+            "pattern_name": "Inhibitory gate stabilization",
+            "abstract_structure": "Generic inhibition limits runaway activation before a threshold cascade.",
+            "search_query": "inhibitory gate threshold cascade suppression",
+            "measurable_signal": "dorsal horn nociceptor firing rate",
+            "control_lever": "raise dorsal horn inhibitory gate threshold",
+            "transfer_rationale": "",
+        },
+        "Dorsal Horn",
+        "Neuroscience",
+    )
 
 
 def test_lateral_jump_with_diagnostics_academic_lane_uses_improved_base_query(

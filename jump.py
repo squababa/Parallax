@@ -1124,10 +1124,12 @@ INTERVENTION_CONDITION_TOKENS = {
 }
 QUERY_PHRASE_STOPWORDS = {
     "a",
+    "after",
     "an",
     "and",
     "as",
     "at",
+    "before",
     "by",
     "for",
     "from",
@@ -1137,12 +1139,17 @@ QUERY_PHRASE_STOPWORDS = {
     "on",
     "or",
     "the",
+    "that",
+    "this",
     "to",
     "under",
     "until",
     "via",
+    "when",
     "where",
+    "which",
     "with",
+    "without",
 }
 
 JUMP_QUERY_CAUSAL_VERB_STEMS = (
@@ -1216,11 +1223,52 @@ JUMP_QUERY_FILLER_TOKENS = {
     "the",
     "toward",
 }
+JUMP_PORTABLE_TRANSFERABLE_LEAKAGE_TOKENS = {
+    "activation",
+    "accumulate",
+    "accumulation",
+    "bias",
+    "cascade",
+    "dampen",
+    "damping",
+    "feedback",
+    "gate",
+    "gating",
+    "inhibit",
+    "inhibition",
+    "inhibitory",
+    "oscillate",
+    "oscillation",
+    "raise",
+    "relay",
+    "saturate",
+    "saturation",
+    "suppression",
+    "suppressive",
+    "threshold",
+}
 
 
 def _tokenize_query_terms(text: str) -> list[str]:
     """Extract lowercase query tokens while preserving hyphenated mechanism words."""
     return re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)?", (text or "").lower())
+
+
+def _jump_transferable_source_leakage_terms(
+    transferable_tokens: set[str],
+    grounded_tokens: set[str],
+) -> list[str]:
+    """Return only source-specific grounded overlap terms."""
+    return sorted(
+        token
+        for token in transferable_tokens.intersection(grounded_tokens)
+        if token not in GENERIC_QUERY_TOKENS
+        and token not in WEAK_QUERY_TOKENS
+        and token not in JUMP_QUERY_FILLER_TOKENS
+        and token not in QUERY_PHRASE_STOPWORDS
+        and token not in JUMP_PORTABLE_TRANSFERABLE_LEAKAGE_TOKENS
+        and len(token) > 2
+    )
 
 
 def _is_specific_jump_query_token(token: str) -> bool:
@@ -1438,9 +1486,12 @@ def _jump_transferable_query_profile(
         if field_name not in backfilled_field_set
     ]
     source_leakage_terms = sorted(
-        set().union(*native_field_token_sets).intersection(grounded_tokens)
+        _jump_transferable_source_leakage_terms(
+            set().union(*native_field_token_sets),
+            grounded_tokens,
+        )
         if native_field_token_sets
-        else set()
+        else []
     )
     if source_leakage_terms:
         concerns.append("transferable_source_leakage")
