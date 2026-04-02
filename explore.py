@@ -165,6 +165,11 @@ Rules:
 - measurable_signal should name one metric, threshold, rate, count, error mode, load measure, or state variable that a target-domain operator could plausibly check.
 - control_lever should name one concrete operator action, tuning knob, gating rule, scheduling choice, routing decision, filter, or intervention implied by the mechanism.
 - transfer_rationale should say why the process shape can transfer across domains without reverting to domain-specific nouns.
+- transferable.mechanism should restate the domain-neutral causal/process structure with no source implementation nouns.
+- transferable.control_logic should state the domain-neutral intervention/control principle, not the source implementation.
+- transferable.signal_shape should state the abstract trajectory/topology of the signal (for example, monotonic rise to threshold collapse), not the source metric name.
+- grounded.source_control should preserve source-domain implementation details for downstream reporting.
+- grounded.source_metric should preserve source-domain metric wording for downstream reporting.
 - Reject patterns that collapse to generic statements like "systems adapt to change", "multiple forces interact", or "local averaging occurs".
 - Exclude patterns that are merely "things interact", "system adapts", "resources balance", or other broad abstractions without a concrete causal operator.
 - Exclude patterns that are descriptive but non-operational: historical summaries, aesthetic motifs, symbolic readings, subject-area overviews, or taxonomic restatements.
@@ -184,7 +189,16 @@ Output schema:
       "search_query": "...",
       "measurable_signal": "...",
       "control_lever": "...",
-      "transfer_rationale": "..."
+      "transfer_rationale": "...",
+      "transferable": {{
+        "mechanism": "...",
+        "control_logic": "...",
+        "signal_shape": "..."
+      }},
+      "grounded": {{
+        "source_control": "...",
+        "source_metric": "..."
+      }}
     }}
   ]
 }}"""
@@ -314,6 +328,7 @@ PATTERN_GENERIC_TERMS = {
     "complexity",
     "coordination",
     "emergence",
+    "generic",
     "general principle",
     "interaction",
     "optimization",
@@ -352,6 +367,15 @@ PATTERN_OPTIONAL_FIELDS = (
     "control_lever",
     "transfer_rationale",
 )
+PATTERN_TRANSFERABLE_FIELDS = (
+    "mechanism",
+    "control_logic",
+    "signal_shape",
+)
+PATTERN_GROUNDED_FIELDS = (
+    "source_control",
+    "source_metric",
+)
 PATTERN_ANCHOR_STOPWORDS = {
     "across",
     "against",
@@ -389,6 +413,42 @@ def _normalize_text(value: object) -> str:
     if not isinstance(value, str):
         return ""
     return " ".join(value.split()).strip()
+
+
+def _normalize_pattern_schema(pattern: dict) -> dict:
+    """Preserve flat pattern fields while backfilling additive nested schema fields."""
+    normalized = {
+        key: _normalize_text(pattern.get(key))
+        for key in PATTERN_REQUIRED_FIELDS.union(PATTERN_OPTIONAL_FIELDS)
+    }
+    transferable = pattern.get("transferable") if isinstance(pattern.get("transferable"), dict) else {}
+    grounded = pattern.get("grounded") if isinstance(pattern.get("grounded"), dict) else {}
+    mechanism = _normalize_text(transferable.get("mechanism"))
+    control_logic = _normalize_text(transferable.get("control_logic"))
+    signal_shape = _normalize_text(transferable.get("signal_shape"))
+    backfilled_fields: list[str] = []
+    if not mechanism:
+        mechanism = normalized["abstract_structure"]
+        backfilled_fields.append("mechanism")
+    if not control_logic:
+        control_logic = normalized["control_lever"]
+        backfilled_fields.append("control_logic")
+    if not signal_shape:
+        signal_shape = normalized["measurable_signal"]
+        backfilled_fields.append("signal_shape")
+    normalized["transferable"] = {
+        "mechanism": mechanism,
+        "control_logic": control_logic,
+        "signal_shape": signal_shape,
+        "_backfilled_fields": backfilled_fields,
+    }
+    normalized["grounded"] = {
+        "source_control": _normalize_text(grounded.get("source_control"))
+        or normalized["control_lever"],
+        "source_metric": _normalize_text(grounded.get("source_metric"))
+        or normalized["measurable_signal"],
+    }
+    return normalized
 
 
 def _match_terms(text: str, terms: set[str]) -> list[str]:
@@ -453,6 +513,73 @@ def _is_low_signal_pattern(pattern: dict) -> bool:
     return any(marker in abstract for marker in generic_markers)
 
 
+def _profile_transferable_pattern_quality(pattern: dict, seed: dict) -> dict:
+    """Lightly profile nested transferable fields without hard-rejecting them."""
+    transferable = pattern.get("transferable") if isinstance(pattern.get("transferable"), dict) else {}
+    grounded = pattern.get("grounded") if isinstance(pattern.get("grounded"), dict) else {}
+    mechanism = _normalize_text(transferable.get("mechanism"))
+    control_logic = _normalize_text(transferable.get("control_logic"))
+    signal_shape = _normalize_text(transferable.get("signal_shape"))
+    source_tokens = _pattern_source_tokens(seed)
+    source_tokens.update(
+        _pattern_anchor_tokens(
+            grounded.get("source_control"),
+            grounded.get("source_metric"),
+        )
+    )
+
+    field_tokens = {
+        "mechanism": _pattern_anchor_tokens(mechanism),
+        "control_logic": _pattern_anchor_tokens(control_logic),
+        "signal_shape": _pattern_anchor_tokens(signal_shape),
+    }
+    concerns: list[str] = []
+    short_fields = [
+        field_name
+        for field_name, tokens in field_tokens.items()
+        if len(tokens) < 2
+    ]
+    if short_fields:
+        concerns.append("transferable_fields_too_thin")
+
+    transferable_text = " | ".join([mechanism, control_logic, signal_shape]).lower()
+    generic_matches = _match_terms(transferable_text, PATTERN_GENERIC_TERMS)
+    if generic_matches:
+        concerns.append("transferable_fields_too_generic")
+
+    transferable_tokens = set().union(*field_tokens.values()) if field_tokens else set()
+    leakage_terms = sorted(transferable_tokens.intersection(source_tokens))
+    if leakage_terms:
+        concerns.append("transferable_source_leakage")
+
+    overlap_pairs: list[str] = []
+    for left_name, right_name in (
+        ("mechanism", "control_logic"),
+        ("mechanism", "signal_shape"),
+        ("control_logic", "signal_shape"),
+    ):
+        left_tokens = field_tokens[left_name]
+        right_tokens = field_tokens[right_name]
+        if len(left_tokens) < 2 or len(right_tokens) < 2:
+            continue
+        overlap = left_tokens.intersection(right_tokens)
+        overlap_ratio = len(overlap) / max(1, min(len(left_tokens), len(right_tokens)))
+        if len(overlap) >= 2 and overlap_ratio >= 0.8:
+            overlap_pairs.append(f"{left_name}/{right_name}")
+    if overlap_pairs:
+        concerns.append("transferable_field_overlap")
+
+    return {
+        "usable": not concerns,
+        "concerns": concerns[:4],
+        "source_overlap_terms": leakage_terms[:4],
+        "field_token_counts": {
+            field_name: len(tokens)
+            for field_name, tokens in field_tokens.items()
+        },
+    }
+
+
 def _profile_pattern_quality(pattern: dict, seed: dict) -> dict:
     """Score one extracted pattern for mechanism, measurability, and jump readiness."""
     name = _normalize_text(pattern.get("pattern_name"))
@@ -462,6 +589,7 @@ def _profile_pattern_quality(pattern: dict, seed: dict) -> dict:
     measurable_signal = _normalize_text(pattern.get("measurable_signal"))
     control_lever = _normalize_text(pattern.get("control_lever"))
     transfer_rationale = _normalize_text(pattern.get("transfer_rationale"))
+    transferable_quality = _profile_transferable_pattern_quality(pattern, seed)
 
     corpus = " | ".join(
         [
@@ -562,6 +690,10 @@ def _profile_pattern_quality(pattern: dict, seed: dict) -> dict:
     if aesthetic_matches:
         score -= 0.14
         concerns.append(f"aesthetic or interpretive via {', '.join(aesthetic_matches[:2])}")
+    if not transferable_quality.get("usable"):
+        score -= 0.03
+        for concern in transferable_quality.get("concerns") or []:
+            concerns.append(str(concern))
 
     score = max(0.05, min(0.97, score))
     if score >= PATTERN_QUALITY_HIGH_THRESHOLD:
@@ -588,6 +720,7 @@ def _profile_pattern_quality(pattern: dict, seed: dict) -> dict:
         "jump_ready": jump_ready,
         "strengths": strengths[:4],
         "concerns": concerns[:4],
+        "transferable_quality": transferable_quality,
         "summary": (
             f"{band}-quality pattern ({score:.2f}); "
             f"jump {'ready' if jump_ready else 'weak'} ({jump_support_score:.2f})"
@@ -1256,11 +1389,7 @@ def dive(seed: dict) -> list[dict]:
         if not PATTERN_REQUIRED_FIELDS.issubset(p.keys()):
             missing_fields += 1
             continue
-        normalized = {
-            key: _normalize_text(value)
-            for key, value in dict(p).items()
-            if key in PATTERN_REQUIRED_FIELDS or key in PATTERN_OPTIONAL_FIELDS
-        }
+        normalized = _normalize_pattern_schema(dict(p))
         if _is_low_signal_pattern(normalized):
             low_signal_rejections += 1
             rejected_profiles.append(

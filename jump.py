@@ -1368,22 +1368,193 @@ def _classify_jump_intervention_evidence(
     }
 
 
+def _jump_legacy_flat_pattern(pattern: dict) -> dict:
+    return {
+        "pattern_name": str(pattern.get("pattern_name", "") or "").strip(),
+        "abstract_structure": str(pattern.get("abstract_structure", "") or "").strip(),
+        "search_query": str(pattern.get("search_query", "") or "").strip(),
+        "measurable_signal": str(pattern.get("measurable_signal", "") or "").strip(),
+        "control_lever": str(pattern.get("control_lever", "") or "").strip(),
+        "transfer_rationale": str(pattern.get("transfer_rationale", "") or "").strip(),
+    }
+
+
+def _jump_transferable_query_profile(
+    pattern: dict,
+    source_domain: str,
+    source_category: str,
+) -> dict:
+    transferable = pattern.get("transferable") if isinstance(pattern.get("transferable"), dict) else {}
+    grounded = pattern.get("grounded") if isinstance(pattern.get("grounded"), dict) else {}
+    fields = {
+        "mechanism": str(transferable.get("mechanism", "") or "").strip(),
+        "control_logic": str(transferable.get("control_logic", "") or "").strip(),
+        "signal_shape": str(transferable.get("signal_shape", "") or "").strip(),
+    }
+    raw_backfilled_fields = transferable.get("_backfilled_fields")
+    if isinstance(raw_backfilled_fields, list):
+        backfilled_fields = [
+            str(field_name).strip()
+            for field_name in raw_backfilled_fields
+            if str(field_name).strip() in fields
+        ]
+    elif bool(transferable.get("_backfilled")):
+        backfilled_fields = [
+            field_name
+            for field_name, text in fields.items()
+            if text
+        ]
+    else:
+        backfilled_fields = []
+    backfilled_field_set = set(backfilled_fields)
+    grounded_tokens = set(_tokenize_query_terms(str(grounded.get("source_control", "") or "")))
+    grounded_tokens.update(_tokenize_query_terms(str(grounded.get("source_metric", "") or "")))
+    grounded_tokens.update(_tokenize_query_terms(source_domain))
+    grounded_tokens.update(_tokenize_query_terms(source_category))
+    field_token_sets: dict[str, set[str]] = {}
+    concerns: list[str] = []
+    for field_name, text in fields.items():
+        token_set = {
+            token
+            for token in _tokenize_query_terms(text)
+            if (
+                token not in GENERIC_QUERY_TOKENS
+                and token not in WEAK_QUERY_TOKENS
+                and token not in JUMP_QUERY_FILLER_TOKENS
+                and token not in QUERY_PHRASE_STOPWORDS
+                and len(token) > 2
+            )
+        }
+        field_token_sets[field_name] = token_set
+        if field_name in backfilled_field_set:
+            continue
+        clause_score = _score_jump_query_clause(text, grounded_tokens)
+        if len(token_set) < 2 or clause_score[1] < 1 or clause_score[2] < 2:
+            concerns.append(f"{field_name}_too_generic")
+
+    native_field_token_sets = [
+        token_set
+        for field_name, token_set in field_token_sets.items()
+        if field_name not in backfilled_field_set
+    ]
+    source_leakage_terms = sorted(
+        set().union(*native_field_token_sets).intersection(grounded_tokens)
+        if native_field_token_sets
+        else set()
+    )
+    if source_leakage_terms:
+        concerns.append("transferable_source_leakage")
+
+    overlap_pairs: list[str] = []
+    for left_name, right_name in (
+        ("mechanism", "control_logic"),
+        ("mechanism", "signal_shape"),
+        ("control_logic", "signal_shape"),
+    ):
+        if (
+            left_name in backfilled_field_set
+            or right_name in backfilled_field_set
+        ):
+            continue
+        left_tokens = field_token_sets.get(left_name, set())
+        right_tokens = field_token_sets.get(right_name, set())
+        if len(left_tokens) < 2 or len(right_tokens) < 2:
+            continue
+        overlap = left_tokens.intersection(right_tokens)
+        overlap_ratio = len(overlap) / max(1, min(len(left_tokens), len(right_tokens)))
+        if len(overlap) >= 2 and overlap_ratio >= 0.8:
+            overlap_pairs.append(f"{left_name}/{right_name}")
+    if overlap_pairs:
+        concerns.append("transferable_field_overlap")
+
+    has_transferable_fields = any(fields.values())
+    has_native_transferable_fields = any(
+        text and field_name not in backfilled_field_set
+        for field_name, text in fields.items()
+    )
+    blocking_concerns = {
+        "transferable_source_leakage",
+        "transferable_field_overlap",
+    }
+    return {
+        "usable": has_native_transferable_fields
+        and not any(
+            str(concern).endswith("_too_generic") or concern in blocking_concerns
+            for concern in concerns
+        ),
+        "backfilled": has_transferable_fields and not has_native_transferable_fields,
+        "backfilled_fields": backfilled_fields,
+        "has_transferable_fields": has_transferable_fields,
+        "concerns": concerns[:4],
+        "source_leakage_terms": source_leakage_terms[:4],
+        "overlap_pairs": overlap_pairs[:3],
+        "fields": fields,
+    }
+
+
+def _jump_query_pattern_view(
+    pattern: dict,
+    source_domain: str,
+    source_category: str,
+) -> tuple[dict, dict]:
+    legacy_pattern = _jump_legacy_flat_pattern(pattern)
+    transferable_profile = _jump_transferable_query_profile(
+        pattern,
+        source_domain,
+        source_category,
+    )
+    if not transferable_profile.get("usable"):
+        return legacy_pattern, transferable_profile
+
+    transferable_fields = dict(transferable_profile.get("fields") or {})
+    backfilled_field_set = {
+        str(field_name).strip()
+        for field_name in (transferable_profile.get("backfilled_fields") or [])
+        if str(field_name).strip()
+    }
+    preferred_pattern = dict(legacy_pattern)
+    if "mechanism" not in backfilled_field_set:
+        preferred_pattern["abstract_structure"] = (
+            str(transferable_fields.get("mechanism") or "").strip()
+            or preferred_pattern["abstract_structure"]
+        )
+    if "control_logic" not in backfilled_field_set:
+        preferred_pattern["control_lever"] = (
+            str(transferable_fields.get("control_logic") or "").strip()
+            or preferred_pattern["control_lever"]
+        )
+    if "signal_shape" not in backfilled_field_set:
+        preferred_pattern["measurable_signal"] = (
+            str(transferable_fields.get("signal_shape") or "").strip()
+            or preferred_pattern["measurable_signal"]
+        )
+    return preferred_pattern, transferable_profile
+
+
 def _jump_query_support_context(
     pattern: dict,
     source_domain: str,
     source_category: str,
 ) -> tuple[set[str], list[str], list[str]]:
+    query_pattern, _transferable_profile = _jump_query_pattern_view(
+        pattern,
+        source_domain,
+        source_category,
+    )
     blocked_tokens = set(_tokenize_query_terms(source_domain))
     blocked_tokens.update(_tokenize_query_terms(source_category))
-    preferred_anchor_phrases = _preferred_jump_query_anchor_phrases(pattern, blocked_tokens)
+    preferred_anchor_phrases = _preferred_jump_query_anchor_phrases(
+        query_pattern,
+        blocked_tokens,
+    )
     support_tokens: list[str] = []
     seen: set[str] = set()
     for text in (
-        str(pattern.get("control_lever", "") or ""),
-        str(pattern.get("abstract_structure", "") or ""),
-        str(pattern.get("measurable_signal", "") or ""),
-        str(pattern.get("pattern_name", "") or ""),
-        str(pattern.get("transfer_rationale", "") or ""),
+        str(query_pattern.get("control_lever", "") or ""),
+        str(query_pattern.get("abstract_structure", "") or ""),
+        str(query_pattern.get("measurable_signal", "") or ""),
+        str(query_pattern.get("pattern_name", "") or ""),
+        str(query_pattern.get("transfer_rationale", "") or ""),
     ):
         for token in _tokenize_query_terms(text):
             if (
@@ -2082,9 +2253,16 @@ def _build_jump_search_query_heuristic(
     pattern: dict,
     source_domain: str,
     source_category: str,
+    *,
+    prefer_transferable: bool = True,
 ) -> str:
     """Deterministically prefer causal-dynamics phrasing over source-token recombination."""
-    raw_query = str(pattern.get("search_query", "") or "").strip()
+    query_pattern = (
+        _jump_query_pattern_view(pattern, source_domain, source_category)[0]
+        if prefer_transferable
+        else _jump_legacy_flat_pattern(pattern)
+    )
+    raw_query = str(query_pattern.get("search_query", "") or "").strip()
     if not raw_query:
         return ""
 
@@ -2094,8 +2272,8 @@ def _build_jump_search_query_heuristic(
     causal_candidates: list[tuple[int, str]] = []
     for priority, text in enumerate(
         (
-            str(pattern.get("transfer_rationale", "") or ""),
-            str(pattern.get("abstract_structure", "") or ""),
+            str(query_pattern.get("transfer_rationale", "") or ""),
+            str(query_pattern.get("abstract_structure", "") or ""),
         ),
         start=1,
     ):
@@ -2137,17 +2315,17 @@ def _build_jump_search_query_heuristic(
     base_specific_tokens = _filtered_tokens(raw_query, specific_only=True)
     base_tokens = _filtered_tokens(raw_query)
     pattern_field_text = [
-        str(pattern.get("control_lever", "") or ""),
-        str(pattern.get("abstract_structure", "") or ""),
-        str(pattern.get("measurable_signal", "") or ""),
-        str(pattern.get("pattern_name", "") or ""),
-        str(pattern.get("transfer_rationale", "") or ""),
+        str(query_pattern.get("control_lever", "") or ""),
+        str(query_pattern.get("abstract_structure", "") or ""),
+        str(query_pattern.get("measurable_signal", "") or ""),
+        str(query_pattern.get("pattern_name", "") or ""),
+        str(query_pattern.get("transfer_rationale", "") or ""),
     ]
     phrase_field_text = [
-        str(pattern.get("control_lever", "") or ""),
-        str(pattern.get("abstract_structure", "") or ""),
-        str(pattern.get("measurable_signal", "") or ""),
-        str(pattern.get("pattern_name", "") or ""),
+        str(query_pattern.get("control_lever", "") or ""),
+        str(query_pattern.get("abstract_structure", "") or ""),
+        str(query_pattern.get("measurable_signal", "") or ""),
+        str(query_pattern.get("pattern_name", "") or ""),
         raw_query,
     ]
     phrase_anchors: list[str] = []
@@ -2427,34 +2605,80 @@ def _build_jump_search_query_with_metadata(
 ) -> tuple[str, bool]:
     raw_query = str(pattern.get("search_query", "") or "").strip()
     if not raw_query:
+        _build_jump_search_query_with_metadata.last_legacy_query = ""
+        _build_jump_search_query_with_metadata.last_transferable_query_profile = (
+            _jump_transferable_query_profile(
+                pattern,
+                source_domain,
+                source_category,
+            )
+        )
         return "", False
 
-    heuristic_query = _build_jump_search_query_heuristic(
+    query_pattern, transferable_profile = _jump_query_pattern_view(
         pattern,
         source_domain,
         source_category,
     )
+
+    heuristic_query = _build_jump_search_query_heuristic(
+        query_pattern,
+        source_domain,
+        source_category,
+        prefer_transferable=False,
+    )
     heuristic_query = _disambiguate_jump_search_query(
         heuristic_query,
-        pattern,
+        query_pattern,
         source_domain,
         source_category,
     )
     heuristic_query, heuristic_collision_guard_applied = _apply_jump_query_collision_guard(
         heuristic_query,
-        pattern,
+        query_pattern,
         source_domain,
         source_category,
     )
     heuristic_query = _preserve_jump_query_causal_shape(
         raw_query,
         heuristic_query,
-        pattern,
+        query_pattern,
         source_domain,
         source_category,
     )
+
+    legacy_query = _build_jump_search_query_heuristic(
+        _jump_legacy_flat_pattern(pattern),
+        source_domain,
+        source_category,
+        prefer_transferable=False,
+    )
+    legacy_query = _disambiguate_jump_search_query(
+        legacy_query,
+        _jump_legacy_flat_pattern(pattern),
+        source_domain,
+        source_category,
+    )
+    legacy_query, _legacy_collision_guard_applied = _apply_jump_query_collision_guard(
+        legacy_query,
+        _jump_legacy_flat_pattern(pattern),
+        source_domain,
+        source_category,
+    )
+    legacy_query = _preserve_jump_query_causal_shape(
+        raw_query,
+        legacy_query,
+        _jump_legacy_flat_pattern(pattern),
+        source_domain,
+        source_category,
+    )
+    _build_jump_search_query_with_metadata.last_legacy_query = legacy_query
+    _build_jump_search_query_with_metadata.last_transferable_query_profile = (
+        transferable_profile
+    )
+
     llm_query = _generate_llm_jump_search_query(
-        pattern,
+        query_pattern,
         source_domain,
         source_category,
         heuristic_query,
@@ -2463,7 +2687,7 @@ def _build_jump_search_query_with_metadata(
         original_llm_query = llm_query
         llm_query = _disambiguate_jump_search_query(
             llm_query,
-            pattern,
+            query_pattern,
             source_domain,
             source_category,
         )
@@ -2471,20 +2695,20 @@ def _build_jump_search_query_with_metadata(
     if llm_query:
         llm_query, llm_collision_guard_applied = _apply_jump_query_collision_guard(
             llm_query,
-            pattern,
+            query_pattern,
             source_domain,
             source_category,
         )
         llm_query = _preserve_jump_query_causal_shape(
             original_llm_query,
             llm_query,
-            pattern,
+            query_pattern,
             source_domain,
             source_category,
         )
         if not _is_acceptable_llm_jump_query(
             llm_query,
-            pattern,
+            query_pattern,
             source_domain,
             source_category,
             heuristic_query,
@@ -2501,6 +2725,11 @@ def _build_jump_search_queries(
     source_domain: str,
     source_category: str,
 ) -> list[str]:
+    query_pattern, _transferable_profile = _jump_query_pattern_view(
+        pattern,
+        source_domain,
+        source_category,
+    )
     raw_source_query = str(pattern.get("search_query", "") or "").strip()
 
     def _family_support_terms(*texts: str) -> list[str]:
@@ -2618,6 +2847,17 @@ def _build_jump_search_queries(
     )
     _build_jump_search_queries.last_collision_guard_applied = collision_guard_applied
     _build_jump_search_queries.last_query_labels = []
+    _build_jump_search_queries.last_legacy_query = str(
+        getattr(_build_jump_search_query_with_metadata, "last_legacy_query", "") or ""
+    ).strip()
+    _build_jump_search_queries.last_transferable_query_profile = dict(
+        getattr(
+            _build_jump_search_query_with_metadata,
+            "last_transferable_query_profile",
+            {},
+        )
+        or {}
+    )
     if not query:
         return []
 
@@ -2639,24 +2879,24 @@ def _build_jump_search_queries(
     if _needs_mechanism_family_support(base_query):
         mechanism_query = _build_family_variant(
             _family_support_terms(
-                str(pattern.get("abstract_structure", "") or ""),
-                str(pattern.get("pattern_name", "") or ""),
+                str(query_pattern.get("abstract_structure", "") or ""),
+                str(query_pattern.get("pattern_name", "") or ""),
                 raw_source_query,
             ),
             ("mechanism",),
         )
     intervention_query = _build_family_variant(
         _family_support_terms(
-            str(pattern.get("control_lever", "") or ""),
-            str(pattern.get("transfer_rationale", "") or ""),
+            str(query_pattern.get("control_lever", "") or ""),
+            str(query_pattern.get("transfer_rationale", "") or ""),
         ),
         (intervention_term,),
     )
     operator_query = _build_family_variant(
         _family_support_terms(
-            str(pattern.get("measurable_signal", "") or ""),
-            str(pattern.get("search_query", "") or ""),
-            str(pattern.get("abstract_structure", "") or ""),
+            str(query_pattern.get("measurable_signal", "") or ""),
+            str(query_pattern.get("search_query", "") or ""),
+            str(query_pattern.get("abstract_structure", "") or ""),
         ),
         ("failure",),
     )
@@ -2681,6 +2921,19 @@ def _build_jump_search_queries(
 
 _build_jump_search_queries.last_collision_guard_applied = False
 _build_jump_search_queries.last_query_labels = []
+_build_jump_search_queries.last_legacy_query = ""
+_build_jump_search_queries.last_transferable_query_profile = {}
+_build_jump_search_query_with_metadata.last_legacy_query = ""
+_build_jump_search_query_with_metadata.last_transferable_query_profile = {
+    "usable": False,
+    "backfilled": False,
+    "backfilled_fields": [],
+    "has_transferable_fields": False,
+    "concerns": [],
+    "source_leakage_terms": [],
+    "overlap_pairs": [],
+    "fields": {},
+}
 
 
 def _has_intervention_query_label(labels: list[str] | tuple[str, ...]) -> bool:
@@ -6593,9 +6846,11 @@ def lateral_jump_with_diagnostics(
         "pattern_name": str(pattern.get("pattern_name", "") or "").strip() or "Unknown",
         "abstract_structure": str(pattern.get("abstract_structure", "") or "").strip(),
         "raw_search_query": raw_search_query,
+        "legacy_built_jump_query": "",
         "built_jump_query": None,
         "built_jump_queries": [],
         "built_jump_query_labels": [],
+        "transferable_query_profile": {},
         "query_collision_guard_applied": False,
         "result_count": 0,
         "general_result_count": 0,
@@ -6636,6 +6891,12 @@ def lateral_jump_with_diagnostics(
     )
     diagnostic["query_collision_guard_applied"] = bool(
         getattr(_build_jump_search_queries, "last_collision_guard_applied", False)
+    )
+    diagnostic["legacy_built_jump_query"] = str(
+        getattr(_build_jump_search_queries, "last_legacy_query", "") or ""
+    ).strip()
+    diagnostic["transferable_query_profile"] = dict(
+        getattr(_build_jump_search_queries, "last_transferable_query_profile", {}) or {}
     )
     query_labels = [
         str(label).strip()
