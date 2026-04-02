@@ -2660,10 +2660,70 @@ def test_classify_weak_jump_result_marks_specific_intervention_hit_as_adjacent()
         preferred_anchor_phrases=["relay gating mismatch"],
         strong_anchor_tokens={"relay", "gating", "mismatch", "actuator"},
     )
+    repeated_should_drop, repeated_context = jump._classify_weak_jump_result(
+        title_text="Overview of electrochemical gas phase suppression",
+        url="https://medium.com/electrochemical-overview",
+        clean=(
+            "Operators suppress bubble carryover by adjusting flow rate "
+            "during startup in two-phase electrochemical reactors."
+        ),
+        preferred_anchor_phrases=["relay gating mismatch"],
+        strong_anchor_tokens={"relay", "gating", "mismatch", "actuator"},
+    )
 
     assert should_drop is False
     assert context["triage_class"] == "adjacent"
     assert context["intervention_evidence"] is True
+    assert isinstance(context["adjacent_strength"], int)
+    assert context["adjacent_strength"] > 0
+    assert repeated_should_drop is False
+    assert repeated_context["adjacent_strength"] == context["adjacent_strength"]
+
+
+def test_classify_weak_jump_result_scores_stronger_adjacent_evidence_above_weaker_adjacent_evidence() -> None:
+    _, stronger_context = jump._classify_weak_jump_result(
+        title_text="Overview of electrochemical gas phase suppression",
+        url="https://medium.com/electrochemical-overview",
+        clean=(
+            "Operators suppress bubble carryover by adjusting flow rate "
+            "during startup in two-phase electrochemical reactors."
+        ),
+        preferred_anchor_phrases=["relay gating mismatch"],
+        strong_anchor_tokens={"relay", "gating", "mismatch", "actuator"},
+    )
+    _, weaker_context = jump._classify_weak_jump_result(
+        title_text="Electrochemical transient gas phase dynamics",
+        url="https://example.test/electrochemical-dynamics",
+        clean=(
+            "Two-phase electrochemical reactors exhibit bubble carryover, "
+            "recirculation asymmetry, electrode flooding, gas-channel "
+            "maldistribution, impedance spikes, and transient pressure coupling "
+            "across parallel manifolds."
+        ),
+        preferred_anchor_phrases=["relay gating mismatch"],
+        strong_anchor_tokens={"relay", "gating", "mismatch", "actuator"},
+    )
+
+    assert stronger_context["triage_class"] == "adjacent"
+    assert weaker_context["triage_class"] == "adjacent"
+    assert stronger_context["adjacent_strength"] > weaker_context["adjacent_strength"]
+
+
+def test_classify_weak_jump_result_keeps_anchored_result_and_returns_strength_field() -> None:
+    should_drop, context = jump._classify_weak_jump_result(
+        title_text="Relay gating mismatch suppression",
+        url="https://target.test/anchored",
+        clean=(
+            "Relay gating mismatch suppression isolates the mismatched lane "
+            "before actuator switching."
+        ),
+        preferred_anchor_phrases=["relay gating mismatch"],
+        strong_anchor_tokens={"relay", "gating", "mismatch", "actuator"},
+    )
+
+    assert should_drop is False
+    assert context["triage_class"] == "keep"
+    assert isinstance(context["adjacent_strength"], int)
 
 
 def test_classify_weak_jump_result_drops_broad_specificity_only_result() -> None:
@@ -2683,6 +2743,7 @@ def test_classify_weak_jump_result_drops_broad_specificity_only_result() -> None
     assert should_drop is True
     assert context["triage_class"] == "drop"
     assert context["intervention_evidence"] is False
+    assert isinstance(context["adjacent_strength"], int)
 
 
 def test_lateral_jump_with_diagnostics_retains_adjacent_specific_hit_but_drops_broad_junk(
