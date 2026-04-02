@@ -281,7 +281,7 @@ def test_build_jump_search_query_preserves_natural_language_causal_shape_through
     assert query == "systems where periodic disruption prevents resource monopolization"
 
 
-def test_build_jump_search_queries_returns_base_query_plus_solution_variant(
+def test_build_jump_search_queries_returns_bounded_query_families(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
@@ -305,9 +305,33 @@ def test_build_jump_search_queries_returns_base_query_plus_solution_variant(
         "Technology",
     )
 
-    assert queries == [
-        "allocation regimes where threshold gating trades efficiency for overload prevention",
-        "allocation regimes where threshold gating trades efficiency for overload prevention workaround",
+    assert queries == jump._build_jump_search_queries(
+        {
+            "search_query": "allocation threshold rate efficiency overload routing",
+            "pattern_name": "Threshold-gated overload prevention",
+            "abstract_structure": (
+                "threshold gating slows allocation when overload risk rises above the "
+                "safe operating band"
+            ),
+            "measurable_signal": "allocation efficiency and overload incidents",
+            "control_lever": "change threshold gating and overflow routing",
+        },
+        "Network Protocols",
+        "Technology",
+    )
+    assert len(queries) == 3
+    assert queries[0] == (
+        "allocation regimes where threshold gating trades efficiency for overload prevention"
+    )
+    assert queries[1].startswith(queries[0])
+    assert queries[2].startswith(queries[0])
+    assert "overflow routing" in queries[1]
+    assert "incidents" in queries[2]
+    assert queries[2].endswith("failure")
+    assert jump._build_jump_search_queries.last_query_labels == [
+        "mechanism-family",
+        "intervention-family",
+        "operator-family",
     ]
 
 
@@ -329,6 +353,12 @@ def test_build_jump_search_queries_uses_next_unused_solution_variant(
     assert queries == [
         "queue threshold throttling latency workaround",
         "queue threshold throttling latency workaround mitigation",
+        "queue threshold throttling latency workaround failure",
+    ]
+    assert jump._build_jump_search_queries.last_query_labels == [
+        "mechanism-family",
+        "intervention-family",
+        "operator-family",
     ]
 
 
@@ -619,15 +649,22 @@ def test_lateral_jump_with_diagnostics_academic_lane_uses_improved_base_query(
 
     assert connection is not None
     assert diagnostic["built_jump_query"] == "periodic disruption prevents monopolization"
-    assert diagnostic["built_jump_queries"] == [
-        "periodic disruption prevents monopolization",
-        "periodic disruption prevents monopolization workaround",
+    assert diagnostic["built_jump_queries"][0] == (
+        "periodic disruption prevents monopolization"
+    )
+    assert diagnostic["built_jump_query_labels"] == [
+        "mechanism-family",
+        "intervention-family",
+        "operator-family",
     ]
+    assert len(diagnostic["built_jump_queries"]) == 3
     assert seen_calls == [
-        ("periodic disruption prevents monopolization", None),
-        ("periodic disruption prevents monopolization workaround", None),
+        *[
+            (query, None)
+            for query in diagnostic["built_jump_queries"]
+        ],
         (
-            "periodic disruption prevents monopolization",
+            diagnostic["built_jump_query"],
             jump.ACADEMIC_JUMP_INCLUDE_DOMAINS,
         ),
     ]
@@ -707,18 +744,22 @@ def test_lateral_jump_with_diagnostics_reports_preserved_natural_language_built_
     assert diagnostic["built_jump_query"] == (
         "systems where periodic disruption prevents resource monopolization"
     )
-    assert diagnostic["built_jump_queries"] == [
-        "systems where periodic disruption prevents resource monopolization",
-        "systems where periodic disruption prevents resource monopolization workaround",
+    assert diagnostic["built_jump_queries"][0] == (
+        "systems where periodic disruption prevents resource monopolization"
+    )
+    assert diagnostic["built_jump_query_labels"] == [
+        "mechanism-family",
+        "intervention-family",
+        "operator-family",
     ]
+    assert len(diagnostic["built_jump_queries"]) == 3
     assert seen_calls == [
-        ("systems where periodic disruption prevents resource monopolization", None),
+        *[
+            (query, None)
+            for query in diagnostic["built_jump_queries"]
+        ],
         (
-            "systems where periodic disruption prevents resource monopolization workaround",
-            None,
-        ),
-        (
-            "systems where periodic disruption prevents resource monopolization",
+            diagnostic["built_jump_query"],
             jump.ACADEMIC_JUMP_INCLUDE_DOMAINS,
         ),
     ]
@@ -2305,6 +2346,10 @@ def test_lateral_jump_with_diagnostics_merges_multi_query_results_for_both_stage
     assert diagnostic["built_jump_queries"] == [
         "queue threshold throttling latency",
         "queue threshold throttling latency workaround",
+    ]
+    assert diagnostic["built_jump_query_labels"] == [
+        "base",
+        "solution-biased",
     ]
     assert diagnostic["query_collision_guard_applied"] is False
     assert diagnostic["general_result_count"] == 4
