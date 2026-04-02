@@ -1218,34 +1218,11 @@ JUMP_QUERY_FILLER_TOKENS = {
     "long",
     "most",
     "one",
+    "raise",
     "same",
     "term",
     "the",
     "toward",
-}
-JUMP_PORTABLE_TRANSFERABLE_LEAKAGE_TOKENS = {
-    "activation",
-    "accumulate",
-    "accumulation",
-    "bias",
-    "cascade",
-    "dampen",
-    "damping",
-    "feedback",
-    "gate",
-    "gating",
-    "inhibit",
-    "inhibition",
-    "inhibitory",
-    "oscillate",
-    "oscillation",
-    "raise",
-    "relay",
-    "saturate",
-    "saturation",
-    "suppression",
-    "suppressive",
-    "threshold",
 }
 
 
@@ -1256,19 +1233,69 @@ def _tokenize_query_terms(text: str) -> list[str]:
 
 def _jump_transferable_source_leakage_terms(
     transferable_tokens: set[str],
-    grounded_tokens: set[str],
+    grounded_source_tokens: set[str],
 ) -> list[str]:
     """Return only source-specific grounded overlap terms."""
     return sorted(
         token
-        for token in transferable_tokens.intersection(grounded_tokens)
+        for token in transferable_tokens.intersection(grounded_source_tokens)
         if token not in GENERIC_QUERY_TOKENS
         and token not in WEAK_QUERY_TOKENS
         and token not in JUMP_QUERY_FILLER_TOKENS
         and token not in QUERY_PHRASE_STOPWORDS
-        and token not in JUMP_PORTABLE_TRANSFERABLE_LEAKAGE_TOKENS
+        and not _is_generic_jump_grounded_source_token(token)
         and len(token) > 2
     )
+
+
+def _jump_exact_domain_blocker_tokens(*values: str) -> set[str]:
+    """Block exact one-token domain names without adding broad domain vocabulary."""
+    blockers: set[str] = set()
+    for value in values:
+        domain_tokens = _tokenize_query_terms(str(value or ""))
+        if len(domain_tokens) == 1:
+            blockers.add(domain_tokens[0])
+    return blockers
+
+
+def _is_generic_jump_grounded_source_token(token: str) -> bool:
+    """Filter broad mechanism/control terms using existing query vocab."""
+    candidate = str(token or "").strip().lower()
+    if not candidate:
+        return True
+    if candidate in AMBIGUOUS_JUMP_QUERY_TOKENS:
+        return True
+    broad_terms = (
+        tuple(MECHANISM_QUERY_TOKENS)
+        + tuple(INTERVENTION_CONDITION_TOKENS)
+        + INTERVENTION_CONTROL_MARKERS
+        + INTERVENTION_RESPONSE_MARKERS
+        + JUMP_QUERY_CAUSAL_VERB_STEMS
+    )
+    for term in broad_terms:
+        term_token = str(term or "").strip().lower()
+        if len(term_token) < 4:
+            continue
+        if candidate == term_token:
+            return True
+        if len(term_token) >= 6 and candidate.startswith(term_token[:6]):
+            return True
+    return False
+
+
+def _jump_grounded_source_tokens(grounded: dict) -> set[str]:
+    """Derive a bounded source-specific term bag from grounded source fields only."""
+    return {
+        token
+        for token in _tokenize_query_terms(str(grounded.get("source_control", "") or ""))
+        + _tokenize_query_terms(str(grounded.get("source_metric", "") or ""))
+        if token not in GENERIC_QUERY_TOKENS
+        and token not in WEAK_QUERY_TOKENS
+        and token not in JUMP_QUERY_FILLER_TOKENS
+        and token not in QUERY_PHRASE_STOPWORDS
+        and not _is_generic_jump_grounded_source_token(token)
+        and len(token) > 2
+    }
 
 
 def _is_specific_jump_query_token(token: str) -> bool:
@@ -1455,10 +1482,11 @@ def _jump_transferable_query_profile(
     else:
         backfilled_fields = []
     backfilled_field_set = set(backfilled_fields)
-    grounded_tokens = set(_tokenize_query_terms(str(grounded.get("source_control", "") or "")))
-    grounded_tokens.update(_tokenize_query_terms(str(grounded.get("source_metric", "") or "")))
-    grounded_tokens.update(_tokenize_query_terms(source_domain))
-    grounded_tokens.update(_tokenize_query_terms(source_category))
+    grounded_source_tokens = _jump_grounded_source_tokens(grounded)
+    domain_blocker_tokens = _jump_exact_domain_blocker_tokens(
+        source_domain,
+        source_category,
+    )
     field_token_sets: dict[str, set[str]] = {}
     concerns: list[str] = []
     for field_name, text in fields.items():
@@ -1476,7 +1504,10 @@ def _jump_transferable_query_profile(
         field_token_sets[field_name] = token_set
         if field_name in backfilled_field_set:
             continue
-        clause_score = _score_jump_query_clause(text, grounded_tokens)
+        clause_score = _score_jump_query_clause(
+            text,
+            grounded_source_tokens.union(domain_blocker_tokens),
+        )
         if len(token_set) < 2 or clause_score[1] < 1 or clause_score[2] < 2:
             concerns.append(f"{field_name}_too_generic")
 
@@ -1486,10 +1517,10 @@ def _jump_transferable_query_profile(
         if field_name not in backfilled_field_set
     ]
     source_leakage_terms = sorted(
-        _jump_transferable_source_leakage_terms(
-            set().union(*native_field_token_sets),
-            grounded_tokens,
-        )
+            _jump_transferable_source_leakage_terms(
+                set().union(*native_field_token_sets),
+                grounded_source_tokens,
+            )
         if native_field_token_sets
         else []
     )

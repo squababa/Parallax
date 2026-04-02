@@ -186,6 +186,41 @@ def test_profile_transferable_pattern_quality_ignores_portable_mechanism_overlap
     assert profile["source_overlap_terms"] == []
 
 
+def test_profile_transferable_pattern_quality_ignores_broad_seed_domain_vocab() -> None:
+    profile = explore._profile_transferable_pattern_quality(
+        explore._normalize_pattern_schema(
+            {
+                "pattern_name": "Seismic envelope drift",
+                "description": "A broad wave envelope drifts when local phase offsets accumulate.",
+                "abstract_structure": "Amplitude and distance cues interact with angle shifts before a localized correction burst.",
+                "search_query": "amplitude distance angle correction",
+                "measurable_signal": "P-wave pick residual and travel-time jitter",
+                "control_lever": "calibrate station azimuth and clock offset",
+                "transferable": {
+                    "mechanism": "amplitude distance coupling concentrates angle shifts into localized phase drift",
+                    "control_logic": "counter misalignment with high-frequency gating before phase drift spreads",
+                    "signal_shape": "density-normalized residuals widen gradually before a sharp correction burst",
+                },
+                "grounded": {
+                    "source_control": "calibrate station azimuth and clock offset",
+                    "source_metric": "P-wave pick residual and travel-time jitter",
+                },
+            }
+        ),
+        {
+            "name": (
+                "Amplitude Distance Angle Density Misalignment High-Frequency "
+                "Seismology"
+            ),
+            "category": "Seismology",
+        },
+    )
+
+    assert profile["usable"] is True
+    assert "transferable_source_leakage" not in profile["concerns"]
+    assert profile["source_overlap_terms"] == []
+
+
 def test_profile_transferable_pattern_quality_flags_true_source_noun_leakage() -> None:
     profile = explore._profile_transferable_pattern_quality(
         explore._normalize_pattern_schema(
@@ -211,7 +246,9 @@ def test_profile_transferable_pattern_quality_flags_true_source_noun_leakage() -
     )
 
     assert "transferable_source_leakage" in profile["concerns"]
-    assert {"dorsal", "nociceptor"}.intersection(profile["source_overlap_terms"])
+    assert {"c-fiber", "dorsal", "horn", "nociceptor"}.intersection(
+        profile["source_overlap_terms"]
+    )
 
 
 def test_build_jump_search_query_replaces_weak_feedback_style_terms() -> None:
@@ -1173,6 +1210,29 @@ def test_jump_transferable_query_profile_ignores_portable_mechanism_and_connecto
     assert profile["source_leakage_terms"] == []
 
 
+def test_jump_transferable_query_profile_ignores_broad_source_domain_vocab_and_stays_usable() -> None:
+    profile = jump._jump_transferable_query_profile(
+        {
+            "transferable": {
+                "mechanism": "amplitude distance coupling concentrates angle shifts into localized phase drift",
+                "control_logic": "counter misalignment with high-frequency gating before phase drift spreads",
+                "signal_shape": "density-normalized amplitude rises toward high-frequency saturation bursts",
+                "_backfilled_fields": [],
+            },
+            "grounded": {
+                "source_control": "calibrate station azimuth and clock offset",
+                "source_metric": "P-wave pick residual and travel-time jitter",
+            },
+        },
+        "Amplitude Distance Angle Density Misalignment High-Frequency",
+        "Seismology",
+    )
+
+    assert profile["usable"] is True
+    assert "transferable_source_leakage" not in profile["concerns"]
+    assert profile["source_leakage_terms"] == []
+
+
 def test_jump_transferable_query_profile_rejects_overlap_collapsed_fields() -> None:
     profile = jump._jump_transferable_query_profile(
         {
@@ -1230,6 +1290,9 @@ def test_build_jump_search_queries_falls_back_on_true_source_specific_transferab
         "transferable_source_leakage"
         in jump._build_jump_search_queries.last_transferable_query_profile["concerns"]
     )
+    assert "c-fiber" in jump._build_jump_search_queries.last_transferable_query_profile[
+        "source_leakage_terms"
+    ]
     assert "nociceptor" in jump._build_jump_search_queries.last_transferable_query_profile[
         "source_leakage_terms"
     ]

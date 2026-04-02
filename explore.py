@@ -410,33 +410,10 @@ PATTERN_ANCHOR_STOPWORDS = {
     "when",
     "where",
     "which",
+    "raise",
     "with",
     "without",
     "within",
-}
-PATTERN_PORTABLE_TRANSFERABLE_LEAKAGE_TERMS = {
-    "activation",
-    "accumulate",
-    "accumulation",
-    "bias",
-    "cascade",
-    "dampen",
-    "damping",
-    "feedback",
-    "gate",
-    "gating",
-    "inhibit",
-    "inhibition",
-    "inhibitory",
-    "oscillate",
-    "oscillation",
-    "raise",
-    "relay",
-    "saturate",
-    "saturation",
-    "suppression",
-    "suppressive",
-    "threshold",
 }
 
 
@@ -526,13 +503,13 @@ def _transferable_source_leakage_terms(
     transferable_tokens: set[str],
     source_tokens: set[str],
 ) -> list[str]:
-    """Return only source-specific overlap terms, not portable mechanism words."""
+    """Return only source-specific overlap terms drawn from grounded source fields."""
     return sorted(
         token
         for token in transferable_tokens.intersection(source_tokens)
         if token not in PATTERN_ANCHOR_STOPWORDS
         and token not in PATTERN_GENERIC_TERMS
-        and token not in PATTERN_PORTABLE_TRANSFERABLE_LEAKAGE_TERMS
+        and not _is_generic_grounded_source_token(token)
         and len(token) >= 4
     )
 
@@ -567,12 +544,9 @@ def _profile_transferable_pattern_quality(pattern: dict, seed: dict) -> dict:
     mechanism = _normalize_text(transferable.get("mechanism"))
     control_logic = _normalize_text(transferable.get("control_logic"))
     signal_shape = _normalize_text(transferable.get("signal_shape"))
-    source_tokens = _pattern_source_tokens(seed)
-    source_tokens.update(
-        _pattern_anchor_tokens(
-            grounded.get("source_control"),
-            grounded.get("source_metric"),
-        )
+    source_tokens = _pattern_grounded_source_tokens(
+        grounded.get("source_control"),
+        grounded.get("source_metric"),
     )
 
     field_tokens = {
@@ -790,6 +764,36 @@ def _pattern_anchor_tokens(*values: object) -> set[str]:
                 continue
             tokens.add(token)
     return tokens
+
+
+def _is_generic_grounded_source_token(token: str) -> bool:
+    """Filter broad mechanism/control words using existing pattern vocab."""
+    candidate = str(token or "").strip().lower()
+    if not candidate:
+        return True
+    for term_group in (
+        PATTERN_MECHANISM_TERMS,
+        PATTERN_MEASURABLE_TERMS,
+        PATTERN_CONTROL_TERMS,
+    ):
+        for term in term_group:
+            for term_token in re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)?", term.lower()):
+                if len(term_token) < 4:
+                    continue
+                if candidate == term_token:
+                    return True
+                if len(term_token) >= 6 and candidate.startswith(term_token[:6]):
+                    return True
+    return False
+
+
+def _pattern_grounded_source_tokens(*values: object) -> set[str]:
+    """Extract source-specific leakage candidates from grounded source fields only."""
+    return {
+        token
+        for token in _pattern_anchor_tokens(*values)
+        if not _is_generic_grounded_source_token(token)
+    }
 
 
 def _seed_source_candidates_from_provenance(provenance: dict) -> list[dict]:
