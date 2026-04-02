@@ -5709,6 +5709,23 @@ def _build_jump_search_content(
             *_stage_one_mechanism_evidence_rank(result),
         )
 
+    def _stage_one_adjacent_highlight_extra_rank(
+        highlight: dict[str, object],
+    ) -> tuple[int, int, int, int, int, int, int, int, int, int, int, int, int, int, int]:
+        result = dict(highlight.get("result") or {})
+        return (
+            _adjacent_strength(result),
+            len(
+                [
+                    label
+                    for label in (highlight.get("labels") or [])
+                    if str(label).strip()
+                ]
+            ),
+            *_stage_one_intervention_evidence_rank(result),
+            *_stage_one_mechanism_evidence_rank(result),
+        )
+
     def _select_stage_one_evidence_highlights(
         cluster_results: list[dict],
     ) -> list[dict[str, object]]:
@@ -5911,15 +5928,6 @@ def _build_jump_search_content(
             - sum(1 for result in display_cluster_results if _is_adjacent_result(result)),
             0,
         )
-        highlighted_result_keys: set[str] = set()
-        highlights = _select_stage_one_evidence_highlights(display_cluster_results)
-        if highlights:
-            enriched_packet = True
-        adjacent_highlighted_count += sum(
-            1
-            for highlight in highlights
-            if _is_adjacent_result(dict(highlight.get("result") or {}))
-        )
         fallback_results: list[dict] = []
         for merged_result in cluster_results:
             title_text = str(merged_result.get("title_text", "") or "").strip()
@@ -5939,21 +5947,131 @@ def _build_jump_search_content(
             )
             if title_text and title_text not in top_titles and len(top_titles) < 3:
                 top_titles.append(title_text)
-        for highlight in highlights:
-            highlighted_result = dict(highlight.get("result") or {})
-            highlighted_result_keys.add(_stage_one_packet_result_key(highlighted_result))
-        for merged_result in display_cluster_results:
-            if _stage_one_packet_result_key(merged_result) not in highlighted_result_keys:
-                fallback_results.append(merged_result)
         cluster_packet_sections.append(
             {
                 "cluster": cluster,
                 "cluster_hint": cluster_hint,
                 "cluster_results": cluster_results,
-                "highlights": highlights,
+                "display_cluster_results": display_cluster_results,
+                "highlights": _select_stage_one_evidence_highlights(
+                    display_cluster_results
+                ),
                 "fallback_results": fallback_results,
             }
         )
+
+    adjacent_highlight_candidates = [
+        highlight
+        for section in cluster_packet_sections
+        for highlight in list(section.get("highlights") or [])
+        if _is_adjacent_result(dict(highlight.get("result") or {}))
+    ]
+    adjacent_highlight_candidate_count = len(adjacent_highlight_candidates)
+    if adjacent_heavy_packet and len(adjacent_highlight_candidates) > 3:
+        selected_adjacent_highlights: dict[str, dict[str, object]] = {}
+
+        def _adjacent_highlight_key(highlight: dict[str, object]) -> str:
+            return _stage_one_packet_result_key(dict(highlight.get("result") or {}))
+
+        def _pick_adjacent_highlight(
+            label_text: str,
+            ranker,
+        ) -> None:
+            candidates = [
+                highlight
+                for highlight in adjacent_highlight_candidates
+                if label_text in (highlight.get("labels") or [])
+                and _adjacent_highlight_key(highlight)
+                not in selected_adjacent_highlights
+            ]
+            if not candidates:
+                return
+            best_highlight = max(candidates, key=ranker)
+            selected_adjacent_highlights[_adjacent_highlight_key(best_highlight)] = (
+                best_highlight
+            )
+
+        _pick_adjacent_highlight(
+            "Mechanism evidence",
+            lambda highlight: (
+                _adjacent_strength(dict(highlight.get("result") or {})),
+                *_stage_one_mechanism_evidence_rank(
+                    dict(highlight.get("result") or {})
+                ),
+            ),
+        )
+        _pick_adjacent_highlight(
+            "Intervention/workaround evidence",
+            lambda highlight: (
+                _adjacent_strength(dict(highlight.get("result") or {})),
+                *_stage_one_intervention_evidence_rank(
+                    dict(highlight.get("result") or {})
+                ),
+            ),
+        )
+        _pick_adjacent_highlight(
+            "Operator response evidence",
+            lambda highlight: (
+                1
+                if str(
+                    dict(highlight.get("result") or {}).get("intervention_signal") or ""
+                ).strip()
+                else 0,
+                _adjacent_strength(dict(highlight.get("result") or {})),
+                *_stage_one_intervention_evidence_rank(
+                    dict(highlight.get("result") or {})
+                ),
+            ),
+        )
+        remaining_adjacent_highlights = [
+            highlight
+            for highlight in adjacent_highlight_candidates
+            if _adjacent_highlight_key(highlight) not in selected_adjacent_highlights
+        ]
+        if remaining_adjacent_highlights:
+            best_remaining_adjacent_highlight = max(
+                remaining_adjacent_highlights,
+                key=_stage_one_adjacent_highlight_extra_rank,
+            )
+            if (
+                _adjacent_strength(
+                    dict(best_remaining_adjacent_highlight.get("result") or {})
+                )
+                >= 6
+                or not selected_adjacent_highlights
+            ):
+                selected_adjacent_highlights[
+                    _adjacent_highlight_key(best_remaining_adjacent_highlight)
+                ] = best_remaining_adjacent_highlight
+
+        kept_adjacent_highlight_keys = set(selected_adjacent_highlights)
+        for section in cluster_packet_sections:
+            section["highlights"] = [
+                highlight
+                for highlight in list(section.get("highlights") or [])
+                if not _is_adjacent_result(dict(highlight.get("result") or {}))
+                or _stage_one_packet_result_key(dict(highlight.get("result") or {}))
+                in kept_adjacent_highlight_keys
+            ]
+
+    adjacent_highlighted_count = sum(
+        1
+        for section in cluster_packet_sections
+        for highlight in list(section.get("highlights") or [])
+        if _is_adjacent_result(dict(highlight.get("result") or {}))
+    )
+    enriched_packet = any(section.get("highlights") for section in cluster_packet_sections)
+
+    for section in cluster_packet_sections:
+        highlighted_result_keys = {
+            _stage_one_packet_result_key(dict(highlight.get("result") or {}))
+            for highlight in list(section.get("highlights") or [])
+        }
+        section["fallback_results"] = [
+            merged_result
+            for merged_result in list(section.get("display_cluster_results") or [])
+            if _stage_one_packet_result_key(merged_result) not in highlighted_result_keys
+        ]
 
     adjacent_fallback_budget = 1 if adjacent_highlighted_count > 0 else 2
     adjacent_fallback_candidates = [
@@ -6049,7 +6167,10 @@ def _build_jump_search_content(
     if adjacent_heavy_packet:
         packet_quality = (
             "adjacent_compressed"
-            if adjacent_suppressed_count > 0
+            if (
+                adjacent_suppressed_count > 0
+                or adjacent_highlighted_count < adjacent_highlight_candidate_count
+            )
             else "adjacent_heavy"
         )
 

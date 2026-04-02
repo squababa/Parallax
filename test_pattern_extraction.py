@@ -3320,6 +3320,77 @@ def test_build_jump_search_content_applies_packet_wide_adjacent_budget_across_cl
     assert packet_observability["adjacent_suppressed_count"] == 3
 
 
+def test_build_jump_search_content_applies_packet_wide_adjacent_highlight_budget_across_clusters() -> None:
+    search_content, _, _, clustered_results, enriched_packet, packet_observability = jump._build_jump_search_content(
+        [
+            _jump_packet_result(
+                "Relay gating mismatch suppression",
+                "Relay gating mismatch suppression isolates the mismatched lane before actuator switching.",
+                "https://target.test/keep",
+                triage_class="keep",
+                adjacent_strength=6,
+                anchor_overlap=3,
+            ),
+            _jump_packet_result(
+                "Electrochemical routing mechanism",
+                "Threshold routing channels stabilize latency under rising load.",
+                "https://alpha.test/mechanism",
+                adjacent_strength=8,
+            ),
+            _jump_packet_result(
+                "Polymer startup workaround",
+                "A practical workaround isolates the unstable lane during startup.",
+                "https://beta.test/workaround",
+                adjacent_strength=9,
+                solution_marker_count=2,
+                intervention_marker_count=2,
+                intervention_evidence=True,
+            ),
+            _jump_packet_result(
+                "Sensor alarm operator response",
+                "Operators isolate the unstable lane and switch flow when alarms trigger.",
+                "https://gamma.test/operator",
+                adjacent_strength=8,
+                solution_marker_count=1,
+                intervention_marker_count=2,
+                intervention_evidence=True,
+                intervention_signal="operators isolate",
+            ),
+            _jump_packet_result(
+                "Capacitor charge gating study",
+                "Charge gating reroutes current during overload startup in parallel channels.",
+                "https://theta.test/gating",
+                adjacent_strength=5,
+            ),
+            _jump_packet_result(
+                "Valve startup workaround note",
+                "A workaround retunes valve bias during startup transients.",
+                "https://lambda.test/valve",
+                adjacent_strength=4,
+                solution_marker_count=1,
+                intervention_marker_count=1,
+                intervention_evidence=True,
+            ),
+        ],
+        set(),
+        {"relay", "gating", "mismatch", "actuator", "threshold", "routing", "startup"},
+    )
+
+    assert len(clustered_results) >= 6
+    assert enriched_packet is True
+    assert "Title: Relay gating mismatch suppression" in search_content
+    assert "Title: Electrochemical routing mechanism" in search_content
+    assert "Title: Polymer startup workaround" in search_content
+    assert "Title: Sensor alarm operator response" in search_content
+    assert "Title: Capacitor charge gating study" in search_content
+    assert "Title: Valve startup workaround note" not in search_content
+    assert search_content.count("Search result 1:") == 1
+    assert "Search result 2:" not in search_content
+    assert packet_observability["packet_quality"] == "adjacent_compressed"
+    assert packet_observability["adjacent_highlighted_count"] == 3
+    assert packet_observability["adjacent_suppressed_count"] == 1
+
+
 def test_lateral_jump_with_diagnostics_does_not_promote_descriptive_process_paper_as_intervention(
     monkeypatch,
 ) -> None:
