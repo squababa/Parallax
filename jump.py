@@ -1224,6 +1224,14 @@ JUMP_QUERY_FILLER_TOKENS = {
     "the",
     "toward",
 }
+JUMP_SOURCE_LEAKAGE_GENERIC_TOKENS = {
+    "declaration",
+    "event",
+    "initial",
+    "response",
+    "signal",
+    "state",
+}
 
 
 def _tokenize_query_terms(text: str) -> list[str]:
@@ -1263,7 +1271,10 @@ def _is_generic_jump_grounded_source_token(token: str) -> bool:
     candidate = str(token or "").strip().lower()
     if not candidate:
         return True
-    if candidate in AMBIGUOUS_JUMP_QUERY_TOKENS:
+    if (
+        candidate in AMBIGUOUS_JUMP_QUERY_TOKENS
+        or candidate in JUMP_SOURCE_LEAKAGE_GENERIC_TOKENS
+    ):
         return True
     broad_terms = (
         tuple(MECHANISM_QUERY_TOKENS)
@@ -1296,6 +1307,42 @@ def _jump_grounded_source_tokens(grounded: dict) -> set[str]:
         and not _is_generic_jump_grounded_source_token(token)
         and len(token) > 2
     }
+
+
+def _jump_source_shaped_terms(candidate_text: str, pattern: dict) -> list[str]:
+    """Return overlap terms showing transferable text still mirrors source-native labels."""
+    candidate_tokens = {
+        token
+        for token in _tokenize_query_terms(candidate_text)
+        if token not in GENERIC_QUERY_TOKENS
+        and token not in WEAK_QUERY_TOKENS
+        and token not in JUMP_QUERY_FILLER_TOKENS
+        and token not in QUERY_PHRASE_STOPWORDS
+        and token not in OVERLOADED_JUMP_QUERY_TOKENS
+        and not _is_generic_jump_grounded_source_token(token)
+        and len(token) > 2
+    }
+    source_tokens = {
+        token
+        for token in _tokenize_query_terms(
+            " ".join(
+                [
+                    str(pattern.get("pattern_name", "") or ""),
+                    str(pattern.get("search_query", "") or ""),
+                    str(pattern.get("measurable_signal", "") or ""),
+                    str(pattern.get("control_lever", "") or ""),
+                ]
+            )
+        )
+        if token not in GENERIC_QUERY_TOKENS
+        and token not in WEAK_QUERY_TOKENS
+        and token not in JUMP_QUERY_FILLER_TOKENS
+        and token not in QUERY_PHRASE_STOPWORDS
+        and token not in OVERLOADED_JUMP_QUERY_TOKENS
+        and not _is_generic_jump_grounded_source_token(token)
+        and len(token) > 2
+    }
+    return sorted(candidate_tokens.intersection(source_tokens))
 
 
 def _is_specific_jump_query_token(token: str) -> bool:
@@ -1526,6 +1573,25 @@ def _jump_transferable_query_profile(
     )
     if source_leakage_terms:
         concerns.append("transferable_source_leakage")
+    has_transferable_fields = any(fields.values())
+    has_native_transferable_fields = any(
+        text and field_name not in backfilled_field_set
+        for field_name, text in fields.items()
+    )
+    source_shape_terms = (
+        _jump_source_shaped_terms(
+            " ".join(
+                fields[field_name]
+                for field_name in fields
+                if field_name not in backfilled_field_set
+            ),
+            pattern,
+        )
+        if has_native_transferable_fields
+        else []
+    )
+    if len(source_shape_terms) >= 2:
+        concerns.append("transferable_source_shaped")
 
     overlap_pairs: list[str] = []
     for left_name, right_name in (
@@ -1549,11 +1615,6 @@ def _jump_transferable_query_profile(
     if overlap_pairs:
         concerns.append("transferable_field_overlap")
 
-    has_transferable_fields = any(fields.values())
-    has_native_transferable_fields = any(
-        text and field_name not in backfilled_field_set
-        for field_name, text in fields.items()
-    )
     blocking_concerns = {
         "transferable_source_leakage",
         "transferable_field_overlap",
@@ -1569,6 +1630,7 @@ def _jump_transferable_query_profile(
         "has_transferable_fields": has_transferable_fields,
         "concerns": concerns[:4],
         "source_leakage_terms": source_leakage_terms[:4],
+        "source_shape_terms": source_shape_terms[:4],
         "overlap_pairs": overlap_pairs[:3],
         "fields": fields,
     }
@@ -6933,6 +6995,9 @@ def lateral_jump_with_diagnostics(
         "built_jump_queries": [],
         "built_jump_query_labels": [],
         "transferable_query_profile": {},
+        "transferable_fallback_gate_blocked": False,
+        "transferable_used_but_source_shaped": False,
+        "transferable_used_source_shape_terms": [],
         "query_collision_guard_applied": False,
         "result_count": 0,
         "general_result_count": 0,
@@ -6997,6 +7062,14 @@ def lateral_jump_with_diagnostics(
     diagnostic["built_jump_query"] = query
     diagnostic["built_jump_queries"] = queries
     diagnostic["built_jump_query_labels"] = query_labels[: len(queries)]
+    source_shape_terms = _jump_source_shaped_terms(query, pattern)
+    diagnostic["transferable_fallback_gate_blocked"] = not bool(
+        diagnostic["transferable_query_profile"].get("usable")
+    )
+    diagnostic["transferable_used_but_source_shaped"] = bool(
+        diagnostic["transferable_query_profile"].get("usable")
+    ) and len(source_shape_terms) >= 2
+    diagnostic["transferable_used_source_shape_terms"] = source_shape_terms[:4]
     if not query:
         diagnostic["stage1_outcome"] = "no_results"
         diagnostic["stage1_failure_hint"] = "empty_jump_query"

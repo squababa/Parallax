@@ -165,9 +165,10 @@ Rules:
 - measurable_signal should name one metric, threshold, rate, count, error mode, load measure, or state variable that a target-domain operator could plausibly check.
 - control_lever should name one concrete operator action, tuning knob, gating rule, scheduling choice, routing decision, filter, or intervention implied by the mechanism.
 - transfer_rationale should say why the process shape can transfer across domains without reverting to domain-specific nouns.
-- transferable.mechanism should restate the domain-neutral causal/process structure with no source implementation nouns.
-- transferable.control_logic should state the domain-neutral intervention/control principle, not the source implementation.
-- transferable.signal_shape should state the abstract trajectory/topology of the signal (for example, monotonic rise to threshold collapse), not the source metric name.
+- transferable.mechanism should describe only the functional causal relation in domain-neutral relational language, not source-domain algorithm names, protocol names, or canonical source labels.
+- transferable.control_logic should state the intervention principle in generic control language, not source-domain algorithm/protocol terms or implementation labels.
+- transferable.signal_shape should describe only trajectory/topology (for example, monotonic rise to threshold collapse), not source-domain signal names, metric names, or canonical mechanism labels.
+- Never copy canonical source-domain names into transferable.* when an abstract relational rewrite is possible. Bad: `additive increase multiplicative decrease`; better: `gradual linear ramp-up interrupted by proportional rollback after threshold breach`. Bad: `TCP retry timeout`; better: `geometrically expanding wait intervals capped by a finite retry ceiling`. Bad: `nociceptive inhibitory gating`; better: `sustained suppressive bias that shifts a downstream activation threshold`.
 - grounded.source_control should preserve source-domain implementation details for downstream reporting.
 - grounded.source_metric should preserve source-domain metric wording for downstream reporting.
 - Reject patterns that collapse to generic statements like "systems adapt to change", "multiple forces interact", or "local averaging occurs".
@@ -415,6 +416,13 @@ PATTERN_ANCHOR_STOPWORDS = {
     "without",
     "within",
 }
+PATTERN_SOURCE_LEAKAGE_GENERIC_TERMS = {
+    "declaration",
+    "event",
+    "initial",
+    "response",
+    "state",
+}
 
 
 def _normalize_text(value: object) -> str:
@@ -575,6 +583,17 @@ def _profile_transferable_pattern_quality(pattern: dict, seed: dict) -> dict:
     )
     if leakage_terms:
         concerns.append("transferable_source_leakage")
+    source_shape_terms = _transferable_source_shaped_terms(
+        pattern,
+        {
+            token
+            for field_name, tokens in field_tokens.items()
+            for token in tokens
+            if field_name in PATTERN_TRANSFERABLE_FIELDS
+        },
+    )
+    if len(source_shape_terms) >= 2:
+        concerns.append("transferable_source_shaped")
 
     overlap_pairs: list[str] = []
     for left_name, right_name in (
@@ -594,9 +613,13 @@ def _profile_transferable_pattern_quality(pattern: dict, seed: dict) -> dict:
         concerns.append("transferable_field_overlap")
 
     return {
-        "usable": not concerns,
+        "usable": not any(
+            concern != "transferable_source_shaped"
+            for concern in concerns
+        ),
         "concerns": concerns[:4],
         "source_overlap_terms": leakage_terms[:4],
+        "source_shape_terms": source_shape_terms[:4],
         "field_token_counts": {
             field_name: len(tokens)
             for field_name, tokens in field_tokens.items()
@@ -771,6 +794,8 @@ def _is_generic_grounded_source_token(token: str) -> bool:
     candidate = str(token or "").strip().lower()
     if not candidate:
         return True
+    if candidate in PATTERN_SOURCE_LEAKAGE_GENERIC_TERMS:
+        return True
     for term_group in (
         PATTERN_MECHANISM_TERMS,
         PATTERN_MEASURABLE_TERMS,
@@ -794,6 +819,25 @@ def _pattern_grounded_source_tokens(*values: object) -> set[str]:
         for token in _pattern_anchor_tokens(*values)
         if not _is_generic_grounded_source_token(token)
     }
+
+
+def _transferable_source_shaped_terms(
+    pattern: dict,
+    transferable_tokens: set[str],
+) -> list[str]:
+    """Detect overuse of source-native flat-field labels inside transferable text."""
+    source_shape_tokens = {
+        token
+        for token in _pattern_anchor_tokens(
+            pattern.get("pattern_name"),
+            pattern.get("search_query"),
+            pattern.get("measurable_signal"),
+            pattern.get("control_lever"),
+        )
+        if token not in PATTERN_GENERIC_TERMS
+        and not _is_generic_grounded_source_token(token)
+    }
+    return sorted(transferable_tokens.intersection(source_shape_tokens))
 
 
 def _seed_source_candidates_from_provenance(provenance: dict) -> list[dict]:
