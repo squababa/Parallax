@@ -491,6 +491,65 @@ def test_is_acceptable_llm_jump_query_accepts_compact_natural_language_causal_qu
     assert acceptable is True
 
 
+def test_is_acceptable_llm_jump_query_rejects_vague_preferred_phrase_fragment() -> None:
+    pattern = {
+        "search_query": "finer types gate them earlier",
+        "pattern_name": "Fine-grained validation gating",
+        "abstract_structure": (
+            "fine-grained validation gating rejects invalid payloads before "
+            "downstream execution"
+        ),
+        "measurable_signal": "invalid payload rate and downstream rejection count",
+        "control_lever": "tighten validation gating granularity before execution",
+    }
+
+    acceptable = jump._is_acceptable_llm_jump_query(
+        "finer types gate them earlier",
+        pattern,
+        "Programming Languages",
+        "Technology",
+        jump._build_jump_search_query_heuristic(
+            pattern,
+            "Programming Languages",
+            "Technology",
+        ),
+    )
+
+    assert acceptable is False
+
+
+def test_build_jump_search_query_falls_back_from_vague_llm_base_query(
+    monkeypatch,
+) -> None:
+    pattern = {
+        "search_query": "finer types gate them earlier",
+        "pattern_name": "Fine-grained validation gating",
+        "abstract_structure": (
+            "fine-grained validation gating rejects invalid payloads before "
+            "downstream execution"
+        ),
+        "measurable_signal": "invalid payload rate and downstream rejection count",
+        "control_lever": "tighten validation gating granularity before execution",
+    }
+    monkeypatch.setattr(
+        jump,
+        "_generate_json_with_retry",
+        lambda *_args, **_kwargs: json.dumps(
+            {"query": "finer types gate them earlier"}
+        ),
+    )
+
+    query = jump._build_jump_search_query(
+        pattern,
+        "Programming Languages",
+        "Technology",
+    )
+
+    assert query != "finer types gate them earlier"
+    assert "validation gating" in query
+    assert "payload" in query
+
+
 def test_build_jump_search_query_falls_back_when_llm_query_contains_source_domain(
     monkeypatch,
 ) -> None:
@@ -562,6 +621,51 @@ def test_build_jump_search_query_falls_back_when_llm_query_is_formal_token_soup(
     )
 
     assert query == expected
+
+
+def test_build_jump_search_queries_strengthens_thin_mechanism_family_spine(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        jump,
+        "_build_jump_search_query_with_metadata",
+        lambda *_args, **_kwargs: ("finer types gate them earlier", False),
+    )
+
+    queries = jump._build_jump_search_queries(
+        {
+            "search_query": "finer types gate them earlier",
+            "pattern_name": "Fine-grained validation gating",
+            "abstract_structure": (
+                "fine-grained validation gating rejects invalid payloads before "
+                "downstream execution"
+            ),
+            "measurable_signal": "invalid payload rate and downstream rejection count",
+            "control_lever": "tighten validation gating granularity before execution",
+        },
+        "Programming Languages",
+        "Technology",
+    )
+
+    assert queries == jump._build_jump_search_queries(
+        {
+            "search_query": "finer types gate them earlier",
+            "pattern_name": "Fine-grained validation gating",
+            "abstract_structure": (
+                "fine-grained validation gating rejects invalid payloads before "
+                "downstream execution"
+            ),
+            "measurable_signal": "invalid payload rate and downstream rejection count",
+            "control_lever": "tighten validation gating granularity before execution",
+        },
+        "Programming Languages",
+        "Technology",
+    )
+    assert 1 <= len(queries) <= 3
+    assert queries[0] != "finer types gate them earlier"
+    assert queries[0].startswith("finer types gate them earlier")
+    assert "fine-grained" in queries[0] or "validation" in queries[0]
+    assert jump._build_jump_search_queries.last_query_labels[0] == "mechanism-family"
 
 
 def test_lateral_jump_with_diagnostics_academic_lane_uses_improved_base_query(
