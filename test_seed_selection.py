@@ -173,16 +173,61 @@ def test_domain_to_seed_problem_frames_runtime_queries() -> None:
                 "Byzantine   fault tolerance",
                 "queue routing latency control",
                 "load balancing failover schedule",
+                "redundancy isolation control",
+                "backpressure admission scheduling",
             ],
         }
     )
 
+    assert set(runtime_seed) == {"name", "category", "seed_queries"}
     assert runtime_seed["seed_queries"] == [
-        "unsolved problems in Distributed Systems consensus algorithms distributed systems",
-        "failure modes in Distributed Systems Byzantine fault tolerance",
-        "constraints in Distributed Systems queue routing latency control",
-        "bottlenecks in Distributed Systems load balancing failover schedule",
+        "failure modes in Distributed Systems consensus algorithms distributed systems",
+        "control strategies in Distributed Systems Byzantine fault tolerance",
+        "mechanisms in Distributed Systems queue routing latency control",
+        "operating constraints in Distributed Systems load balancing failover schedule",
+        "workflow interventions in Distributed Systems redundancy isolation control",
+        "process bottlenecks in Distributed Systems backpressure admission scheduling",
     ]
+
+
+def test_problem_frame_seed_queries_cycles_query_families_deterministically() -> None:
+    queries = seed._problem_frame_seed_queries(
+        "Control Systems",
+        [
+            "threshold switching",
+            "feedback saturation",
+            "queue routing",
+            "voltage instability",
+            "redundancy isolation",
+            "timing drift",
+        ],
+    )
+
+    assert queries == [
+        "failure modes in Control Systems threshold switching",
+        "control strategies in Control Systems feedback saturation",
+        "mechanisms in Control Systems queue routing",
+        "operating constraints in Control Systems voltage instability",
+        "workflow interventions in Control Systems redundancy isolation",
+        "process bottlenecks in Control Systems timing drift",
+    ]
+
+
+def test_problem_frame_seed_queries_remains_bounded_and_skips_empty_inputs() -> None:
+    queries = seed._problem_frame_seed_queries(
+        "Distributed Systems",
+        [
+            "queue routing latency control",
+            "   ",
+            "",
+            "load balancing failover schedule",
+        ],
+    )
+
+    assert len(queries) == 2
+    assert all(query.strip() for query in queries)
+    assert queries[0].startswith("failure modes in Distributed Systems ")
+    assert queries[1].startswith("control strategies in Distributed Systems ")
 
 
 def test_pick_seed_returns_quality_diagnostics(monkeypatch) -> None:

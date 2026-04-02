@@ -216,6 +216,11 @@ def test_stage2_substage_prompts_are_scoped_to_intended_bundles() -> None:
 
     assert "Build only the target-domain core" in mechanism_prompt
     assert "Do not fill prediction, test, or edge_analysis fields in this stage." in mechanism_prompt
+    assert "`evidence_map.variable_mappings` must contain only narrow, directly supported source->target mappings tied to the same target-domain process named in `mechanism`." in mechanism_prompt
+    assert "Prefer exactly 3 strong direct mappings over padded weak mappings." in mechanism_prompt
+    assert "Keep each mapping claim at the same specificity level on both the source and target sides" in mechanism_prompt
+    assert "move that support to `evidence_map.mechanism_assertions`, not `evidence_map.variable_mappings`." in mechanism_prompt
+    assert "If fewer than 3 direct variable mappings are supportable" in mechanism_prompt
     assert '"prediction"' not in mechanism_prompt
     assert '"test"' not in mechanism_prompt
 
@@ -254,6 +259,44 @@ def test_stage2_test_prompt_ties_main_test_and_cheap_test_together() -> None:
     assert '"metric": "the same named metric as test.metric"' in prompt
     assert '"confirm": "what result on that metric confirms the hypothesis"' in prompt
     assert '"confirm": "what result would support the lever"' in prompt
+
+
+def test_stage2_test_prompt_rejects_generic_cheap_test_wording() -> None:
+    prompt = jump.STAGE2_TEST_PROMPT
+
+    assert "`edge_analysis.cheap_test` must be one real cheap operator-facing workflow slice, not a generic validation program." in prompt
+    assert "Reject generic cheap-test wording such as `run a study`, `validate the hypothesis`, `collect more data`, or `see if the effect appears`." in prompt
+    assert "`edge_analysis.cheap_test` must stay smaller, cheaper, and more decision-facing than the main test" in prompt
+
+
+def test_stage2_test_prompt_requires_metric_alignment_between_main_and_cheap_test() -> None:
+    prompt = jump.STAGE2_TEST_PROMPT
+
+    assert "`test.metric` must use a canonical literature-facing metric name" in prompt
+    assert "`test.confirm` and `test.falsify` must stay on one explicit named metric and one explicit comparator/result family." in prompt
+    assert "`edge_analysis.cheap_test.metric` must stay tightly aligned to `test.metric`: use the same named measurable quantity or a narrow comparator on that same quantity, not a generic proxy." in prompt
+
+
+def test_stage2_edge_prompt_requires_one_hidden_problem_on_same_metric_operator_context() -> None:
+    prompt = jump.STAGE2_EDGE_PROMPT
+
+    assert "`edge_analysis.problem_statement` must name exactly one hidden operational problem, blind spot, missed control point, or failure mode, not field-summary prose." in prompt
+    assert "Tie `edge_analysis.problem_statement` to the same process, the same metric/comparator, and the same operator decision already used in the current test bundle." in prompt
+    assert "Keep the whole edge layer as one operator handoff on the current claim, not a literature summary or second target outcome." in prompt
+
+
+def test_stage2_edge_prompt_requires_edge_if_right_actor_decision_and_advantage() -> None:
+    prompt = jump.STAGE2_EDGE_PROMPT
+
+    assert "`edge_analysis.actionable_lever` must name exactly one concrete operator move" in prompt
+    assert "`edge_analysis.edge_if_right` must name exactly one operator, what decision or workflow they change if confirmed, and what concrete advantage they gain." in prompt
+    assert "`edge_analysis.deployment_scope` should say where to try the lever first." in prompt
+
+
+def test_stage2_edge_prompt_requires_expected_asymmetry_to_explain_underuse() -> None:
+    prompt = jump.STAGE2_EDGE_PROMPT
+
+    assert "`edge_analysis.expected_asymmetry` must explain why the lever is plausibly underused, hidden by workflow, or screened out by standard framing, not merely say it creates an edge or has value." in prompt
 
 
 def test_stage2_substage_static_metadata_matches_intended_split() -> None:
@@ -1153,13 +1196,18 @@ def test_build_repair_prompt_marks_variable_mapping_completion_as_narrow() -> No
     )
 
     assert "This is a variable-mapping completion pass." in repair_prompt
+    assert "Keep `target_domain`, `connection`, `mechanism`, `mechanism_type`, `mechanism_type_confidence`, `secondary_mechanism_types`" in repair_prompt
+    assert "Reconstruct only the mapping bundle. Preserve the already grounded mechanism core and any existing valid `evidence_map.mechanism_assertions`." in repair_prompt
     assert (
         "prefer returning only `{\"evidence_map\": {\"variable_mappings\": [...]}}` "
         "instead of rewriting the full candidate."
     ) in repair_prompt
     assert "Complete the missing critical variable mappings from the current payload one supported entry at a time." in repair_prompt
     assert "Prefer exactly 3 strong mappings over padded weak ones." in repair_prompt
+    assert "Prefer narrow direct-support reconstruction over filler mappings." in repair_prompt
     assert "If only 1 or 2 critical mappings can be directly supported from the current payload and evidence, prefer `{\"no_connection\": true}` over weak padding or malformed partial JSON." in repair_prompt
+    assert "same target-domain process" in repair_prompt
+    assert "background process, or broader target-domain claim" in repair_prompt
     assert "Keep the critical pair wording exactly aligned to the current payload: `throw_offset -> task_offset`." in repair_prompt
     assert "Reuse this current mapping claim as the starting point and narrow it only if needed: `Periodic tasks are assigned offsets within a shared hyperperiod.`." in repair_prompt
     assert "Reuse this current evidence wording where possible and keep the repaired claim as a narrow paraphrase of it: `Tasks are assigned offsets within the hyperperiod to determine activation times.`." in repair_prompt
@@ -1764,6 +1812,46 @@ def test_stage_two_hypothesize_prompt_reuses_stage_one_solution_evidence(
     assert "Reuse Stage 1 `solution_evidence` as the workaround anchor when present." in captured["prompt"]
 
 
+def test_stage_two_hypothesize_preserves_workaround_anchor_across_substage_prompts(
+    monkeypatch,
+) -> None:
+    payload = _valid_stage2_payload()
+    split_payload = _split_stage2_payload(payload)
+    captured_prompts: dict[str, str] = {}
+
+    monkeypatch.setattr(jump, "_format_relevant_scars_for_prompt", lambda *_args: "None.")
+
+    def fake_generate_json_with_retry(prompt, stage_name, _max_tokens):
+        substage = stage_name.replace("stage2_", "")
+        captured_prompts[substage] = prompt
+        return json.dumps(split_payload[substage])
+
+    monkeypatch.setattr(jump, "_generate_json_with_retry", fake_generate_json_with_retry)
+
+    repaired, failure_hint, incomplete_fields = jump._stage_two_hypothesize_with_diagnostics(
+        source_domain=payload["source_domain"],
+        abstract_structure="load compared against a queue threshold",
+        stage_one={
+            "target_domain": payload["target_domain"],
+            "signal": "shared structural signal",
+            "evidence": payload["evidence"],
+            "solution_evidence": "filtered offset assignment is the grounded workaround",
+        },
+        search_results="Title: target paper\nconcrete target evidence",
+    )
+
+    assert repaired is not None
+    assert failure_hint is None
+    assert incomplete_fields is None
+    assert "filtered offset assignment is the grounded workaround" in captured_prompts["mechanism"]
+    assert '"solution_evidence": "filtered offset assignment is the grounded workaround"' in captured_prompts["predict"]
+    assert payload["mechanism"] in captured_prompts["predict"]
+    assert '"solution_evidence": "filtered offset assignment is the grounded workaround"' in captured_prompts["test"]
+    assert payload["prediction"]["observable"] in captured_prompts["test"]
+    assert '"solution_evidence": "filtered offset assignment is the grounded workaround"' in captured_prompts["edge"]
+    assert payload["edge_analysis"]["cheap_test"]["setup"] in captured_prompts["edge"]
+
+
 def test_stage_two_hypothesize_repair_receives_stage_one_solution_evidence(
     monkeypatch,
 ) -> None:
@@ -1993,6 +2081,12 @@ def test_run_stage_two_substage_repair_stays_local_to_owned_fields(
     assert failure_hint is None
     assert incomplete_fields is None
     assert captured["missing_fields"] == ["edge_analysis.cheap_test.time_to_signal"]
+    assert captured["original_data"]["solution_evidence"] == (
+        "filtered offset assignment is the grounded workaround"
+    )
+    assert captured["original_data"]["connection"] == payload["connection"]
+    assert captured["original_data"]["prediction"] == payload["prediction"]
+    assert set(captured["original_data"]["edge_analysis"]) == {"cheap_test"}
     assert "problem_statement" not in captured["original_data"].get("edge_analysis", {})
     assert repaired["edge_analysis"]["cheap_test"]["time_to_signal"] == (
         payload["edge_analysis"]["cheap_test"]["time_to_signal"]
@@ -2034,6 +2128,12 @@ def test_stage_two_hypothesize_assembles_split_outputs_into_current_candidate_sh
     assert assembled["test"] == payload["test"]
     assert assembled["edge_analysis"] == payload["edge_analysis"]
     assert assembled["evidence_map"] == jump.normalize_evidence_map(payload["evidence_map"])
+    assert set(assembled) == set(payload) | {"mechanism_typing", "solution_evidence"}
+    assert set(assembled["prediction"]) == set(payload["prediction"])
+    assert set(assembled["test"]) == set(payload["test"])
+    assert set(assembled["edge_analysis"]) == set(payload["edge_analysis"])
+    passed, reasons = validate_hypothesis(assembled)
+    assert passed, reasons
     assert transmit.format_transmission(
         1,
         assembled["source_domain"],

@@ -725,6 +725,176 @@ def test_lateral_jump_with_diagnostics_reports_preserved_natural_language_built_
     assert stage_inputs["stage1"] == stage_inputs["stage2"]
 
 
+def test_lateral_jump_with_diagnostics_attempts_one_alternate_retrieval_for_adjacent_first_packet(
+    monkeypatch,
+) -> None:
+    seen_calls: list[tuple[str, tuple[str, ...] | None]] = []
+    tavily_call_counts: list[int] = []
+    stage_inputs: dict[str, object] = {}
+    alternate_query = "relay gating control mechanism workaround"
+
+    monkeypatch.setattr(
+        jump,
+        "_build_jump_search_queries",
+        lambda *_args, **_kwargs: [
+            "relay gating mismatch suppression",
+            "relay gating mismatch suppression workaround",
+        ],
+    )
+    monkeypatch.setattr(
+        jump,
+        "_build_alternate_jump_search_query",
+        lambda *_args, **_kwargs: alternate_query,
+    )
+
+    def fake_search(**kwargs):
+        query = kwargs["query"]
+        include_domains = tuple(kwargs.get("include_domains") or ())
+        seen_calls.append((query, include_domains or None))
+        if include_domains:
+            return {"results": []}
+        if query == alternate_query:
+            return {
+                "results": [
+                    {
+                        "title": "Relay gating mismatch suppression",
+                        "content": (
+                            "Relay gating mismatch suppression isolates the mismatched lane "
+                            "before actuator switching."
+                        ),
+                        "url": "https://target.test/relay-alt",
+                    }
+                ]
+            }
+        if query.endswith("workaround"):
+            return {
+                "results": [
+                    {
+                        "title": "Electrochemical phase-routing asymmetry",
+                        "content": (
+                            "Electrochemical phase-routing asymmetry produces bubble "
+                            "carryover, startup maldistribution, manifold drift, and "
+                            "transient lane mismatch across parallel channels."
+                        ),
+                        "url": "https://target.test/electrochemical-asymmetry",
+                    }
+                ]
+            }
+        return {
+            "results": [
+                {
+                    "title": "Mismatch monitor note",
+                    "content": (
+                        "Lane monitor detects mismatch before launch."
+                    ),
+                    "url": "https://target.test/mismatch-monitor",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(jump._tavily, "search", fake_search)
+    monkeypatch.setattr(
+        jump,
+        "increment_tavily_calls",
+        lambda count=1: tavily_call_counts.append(count),
+    )
+
+    def fake_stage_one(**kwargs):
+        stage_inputs["stage1"] = kwargs["search_results"]
+        return (
+            {
+                "target_domain": "Safety Interlock Monitoring",
+                "signal": "shared structural signal",
+                "evidence": "specific evidence",
+                "solution_evidence": "concrete workaround",
+            },
+            None,
+        )
+
+    def fake_stage_two(**kwargs):
+        stage_inputs["stage2"] = kwargs["search_results"]
+        return (_safety_interlock_jump_payload(), None, None)
+
+    monkeypatch.setattr(jump, "_stage_one_detect_with_diagnostics", fake_stage_one)
+    monkeypatch.setattr(jump, "_stage_two_hypothesize_with_diagnostics", fake_stage_two)
+
+    connection, diagnostic = jump.lateral_jump_with_diagnostics(
+        {
+            "pattern_name": "Relay-gated mismatch suppression",
+            "abstract_structure": "relay gating suppresses mismatch faults before actuator switching",
+            "search_query": "relay gating mismatch suppression",
+        },
+        "Network Protocols",
+        "Technology",
+    )
+
+    assert connection is not None
+    assert seen_calls == [
+        ("relay gating mismatch suppression", None),
+        ("relay gating mismatch suppression workaround", None),
+        ("relay gating mismatch suppression", jump.ACADEMIC_JUMP_INCLUDE_DOMAINS),
+        (alternate_query, None),
+    ]
+    assert tavily_call_counts == [1, 1, 1, 1]
+    assert diagnostic["alternate_retrieval_attempted"] is True
+    assert diagnostic["alternate_jump_query"] == alternate_query
+    assert diagnostic["alternate_result_count"] == 1
+    assert diagnostic["result_count"] == 3
+    assert diagnostic["adjacent_retained_result_count"] == 1
+    assert stage_inputs["stage1"] == stage_inputs["stage2"]
+    assert "Retrieved via: alternate" in stage_inputs["stage1"]
+    assert "Title: Relay gating mismatch suppression" in stage_inputs["stage1"]
+    assert "Title: Mismatch monitor note" in stage_inputs["stage1"]
+
+
+def test_should_attempt_alternate_jump_retrieval_allows_one_weak_keep_in_thin_packet() -> None:
+    merged_results = [
+        {
+            "triage_class": "keep",
+            "anchor_overlap": 1,
+            "intervention_evidence": False,
+        },
+        {
+            "triage_class": "adjacent",
+            "anchor_overlap": 0,
+            "intervention_evidence": False,
+        },
+    ]
+    clustered_results = [{"results": list(merged_results)}]
+
+    assert (
+        jump._should_attempt_alternate_jump_retrieval(
+            merged_results,
+            clustered_results,
+        )
+        is True
+    )
+
+
+def test_should_attempt_alternate_jump_retrieval_skips_strong_anchored_top_cluster() -> None:
+    merged_results = [
+        {
+            "triage_class": "keep",
+            "anchor_overlap": 3,
+            "intervention_evidence": False,
+        },
+        {
+            "triage_class": "adjacent",
+            "anchor_overlap": 1,
+            "intervention_evidence": False,
+        },
+    ]
+    clustered_results = [{"results": list(merged_results)}]
+
+    assert (
+        jump._should_attempt_alternate_jump_retrieval(
+            merged_results,
+            clustered_results,
+        )
+        is False
+    )
+
+
 def test_stage_one_detect_prompt_prefers_solution_bearing_analogues(
     monkeypatch,
 ) -> None:
@@ -787,7 +957,7 @@ def test_stage_one_detect_requires_solution_evidence_field_on_positive_payload(
     )
 
 
-def test_stage_one_detect_rejects_problem_only_positive_payload_without_solution_evidence(
+def test_stage_one_detect_returns_partial_payload_without_solution_evidence(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
@@ -809,8 +979,12 @@ def test_stage_one_detect_rejects_problem_only_positive_payload_without_solution
         search_results="Retrieved via: base\nTitle: Target paper\nproblem description only",
     )
 
-    assert data is None
+    assert data is not None
     assert failure_hint == "missing_solution_evidence"
+    assert data["target_domain"] == "Safety Interlock Monitoring"
+    assert data["signal"] == "shared thresholded gating structure"
+    assert data["evidence"] == "diagnostic comparison reveals the same constraint"
+    assert "solution_evidence" not in data
 
 
 def test_dive_filters_weak_patterns_and_records_only_weak_diagnostics(
@@ -855,7 +1029,36 @@ def test_dive_keeps_stronger_patterns_and_attaches_quality_metadata(
         "_search_seed",
         lambda _seed: (
             "source material",
-            {"seed_url": "https://seed.test", "seed_excerpt": "seed excerpt"},
+            {
+                "seed_url": "https://seed.test/queue",
+                "seed_excerpt": "Queue threshold gating stabilizes service latency under congestion.",
+                "selected_seed_sources": [
+                    {
+                        "title_text": "Queue control paper",
+                        "url": "https://seed.test/queue",
+                        "clean": "Queue threshold gating stabilizes service latency under congestion.",
+                        "selection_reasons": ["primary/operator source", "mechanism-rich"],
+                        "source_type": "scholarly_primary",
+                        "likely_primary_or_operator_source": True,
+                        "mechanism_signal": True,
+                        "intervention_signal": True,
+                        "query_index": 0,
+                        "specificity_score": 8,
+                    },
+                    {
+                        "title_text": "Retry control note",
+                        "url": "https://seed.test/retry",
+                        "clean": "Retry budget limits resend storms once repeated failures accumulate.",
+                        "selection_reasons": ["mechanism-rich"],
+                        "source_type": "general_web",
+                        "likely_primary_or_operator_source": False,
+                        "mechanism_signal": True,
+                        "intervention_signal": False,
+                        "query_index": 1,
+                        "specificity_score": 6,
+                    },
+                ],
+            },
         ),
     )
     monkeypatch.setattr(
@@ -915,9 +1118,103 @@ def test_dive_keeps_stronger_patterns_and_attaches_quality_metadata(
         "Retry-window loss control",
     ]
     assert all("pattern_quality" in pattern for pattern in patterns)
+    assert all("source_anchor" in pattern for pattern in patterns)
+    assert all("_source_anchor_score" not in pattern for pattern in patterns)
+    assert explore.PATTERN_REQUIRED_FIELDS.issubset(patterns[0].keys())
+    assert patterns[0]["seed_url"] == "https://seed.test/queue"
+    assert patterns[0]["seed_excerpt"] == "Queue threshold gating stabilizes service latency under congestion."
+    assert patterns[0]["source_anchor"]["title"] == "Queue control paper"
+    assert patterns[0]["source_anchor"]["url"] == "https://seed.test/queue"
+    assert "Queue threshold gating stabilizes service latency" in patterns[0]["source_anchor"]["snippet"]
+    assert "matched source terms" in patterns[0]["source_anchor"]["note"]
     assert patterns[0]["pattern_quality"]["jump_support_score"] >= patterns[1]["pattern_quality"]["jump_support_score"]
     assert seed["pattern_diagnostics"]["retained_pattern_count"] == 2
     assert seed["pattern_diagnostics"]["high_quality_count"] >= 1
+
+
+def test_dive_keeps_quality_tie_order_even_when_later_pattern_is_better_anchored(
+    monkeypatch,
+) -> None:
+    seed = {"name": "Network Protocols", "category": "Technology", "seed_queries": []}
+    monkeypatch.setattr(
+        explore,
+        "_search_seed",
+        lambda _seed: (
+            "source material",
+            {
+                "seed_url": "https://seed.test/queue",
+                "seed_excerpt": "Queue threshold gating stabilizes service latency under congestion.",
+                "selected_seed_sources": [
+                    {
+                        "title_text": "Queue control paper",
+                        "url": "https://seed.test/queue",
+                        "clean": "Queue threshold gating stabilizes service latency under congestion.",
+                        "selection_reasons": ["mechanism-rich"],
+                        "source_type": "general_web",
+                        "likely_primary_or_operator_source": False,
+                        "mechanism_signal": True,
+                        "intervention_signal": True,
+                        "query_index": 0,
+                        "specificity_score": 8,
+                    }
+                ],
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        explore,
+        "_generate_json_with_retry",
+        lambda *_args, **_kwargs: json.dumps(
+            {
+                "patterns": [
+                    {
+                        "pattern_name": "Comparator-driven arbitration handoff",
+                        "description": "A comparator redistributes work when arbitration pressure shifts.",
+                        "abstract_structure": (
+                            "A monitored load comparator redistributes demand across pathways "
+                            "when arbitration pressure exceeds a control boundary."
+                        ),
+                        "search_query": "arbitration comparator redistribution pressure",
+                        "measurable_signal": "arbitration pressure and reassignment rate",
+                        "control_lever": "adjust the comparator boundary",
+                        "transfer_rationale": "Transfers to systems that reroute work after comparator checks.",
+                    },
+                    {
+                        "pattern_name": "Queue-threshold congestion gating",
+                        "description": "Queue threshold gating suppresses inflow and stabilizes delay.",
+                        "abstract_structure": (
+                            "Increasing queue load is compared against a threshold; "
+                            "crossing it throttles inflow and lowers service latency."
+                        ),
+                        "search_query": "queue threshold throttling latency",
+                        "measurable_signal": "queue length and mean delay",
+                        "control_lever": "adjust the congestion threshold",
+                        "transfer_rationale": "Transfers to buffered systems that gate inflow under overload.",
+                    },
+                ]
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        explore,
+        "_profile_pattern_quality",
+        lambda *_args, **_kwargs: {
+            "score": 0.81,
+            "band": "high",
+            "jump_support_score": 0.81,
+            "jump_ready": True,
+            "strengths": ["mechanism-rich"],
+            "concerns": [],
+            "summary": "high-quality pattern (0.81); jump ready (0.81)",
+        },
+    )
+    monkeypatch.setattr(explore, "PATTERN_MAX_RETURNED", 1)
+
+    patterns = explore.dive(seed)
+
+    assert len(patterns) == 1
+    assert patterns[0]["pattern_name"] == "Comparator-driven arbitration handoff"
+    assert "source_anchor" not in patterns[0]
 
 
 def test_search_seed_uses_three_queries_with_bounded_richness(monkeypatch) -> None:
@@ -953,6 +1250,8 @@ def test_search_seed_uses_three_queries_with_bounded_richness(monkeypatch) -> No
         }
     )
 
+    assert isinstance(combined, str)
+    assert isinstance(provenance, dict)
     assert [call["query"] for call in calls] == [
         "queue routing latency control",
         "load balancing failover schedule",
@@ -967,11 +1266,14 @@ def test_search_seed_uses_three_queries_with_bounded_richness(monkeypatch) -> No
     assert "should not be queried" not in combined
     assert combined == (
         "Source: queue routing latency control source\n"
-        "queue routing latency control mechanism evidence\n\n"
+        "Host: seed.test | Source type: general web | Selected because: mechanism-rich\n"
+        "Snippet: queue routing latency control mechanism evidence\n\n"
         "Source: load balancing failover schedule source\n"
-        "load balancing failover schedule mechanism evidence\n\n"
+        "Host: seed.test | Source type: general web | Selected because: mechanism-rich, intervention-bearing\n"
+        "Snippet: load balancing failover schedule mechanism evidence\n\n"
         "Source: backpressure retry collapse source\n"
-        "backpressure retry collapse mechanism evidence\n"
+        "Host: seed.test | Source type: general web | Selected because: mechanism-rich\n"
+        "Snippet: backpressure retry collapse mechanism evidence\n"
     )
     assert provenance["seed_url"] == "https://seed.test/1"
     assert provenance["seed_excerpt"] == "queue routing latency control mechanism evidence"
@@ -985,6 +1287,11 @@ def test_search_seed_skips_empty_or_noisy_results_and_keeps_first_usable_provena
             "results": [
                 {"title": "Empty", "content": "", "url": "https://seed.test/empty"},
                 {"title": "Noise", "content": "   ", "url": "https://seed.test/noise"},
+                {
+                    "title": "Queueing overview",
+                    "content": "General background overview of queueing systems.",
+                    "url": "https://seed.test/overview",
+                },
                 {
                     "title": "Useful",
                     "content": "Signal threshold gating stabilizes queue delay.",
@@ -1028,14 +1335,53 @@ def test_search_seed_skips_empty_or_noisy_results_and_keeps_first_usable_provena
         }
     )
 
+    assert "Queueing overview" not in combined
     assert combined == (
         "Source: Useful\n"
-        "Signal threshold gating stabilizes queue delay.\n\n"
+        "Host: seed.test | Source type: general web | Selected because: mechanism-rich\n"
+        "Snippet: Signal threshold gating stabilizes queue delay.\n\n"
         "Source: Second useful\n"
-        "Retry budget limits resend storms.\n"
+        "Host: seed.test | Source type: general web | Selected because: mechanism-rich\n"
+        "Snippet: Retry budget limits resend storms.\n"
     )
     assert provenance["seed_url"] == "https://seed.test/useful"
     assert provenance["seed_excerpt"] == "Signal threshold gating stabilizes queue delay."
+
+
+def test_classify_seed_search_result_keeps_scholarly_type_for_review_language() -> None:
+    classified = explore._classify_seed_search_result(
+        title_text="Comprehensive Review of Queue Gating Mechanisms",
+        url="https://pubmed.ncbi.nlm.nih.gov/12345/",
+        clean="This review compares threshold gating and routing control in operator workflows.",
+        query_index=0,
+    )
+
+    assert classified["source_type"] == "scholarly_primary"
+    assert classified["broad_matches"]
+
+
+def test_classify_seed_search_result_keeps_operator_type_for_manual_language() -> None:
+    classified = explore._classify_seed_search_result(
+        title_text="Operations Manual Overview for Switching Protocols",
+        url="https://agency.gov/operations/manuals/switching",
+        clean="The manual describes protocol controls, mitigation steps, and scheduling interventions.",
+        query_index=0,
+    )
+
+    assert classified["source_type"] == "operator_or_technical"
+    assert classified["broad_matches"]
+
+
+def test_classify_seed_search_result_marks_plain_web_overview_as_broad() -> None:
+    classified = explore._classify_seed_search_result(
+        title_text="Introduction to Queueing Systems",
+        url="https://example.com/queueing-overview",
+        clean="This overview introduces general background concepts and review material.",
+        query_index=0,
+    )
+
+    assert classified["source_type"] == "broad_overview"
+    assert classified["score"] < 20
 
 
 def test_finalize_pattern_diagnostics_marks_patterns_too_weak_for_jump() -> None:
@@ -1232,7 +1578,7 @@ def test_lateral_jump_with_diagnostics_does_not_mislabel_stage1_generation_failu
     assert diagnostic["stage2_outcome"] is None
 
 
-def test_lateral_jump_with_diagnostics_treats_missing_solution_evidence_as_detect_no_signal(
+def test_lateral_jump_with_diagnostics_preserves_missing_solution_evidence_as_weak_signal(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
@@ -1272,9 +1618,207 @@ def test_lateral_jump_with_diagnostics_treats_missing_solution_evidence_as_detec
     )
 
     assert connection is None
-    assert diagnostic["stage1_outcome"] == "detect_no_signal"
+    assert diagnostic["stage1_outcome"] == "weak_signal"
+    assert diagnostic["stage1_target_domain"] == "Wireless Scheduling"
     assert diagnostic["stage1_failure_hint"] == "missing_solution_evidence"
+    assert diagnostic["stage1_soft_gate_attempted"] is True
+    assert diagnostic["stage1_soft_gate_recovered"] is False
     assert diagnostic["stage2_outcome"] is None
+
+
+def test_lateral_jump_with_diagnostics_runs_one_bounded_stage1_soft_gate_recovery_pass(
+    monkeypatch,
+) -> None:
+    seen_calls: list[tuple[str, tuple[str, ...] | None]] = []
+    stage_one_calls: list[str] = []
+
+    def fake_search(**kwargs):
+        query = kwargs["query"]
+        include_domains = tuple(kwargs.get("include_domains") or ())
+        seen_calls.append((query, include_domains or None))
+        return {
+            "results": [
+                {
+                    "title": "Wireless scheduling paper",
+                    "content": (
+                        "Queue threshold gating in wireless scheduling shows the same "
+                        "collision-control structure."
+                    ),
+                    "url": "https://target.test/wireless-scheduling",
+                }
+            ]
+        }
+
+    def fake_stage_one(**kwargs):
+        stage_one_calls.append(kwargs["search_results"])
+        return (
+            {
+                "target_domain": "Wireless Scheduling",
+                "signal": "shared structural signal",
+                "evidence": "specific evidence",
+            },
+            "missing_solution_evidence",
+        )
+
+    monkeypatch.setattr(jump._tavily, "search", fake_search)
+    monkeypatch.setattr(
+        jump,
+        "_build_jump_search_queries",
+        lambda *_args, **_kwargs: [
+            "queue threshold throttling latency",
+            "queue threshold throttling latency workaround",
+        ],
+    )
+    monkeypatch.setattr(
+        jump,
+        "_classify_weak_jump_result",
+        lambda *_args, **_kwargs: (
+            False,
+            {
+                "anchor_overlap": 2,
+                "preferred_phrase_match": True,
+                "solution_marker_count": 0,
+                "intervention_marker_count": 0,
+                "intervention_evidence": False,
+                "intervention_signal": "",
+            },
+        ),
+    )
+    monkeypatch.setattr(jump, "_stage_one_detect_with_diagnostics", fake_stage_one)
+    monkeypatch.setattr(
+        jump,
+        "_stage_two_hypothesize_with_diagnostics",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Stage 2 should not run for an unrecovered weak signal")
+        ),
+    )
+
+    connection, diagnostic = jump.lateral_jump_with_diagnostics(
+        {
+            "pattern_name": "Queue-threshold congestion gating",
+            "abstract_structure": "load compared against a queue threshold",
+            "search_query": "queue threshold throttling latency",
+        },
+        "Network Protocols",
+        "Technology",
+    )
+
+    recovery_query = (
+        "queue threshold throttling latency Wireless Scheduling "
+        "workaround mitigation intervention control"
+    )
+
+    assert connection is None
+    assert diagnostic["stage1_outcome"] == "weak_signal"
+    assert diagnostic["stage1_soft_gate_attempted"] is True
+    assert diagnostic["stage1_soft_gate_recovered"] is False
+    assert len(stage_one_calls) == 2
+    assert seen_calls == [
+        ("queue threshold throttling latency", None),
+        ("queue threshold throttling latency workaround", None),
+        ("queue threshold throttling latency", jump.ACADEMIC_JUMP_INCLUDE_DOMAINS),
+        (recovery_query, None),
+        (recovery_query, jump.ACADEMIC_JUMP_INCLUDE_DOMAINS),
+    ]
+
+
+def test_lateral_jump_with_diagnostics_upgrades_weak_signal_after_soft_gate_recovery(
+    monkeypatch,
+) -> None:
+    stage_one_calls: list[str] = []
+    stage_two_calls: list[dict] = []
+
+    monkeypatch.setattr(
+        jump._tavily,
+        "search",
+        lambda **_kwargs: {
+            "results": [
+                {
+                    "title": "Wireless scheduling paper",
+                    "content": (
+                        "Queue threshold gating in wireless scheduling reveals the same "
+                        "collision-control structure and one operator intervention."
+                    ),
+                    "url": "https://target.test/wireless-scheduling",
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        jump,
+        "_classify_weak_jump_result",
+        lambda *_args, **_kwargs: (
+            False,
+            {
+                "anchor_overlap": 2,
+                "preferred_phrase_match": True,
+                "solution_marker_count": 1,
+                "intervention_marker_count": 1,
+                "intervention_evidence": True,
+                "intervention_signal": "operator intervention present",
+            },
+        ),
+    )
+
+    def fake_stage_one(**kwargs):
+        stage_one_calls.append(kwargs["search_results"])
+        if len(stage_one_calls) == 1:
+            return (
+                {
+                    "target_domain": "Wireless Scheduling",
+                    "signal": "shared structural signal",
+                    "evidence": "specific evidence",
+                },
+                "missing_solution_evidence",
+            )
+        return (
+            {
+                "target_domain": "Wireless Scheduling",
+                "signal": "shared structural signal",
+                "evidence": "specific evidence",
+                "solution_evidence": "threshold gate lowers collision pressure",
+            },
+            None,
+        )
+
+    def fake_stage_two(**kwargs):
+        stage_two_calls.append(kwargs)
+        return (
+            _safety_interlock_jump_payload()
+            | {
+                "target_domain": "Wireless Scheduling",
+                "connection": "Specific connection",
+            },
+            None,
+            None,
+        )
+
+    monkeypatch.setattr(jump, "_stage_one_detect_with_diagnostics", fake_stage_one)
+    monkeypatch.setattr(jump, "_stage_two_hypothesize_with_diagnostics", fake_stage_two)
+
+    connection, diagnostic = jump.lateral_jump_with_diagnostics(
+        {
+            "pattern_name": "Queue-threshold congestion gating",
+            "abstract_structure": "load compared against a queue threshold",
+            "search_query": "queue threshold throttling latency",
+        },
+        "Network Protocols",
+        "Technology",
+    )
+
+    assert connection is not None
+    assert diagnostic["stage1_outcome"] == "detect_signal"
+    assert diagnostic["stage1_target_domain"] == "Wireless Scheduling"
+    assert diagnostic["stage1_failure_hint"] is None
+    assert diagnostic["stage1_soft_gate_attempted"] is True
+    assert diagnostic["stage1_soft_gate_recovered"] is True
+    assert diagnostic["stage2_outcome"] == "connection_found"
+    assert len(stage_one_calls) == 2
+    assert len(stage_two_calls) == 1
+    assert (
+        stage_two_calls[0]["stage_one"]["solution_evidence"]
+        == "threshold gate lowers collision pressure"
+    )
 
 
 def test_lateral_jump_with_diagnostics_records_stage2_no_connection(monkeypatch) -> None:
@@ -2105,6 +2649,128 @@ def test_lateral_jump_with_diagnostics_keeps_broad_result_with_anchor_overlap(
     assert "Overview of relay gating mismatch suppression" in stage_inputs["stage1"]
 
 
+def test_classify_weak_jump_result_marks_specific_intervention_hit_as_adjacent() -> None:
+    should_drop, context = jump._classify_weak_jump_result(
+        title_text="Overview of electrochemical gas phase suppression",
+        url="https://medium.com/electrochemical-overview",
+        clean=(
+            "Operators suppress bubble carryover by adjusting flow rate "
+            "during startup in two-phase electrochemical reactors."
+        ),
+        preferred_anchor_phrases=["relay gating mismatch"],
+        strong_anchor_tokens={"relay", "gating", "mismatch", "actuator"},
+    )
+
+    assert should_drop is False
+    assert context["triage_class"] == "adjacent"
+    assert context["intervention_evidence"] is True
+
+
+def test_classify_weak_jump_result_drops_broad_specificity_only_result() -> None:
+    should_drop, context = jump._classify_weak_jump_result(
+        title_text="Overview of electrochemical gas phase dynamics",
+        url="https://medium.com/electrochemical-overview",
+        clean=(
+            "Two-phase electrochemical reactors exhibit bubble carryover, "
+            "recirculation asymmetry, electrode flooding, gas-channel "
+            "maldistribution, impedance spikes, and transient pressure coupling "
+            "across parallel manifolds."
+        ),
+        preferred_anchor_phrases=["relay gating mismatch"],
+        strong_anchor_tokens={"relay", "gating", "mismatch", "actuator"},
+    )
+
+    assert should_drop is True
+    assert context["triage_class"] == "drop"
+    assert context["intervention_evidence"] is False
+
+
+def test_lateral_jump_with_diagnostics_retains_adjacent_specific_hit_but_drops_broad_junk(
+    monkeypatch,
+) -> None:
+    stage_inputs: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        jump,
+        "_build_jump_search_queries",
+        lambda *_args, **_kwargs: ["relay gating mismatch suppression"],
+    )
+
+    def fake_search(**kwargs):
+        if kwargs.get("include_domains"):
+            return {"results": []}
+        return {
+            "results": [
+                {
+                    "title": "Relay gating mismatch suppression",
+                    "content": (
+                        "Relay gating mismatch suppression isolates the mismatched lane "
+                        "before actuator switching."
+                    ),
+                    "url": "https://target.test/anchored",
+                },
+                {
+                    "title": "Overview of electrochemical gas phase suppression",
+                    "content": (
+                        "Operators suppress bubble carryover by adjusting flow rate "
+                        "during startup in two-phase electrochemical reactors."
+                    ),
+                    "url": "https://medium.com/electrochemical-overview",
+                },
+                {
+                    "title": "What is actuator routing",
+                    "content": "broad background context only",
+                    "url": "https://medium.com/overview",
+                },
+            ]
+        }
+
+    monkeypatch.setattr(jump._tavily, "search", fake_search)
+
+    def fake_stage_one(**kwargs):
+        stage_inputs["stage1"] = kwargs["search_results"]
+        return (
+            {
+                "target_domain": "Safety Interlock Monitoring",
+                "signal": "shared structural signal",
+                "evidence": "specific evidence",
+                "solution_evidence": "concrete workaround",
+            },
+            None,
+        )
+
+    monkeypatch.setattr(jump, "_stage_one_detect_with_diagnostics", fake_stage_one)
+    monkeypatch.setattr(
+        jump,
+        "_stage_two_hypothesize_with_diagnostics",
+        lambda **_kwargs: (_safety_interlock_jump_payload(), None, None),
+    )
+
+    connection, diagnostic = jump.lateral_jump_with_diagnostics(
+        {
+            "pattern_name": "Relay-gated mismatch suppression",
+            "abstract_structure": "relay gating suppresses mismatch faults before actuator switching",
+            "search_query": "relay gating mismatch suppression",
+        },
+        "Network Protocols",
+        "Technology",
+    )
+
+    assert connection is not None
+    assert diagnostic["general_result_count"] == 3
+    assert diagnostic["filtered_result_count"] == 1
+    assert diagnostic["result_count"] == 2
+    assert diagnostic["adjacent_retained_result_count"] == 1
+    assert "What is actuator routing" not in stage_inputs["stage1"]
+    assert "Title: Relay gating mismatch suppression" in stage_inputs["stage1"]
+    assert "Title: Overview of electrochemical gas phase suppression" in stage_inputs["stage1"]
+    assert stage_inputs["stage1"].index(
+        "Title: Relay gating mismatch suppression"
+    ) < stage_inputs["stage1"].index(
+        "Title: Overview of electrochemical gas phase suppression"
+    )
+
+
 def test_lateral_jump_with_diagnostics_prefers_anchored_cluster_over_collision_prone_result(
     monkeypatch,
 ) -> None:
@@ -2257,6 +2923,98 @@ def test_lateral_jump_with_diagnostics_promotes_intervention_bearing_cluster(
     assert stage_inputs["stage1"].index(
         "Title: Electrochemical gas phase suppression"
     ) < stage_inputs["stage1"].index("Title: Electrochemical gas phase dynamics")
+
+
+def test_lateral_jump_with_diagnostics_enriches_stage1_packet_with_evidence_roles(
+    monkeypatch,
+) -> None:
+    stage_inputs: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        jump,
+        "_build_jump_search_queries",
+        lambda *_args, **_kwargs: ["relay gating mismatch suppression"],
+    )
+    monkeypatch.setattr(
+        jump._tavily,
+        "search",
+        lambda **_kwargs: {
+            "results": [
+                {
+                    "title": "Relay gating mismatch suppression",
+                    "content": (
+                        "Relay gating mismatch suppression isolates the mismatched lane "
+                        "before actuator switching."
+                    ),
+                    "url": "https://target.test/relay-1",
+                },
+                {
+                    "title": "Relay gating mismatch monitoring",
+                    "content": (
+                        "Redundant relay mismatch monitoring compares lane states "
+                        "before actuator startup."
+                    ),
+                    "url": "https://target.test/relay-2",
+                },
+                {
+                    "title": "Relay gating operator response",
+                    "content": (
+                        "Operators isolate the failing lane as a practical workaround "
+                        "when mismatch alarms trigger before actuation."
+                    ),
+                    "url": "https://target.test/relay-3",
+                },
+            ]
+        },
+    )
+
+    def fake_stage_one(**kwargs):
+        stage_inputs["stage1"] = kwargs["search_results"]
+        return (
+            {
+                "target_domain": "Safety Interlock Monitoring",
+                "signal": "shared structural signal",
+                "evidence": "specific evidence",
+                "solution_evidence": "concrete workaround",
+            },
+            None,
+        )
+
+    monkeypatch.setattr(jump, "_stage_one_detect_with_diagnostics", fake_stage_one)
+    monkeypatch.setattr(
+        jump,
+        "_stage_two_hypothesize_with_diagnostics",
+        lambda **_kwargs: (_safety_interlock_jump_payload(), None, None),
+    )
+
+    connection, _diagnostic = jump.lateral_jump_with_diagnostics(
+        {
+            "pattern_name": "Relay-gated mismatch suppression",
+            "abstract_structure": "relay gating suppresses mismatch faults before actuator switching",
+            "search_query": "relay gating mismatch suppression",
+        },
+        "Network Protocols",
+        "Technology",
+    )
+
+    assert connection is not None
+    assert "Mechanism evidence:" in stage_inputs["stage1"]
+    assert "Intervention/workaround evidence:" in stage_inputs["stage1"]
+    assert "Operator response evidence:" in stage_inputs["stage1"]
+    assert (
+        "Relay gating mismatch suppression isolates the mismatched lane "
+        "before actuator switching."
+    ) in stage_inputs["stage1"]
+    assert (
+        "Operators isolate the failing lane as a practical workaround "
+        "when mismatch alarms trigger before actuation."
+    ) in stage_inputs["stage1"]
+    assert stage_inputs["stage1"].count("Title: Relay gating mismatch suppression") == 1
+    assert stage_inputs["stage1"].count("Title: Relay gating operator response") == 1
+    assert "Title: Relay gating mismatch monitoring" in stage_inputs["stage1"]
+    assert "Search result 2:" not in stage_inputs["stage1"]
+    assert "Search result 3:" not in stage_inputs["stage1"]
+    assert stage_inputs["stage1"].count("Snippet:") <= 5
 
 
 def test_lateral_jump_with_diagnostics_does_not_promote_descriptive_process_paper_as_intervention(
@@ -2681,15 +3439,18 @@ def test_lateral_jump_with_diagnostics_prefers_evidence_map_core_target_anchor(
         jump._tavily,
         "search",
         lambda **_kwargs: {
-            "results": [
-                {
-                    "title": "Industrial safety overview",
-                    "content": "Safety systems reduce faults across manufacturing plants.",
-                    "url": "https://magazine.test/safety-overview",
-                }
-            ]
-        },
-    )
+                "results": [
+                    {
+                        "title": "Industrial safety diagnostic controls",
+                        "content": (
+                            "Safety diagnostic controls reduce faults across "
+                            "manufacturing plants."
+                        ),
+                        "url": "https://magazine.test/safety-diagnostics",
+                    }
+                ]
+            },
+        )
     monkeypatch.setattr(
         jump,
         "_stage_one_detect_with_diagnostics",
@@ -2759,17 +3520,18 @@ def test_lateral_jump_with_diagnostics_sets_aligned_source_display_fields(
         jump._tavily,
         "search",
         lambda **_kwargs: {
-            "results": [
-                {
-                    "title": "Industrial safety overview",
-                    "content": (
-                        "Safety systems reduce faults across manufacturing plants."
-                    ),
-                    "url": "https://magazine.test/safety-overview",
-                }
-            ]
-        },
-    )
+                "results": [
+                    {
+                        "title": "Industrial safety diagnostic controls",
+                        "content": (
+                            "Safety diagnostic controls reduce faults across "
+                            "manufacturing plants."
+                        ),
+                        "url": "https://magazine.test/safety-diagnostics",
+                    }
+                ]
+            },
+        )
     monkeypatch.setattr(
         jump,
         "_stage_one_detect_with_diagnostics",
@@ -2852,17 +3614,18 @@ def test_lateral_jump_with_diagnostics_prefers_grounded_seed_excerpt_over_descri
         jump._tavily,
         "search",
         lambda **_kwargs: {
-            "results": [
-                {
-                    "title": "Industrial safety overview",
-                    "content": (
-                        "Safety systems reduce faults across manufacturing plants."
-                    ),
-                    "url": "https://magazine.test/safety-overview",
-                }
-            ]
-        },
-    )
+                "results": [
+                    {
+                        "title": "Industrial safety diagnostic controls",
+                        "content": (
+                            "Safety diagnostic controls reduce faults across "
+                            "manufacturing plants."
+                        ),
+                        "url": "https://magazine.test/safety-diagnostics",
+                    }
+                ]
+            },
+        )
     monkeypatch.setattr(
         jump,
         "_stage_one_detect_with_diagnostics",
@@ -3078,9 +3841,53 @@ def test_jump_diagnostics_report_prints_attempts_and_aggregate(temp_db, capsys) 
     assert "[JumpDiagnostics] Recent 1 explorations" in output
     assert "pattern=Pattern A | query=query a | results=0 | stage1=no_results | stage2=—" in output
     assert "pattern=Pattern B | query=query b | results=2 | stage1=detect_signal | stage2=stage2_no_connection" in output
+    assert "prestage1=" not in output
     assert "total_attempted_patterns\t2" in output
     assert "no_results\t1\t50.0%" in output
     assert "stage2_no_connection\t1\t50.0%" in output
+
+
+def test_jump_diagnostics_report_prints_prestage1_observability_when_relevant(
+    temp_db,
+    capsys,
+) -> None:
+    store.save_exploration(
+        seed_domain="Network Protocols",
+        seed_category="Technology",
+        pattern_diagnostics={
+            "summary": "patterns_ready: kept 2/2 patterns; jump_outcome=patterns_present_but_no_connection",
+            "jump_attempts": [
+                {
+                    "pattern_name": "Pattern Hard",
+                    "built_jump_query": "query hard",
+                    "result_count": 1,
+                    "stage1_outcome": "detect_no_signal",
+                    "stage1_failure_hint": "no_connection",
+                },
+                {
+                    "pattern_name": "Pattern Adjacent",
+                    "built_jump_query": "query adjacent",
+                    "result_count": 3,
+                    "stage1_outcome": "detect_no_signal",
+                    "stage1_failure_hint": "no_connection",
+                    "alternate_retrieval_attempted": True,
+                    "adjacent_result_count": 1,
+                    "retained_adjacent_result_count": 1,
+                    "enriched_packet": True,
+                },
+            ],
+        },
+        transmitted=False,
+    )
+
+    main._print_jump_diagnostics(limit=5)
+    output = capsys.readouterr().out
+
+    assert "prestage1=hard_no_signal" in output
+    assert (
+        "prestage1=adjacent_packet | alternate=yes | enriched_packet=yes | "
+        "adjacent=1 | retained_adjacent=1"
+    ) in output
 
 
 def test_jump_diagnostics_report_prints_repair_incomplete_fields(
@@ -3117,6 +3924,112 @@ def test_jump_diagnostics_report_prints_repair_incomplete_fields(
 
     assert "failure_hint=repair_incomplete" in output
     assert "incomplete_fields=mechanism, edge_analysis.actionable_lever" in output
+
+
+def test_jump_diagnostics_report_prints_soft_gate_status_for_weak_signal(
+    temp_db,
+    capsys,
+) -> None:
+    store.save_exploration(
+        seed_domain="Network Protocols",
+        seed_category="Technology",
+        pattern_diagnostics={
+            "summary": "patterns_ready: kept 1/1 patterns; jump_outcome=patterns_present_but_no_connection",
+            "jump_attempts": [
+                {
+                    "pattern_name": "Pattern Weak",
+                    "built_jump_query": "query weak",
+                    "result_count": 2,
+                    "top_result_titles": ["Target Weak"],
+                    "stage1_outcome": "weak_signal",
+                    "stage1_target_domain": "Wireless Scheduling",
+                    "stage1_failure_hint": "missing_solution_evidence",
+                    "stage1_soft_gate_attempted": True,
+                    "stage1_soft_gate_recovered": False,
+                    "stage2_outcome": None,
+                },
+            ],
+        },
+        transmitted=False,
+    )
+
+    main._print_jump_diagnostics(limit=5)
+    output = capsys.readouterr().out
+
+    assert (
+        "pattern=Pattern Weak | query=query weak | results=2 | "
+        "stage1=weak_signal | stage2=—"
+    ) in output
+    assert "soft_gate=attempted,not_recovered" in output
+
+
+def test_jump_diagnostics_report_prints_soft_gate_status_for_recovered_detect_signal(
+    temp_db,
+    capsys,
+) -> None:
+    store.save_exploration(
+        seed_domain="Network Protocols",
+        seed_category="Technology",
+        pattern_diagnostics={
+            "summary": "patterns_ready: kept 1/1 patterns; jump_outcome=patterns_present_but_no_connection",
+            "jump_attempts": [
+                {
+                    "pattern_name": "Pattern Recovered",
+                    "built_jump_query": "query recovered",
+                    "result_count": 3,
+                    "top_result_titles": ["Target Recovered"],
+                    "stage1_outcome": "detect_signal",
+                    "stage1_target_domain": "Wireless Scheduling",
+                    "stage1_soft_gate_attempted": True,
+                    "stage1_soft_gate_recovered": True,
+                    "stage2_outcome": "stage2_no_connection",
+                    "stage2_failure_hint": "returned_no_connection",
+                },
+            ],
+        },
+        transmitted=False,
+    )
+
+    main._print_jump_diagnostics(limit=5)
+    output = capsys.readouterr().out
+
+    assert (
+        "pattern=Pattern Recovered | query=query recovered | results=3 | "
+        "stage1=detect_signal | stage2=stage2_no_connection"
+    ) in output
+    assert "soft_gate=attempted,recovered" in output
+
+
+def test_jump_diagnostics_report_omits_soft_gate_line_for_ordinary_attempts(
+    temp_db,
+    capsys,
+) -> None:
+    store.save_exploration(
+        seed_domain="Network Protocols",
+        seed_category="Technology",
+        pattern_diagnostics={
+            "summary": "patterns_ready: kept 1/1 patterns; jump_outcome=patterns_present_but_no_connection",
+            "jump_attempts": [
+                {
+                    "pattern_name": "Pattern Ordinary",
+                    "built_jump_query": "query ordinary",
+                    "result_count": 2,
+                    "top_result_titles": ["Target Ordinary"],
+                    "stage1_outcome": "detect_signal",
+                    "stage1_target_domain": "Wireless Scheduling",
+                    "stage2_outcome": "stage2_no_connection",
+                    "stage2_failure_hint": "returned_no_connection",
+                },
+            ],
+        },
+        transmitted=False,
+    )
+
+    main._print_jump_diagnostics(limit=5)
+    output = capsys.readouterr().out
+
+    assert "pattern=Pattern Ordinary | query=query ordinary | results=2" in output
+    assert "soft_gate=" not in output
 
 
 def test_lateral_jump_with_diagnostics_records_benchmark_snapshot(monkeypatch) -> None:
@@ -3526,6 +4439,63 @@ def test_run_jump_benchmark_marks_jump_case_improved(tmp_path, capsys, monkeypat
     assert "IMPROVED\tjump_attempt\tjump-case-1" in output
     assert "replay_mode=full" in output
     assert "actual=detect_signal -> connection_found" in output
+
+
+def test_run_jump_benchmark_marks_jump_case_improved_to_weak_signal(
+    tmp_path,
+    capsys,
+    monkeypatch,
+) -> None:
+    benchmark_file = tmp_path / "jump_replay_benchmark.json"
+    benchmark_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "cases": [
+                    {
+                        "id": "jump-case-weak",
+                        "label": "jump case weak",
+                        "type": "jump_attempt",
+                        "source_domain": "Network Protocols",
+                        "pattern_name": "Queue-threshold congestion gating",
+                        "abstract_structure": "load compared against a queue threshold",
+                        "search_results": "Candidate cluster 1:\nTitle: Wireless scheduling paper",
+                        "expected": {
+                            "stage1_outcome": "detect_no_signal",
+                            "stage2_outcome": None,
+                        },
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        main.jump_module,
+        "_stage_one_detect_with_diagnostics",
+        lambda **_kwargs: (
+            {
+                "target_domain": "Wireless Scheduling",
+                "signal": "shared structural signal",
+                "evidence": "specific evidence",
+            },
+            "missing_solution_evidence",
+        ),
+    )
+    monkeypatch.setattr(
+        main.jump_module,
+        "_stage_two_hypothesize_with_diagnostics",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Stage 2 replay should not run for a weak signal")
+        ),
+    )
+
+    assert main._run_jump_benchmark(benchmark_file, 0.6) is True
+    output = capsys.readouterr().out
+    assert "IMPROVED\tjump_attempt\tjump-case-weak" in output
+    assert "actual=weak_signal -> —" in output
+    assert "stage1_failure_hint=missing_solution_evidence" in output
 
 
 def test_run_jump_benchmark_uses_stage2_only_replay_when_stage_one_success_present(
