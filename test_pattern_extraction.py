@@ -3235,6 +3235,91 @@ def test_build_jump_search_content_keeps_strong_keep_evidence_primary_during_adj
     assert packet_observability["adjacent_suppressed_count"] == 2
 
 
+def test_build_jump_search_content_applies_packet_wide_adjacent_budget_across_clusters() -> None:
+    search_content, _, _, clustered_results, enriched_packet, packet_observability = jump._build_jump_search_content(
+        [
+            _jump_packet_result(
+                "Relay gating mismatch suppression",
+                "Relay gating mismatch suppression isolates the mismatched lane before actuator switching.",
+                "https://target.test/keep",
+                triage_class="keep",
+                adjacent_strength=6,
+                anchor_overlap=3,
+            ),
+            _jump_packet_result(
+                "Electrochemical routing mechanism",
+                "Threshold routing channels stabilize latency under rising load.",
+                "https://alpha.test/mechanism",
+                adjacent_strength=6,
+            ),
+            _jump_packet_result(
+                "Electrochemical routing overview",
+                "Broad overview of routing behavior under changing load.",
+                "https://alpha.test/overview",
+                adjacent_strength=1,
+            ),
+            _jump_packet_result(
+                "Polymer startup workaround",
+                "A practical workaround isolates the unstable lane during startup.",
+                "https://beta.test/workaround",
+                adjacent_strength=8,
+                solution_marker_count=2,
+                intervention_marker_count=2,
+                intervention_evidence=True,
+            ),
+            _jump_packet_result(
+                "Polymer startup background",
+                "General background context for startup behavior.",
+                "https://beta.test/background",
+                adjacent_strength=2,
+            ),
+            _jump_packet_result(
+                "Sensor alarm operator response",
+                "Operators isolate the unstable lane and switch flow when alarms trigger.",
+                "https://gamma.test/operator",
+                adjacent_strength=7,
+                solution_marker_count=1,
+                intervention_marker_count=2,
+                intervention_evidence=True,
+                intervention_signal="operators isolate",
+            ),
+            _jump_packet_result(
+                "Sensor alarm context",
+                "General context for alarm escalation and response handling.",
+                "https://gamma.test/context",
+                adjacent_strength=3,
+            ),
+            _jump_packet_result(
+                "Thermal drift notes",
+                "General notes on thermal drift during operation.",
+                "https://delta.test/notes",
+                adjacent_strength=1,
+            ),
+        ],
+        set(),
+        {"relay", "gating", "mismatch", "actuator", "threshold", "routing", "startup"},
+    )
+
+    assert len(clustered_results) >= 5
+    assert enriched_packet is True
+    assert "Title: Relay gating mismatch suppression" in search_content
+    assert "Title: Electrochemical routing mechanism" in search_content
+    assert "Title: Polymer startup workaround" in search_content
+    assert "Title: Sensor alarm operator response" in search_content
+    assert "Title: Sensor alarm context" in search_content
+    assert "Cluster hint: Sensor alarm context" in search_content
+    assert "Title: Electrochemical routing overview" not in search_content
+    assert "Title: Polymer startup background" not in search_content
+    assert "Title: Thermal drift notes" not in search_content
+    assert "Cluster hint: Thermal drift notes" not in search_content
+    assert search_content.count("Candidate cluster") == 5
+    assert search_content.count("Search result 1:") == 1
+    assert "Search result 2:" not in search_content
+    assert packet_observability["packet_quality"] == "adjacent_compressed"
+    assert packet_observability["adjacent_highlighted_count"] == 3
+    assert packet_observability["adjacent_suppressed_count"] == 3
+
+
 def test_lateral_jump_with_diagnostics_does_not_promote_descriptive_process_paper_as_intervention(
     monkeypatch,
 ) -> None:
@@ -4112,6 +4197,41 @@ def test_jump_diagnostics_report_prints_prestage1_observability_when_relevant(
     assert (
         "packet=adjacent_compressed | highlighted_adjacent=3 | suppressed_adjacent=6"
     ) in output
+
+
+def test_jump_diagnostics_report_distinguishes_adjacent_heavy_unsuppressed_packets(
+    temp_db,
+    capsys,
+) -> None:
+    store.save_exploration(
+        seed_domain="Network Protocols",
+        seed_category="Technology",
+        pattern_diagnostics={
+            "summary": "patterns_ready: kept 1/1 patterns; jump_outcome=patterns_present_but_no_connection",
+            "jump_attempts": [
+                {
+                    "pattern_name": "Pattern Heavy",
+                    "built_jump_query": "query heavy",
+                    "result_count": 6,
+                    "stage1_outcome": "detect_no_signal",
+                    "stage1_failure_hint": "no_connection",
+                    "adjacent_result_count": 9,
+                    "retained_adjacent_result_count": 9,
+                    "enriched_packet": True,
+                    "packet_quality": "adjacent_heavy",
+                    "adjacent_highlighted_count": 3,
+                    "adjacent_suppressed_count": 0,
+                },
+            ],
+        },
+        transmitted=False,
+    )
+
+    main._print_jump_diagnostics(limit=5)
+    output = capsys.readouterr().out
+
+    assert "packet=adjacent_heavy | highlighted_adjacent=3" in output
+    assert "suppressed_adjacent=" not in output
 
 
 def test_jump_diagnostics_report_prints_repair_incomplete_fields(

@@ -5700,6 +5700,15 @@ def _build_jump_search_content(
             or _stage_one_packet_result_key(result) in selected_adjacent_keys
         ]
 
+    def _stage_one_adjacent_fallback_rank(
+        result: dict,
+    ) -> tuple[int, int, int, int, int, int, int, int, int, int, int, int, int, int]:
+        return (
+            _adjacent_strength(result),
+            *_stage_one_intervention_evidence_rank(result),
+            *_stage_one_mechanism_evidence_rank(result),
+        )
+
     def _select_stage_one_evidence_highlights(
         cluster_results: list[dict],
     ) -> list[dict[str, object]]:
@@ -5888,8 +5897,9 @@ def _build_jump_search_content(
     enriched_packet = False
     adjacent_highlighted_count = 0
     adjacent_suppressed_count = 0
+    cluster_packet_sections: list[dict[str, object]] = []
 
-    for cluster_index, cluster in enumerate(clustered_results, start=1):
+    for cluster in clustered_results:
         cluster_hint = str(cluster.get("cluster_hint", "") or "").strip() or "Unknown"
         cluster_results = list(cluster.get("results") or [])
         display_cluster_results = _compress_adjacent_display_results(
@@ -5901,15 +5911,6 @@ def _build_jump_search_content(
             - sum(1 for result in display_cluster_results if _is_adjacent_result(result)),
             0,
         )
-        search_content.append(f"Candidate cluster {cluster_index}:")
-        search_content.append(f"Cluster hint: {cluster_hint}")
-        search_content.append(f"Supporting results: {len(cluster_results)}")
-        if str(cluster.get("intervention_signal", "") or "").strip():
-            search_content.append(
-                f"Intervention signal: {str(cluster.get('intervention_signal') or '').strip()}"
-            )
-        elif int(cluster.get("intervention_score") or 0) > 0:
-            search_content.append("Intervention evidence: yes")
         highlighted_result_keys: set[str] = set()
         highlights = _select_stage_one_evidence_highlights(display_cluster_results)
         if highlights:
@@ -5919,30 +5920,6 @@ def _build_jump_search_content(
             for highlight in highlights
             if _is_adjacent_result(dict(highlight.get("result") or {}))
         )
-        for highlight in highlights:
-            highlighted_result = dict(highlight.get("result") or {})
-            title_text = str(highlighted_result.get("title_text", "") or "").strip()
-            clean = str(highlighted_result.get("clean", "") or "").strip()
-            url = str(highlighted_result.get("url", "") or "").strip()
-            query_label_text = ", ".join(
-                str(label).strip()
-                for label in (highlighted_result.get("query_labels") or [])
-                if str(label).strip()
-            )
-            label_texts = [
-                str(label).strip()
-                for label in (highlight.get("labels") or [])
-                if str(label).strip()
-            ]
-            highlighted_result_keys.add(_stage_one_packet_result_key(highlighted_result))
-            for label_text in label_texts:
-                search_content.append(f"{label_text}:")
-            if query_label_text:
-                search_content.append(f"Retrieved via: {query_label_text}")
-            search_content.append(f"Title: {title_text or 'Unknown'}")
-            if url:
-                search_content.append(f"URL: {url}")
-            search_content.append(f"Snippet: {clean}")
         fallback_results: list[dict] = []
         for merged_result in cluster_results:
             title_text = str(merged_result.get("title_text", "") or "").strip()
@@ -5962,9 +5939,97 @@ def _build_jump_search_content(
             )
             if title_text and title_text not in top_titles and len(top_titles) < 3:
                 top_titles.append(title_text)
+        for highlight in highlights:
+            highlighted_result = dict(highlight.get("result") or {})
+            highlighted_result_keys.add(_stage_one_packet_result_key(highlighted_result))
         for merged_result in display_cluster_results:
             if _stage_one_packet_result_key(merged_result) not in highlighted_result_keys:
                 fallback_results.append(merged_result)
+        cluster_packet_sections.append(
+            {
+                "cluster": cluster,
+                "cluster_hint": cluster_hint,
+                "cluster_results": cluster_results,
+                "highlights": highlights,
+                "fallback_results": fallback_results,
+            }
+        )
+
+    adjacent_fallback_budget = 1 if adjacent_highlighted_count > 0 else 2
+    adjacent_fallback_candidates = [
+        result
+        for section in cluster_packet_sections
+        for result in list(section.get("fallback_results") or [])
+        if _is_adjacent_result(result)
+    ]
+    if (
+        adjacent_heavy_packet
+        and len(adjacent_fallback_candidates) > adjacent_fallback_budget
+    ):
+        kept_adjacent_fallback_keys = {
+            _stage_one_packet_result_key(result)
+            for result in sorted(
+                adjacent_fallback_candidates,
+                key=_stage_one_adjacent_fallback_rank,
+                reverse=True,
+            )[:adjacent_fallback_budget]
+        }
+        for section in cluster_packet_sections:
+            filtered_fallback_results: list[dict] = []
+            for result in list(section.get("fallback_results") or []):
+                if not _is_adjacent_result(result):
+                    filtered_fallback_results.append(result)
+                    continue
+                if _stage_one_packet_result_key(result) in kept_adjacent_fallback_keys:
+                    filtered_fallback_results.append(result)
+                    continue
+                adjacent_suppressed_count += 1
+            section["fallback_results"] = filtered_fallback_results
+
+    visible_cluster_sections = [
+        section
+        for section in cluster_packet_sections
+        if (section.get("highlights") or section.get("fallback_results"))
+    ]
+
+    for cluster_index, section in enumerate(visible_cluster_sections, start=1):
+        cluster = dict(section.get("cluster") or {})
+        cluster_hint = str(section.get("cluster_hint", "") or "").strip() or "Unknown"
+        cluster_results = list(section.get("cluster_results") or [])
+        highlights = list(section.get("highlights") or [])
+        fallback_results = list(section.get("fallback_results") or [])
+        search_content.append(f"Candidate cluster {cluster_index}:")
+        search_content.append(f"Cluster hint: {cluster_hint}")
+        search_content.append(f"Supporting results: {len(cluster_results)}")
+        if str(cluster.get("intervention_signal", "") or "").strip():
+            search_content.append(
+                f"Intervention signal: {str(cluster.get('intervention_signal') or '').strip()}"
+            )
+        elif int(cluster.get("intervention_score") or 0) > 0:
+            search_content.append("Intervention evidence: yes")
+        for highlight in highlights:
+            highlighted_result = dict(highlight.get("result") or {})
+            title_text = str(highlighted_result.get("title_text", "") or "").strip()
+            clean = str(highlighted_result.get("clean", "") or "").strip()
+            url = str(highlighted_result.get("url", "") or "").strip()
+            query_label_text = ", ".join(
+                str(label).strip()
+                for label in (highlighted_result.get("query_labels") or [])
+                if str(label).strip()
+            )
+            label_texts = [
+                str(label).strip()
+                for label in (highlight.get("labels") or [])
+                if str(label).strip()
+            ]
+            for label_text in label_texts:
+                search_content.append(f"{label_text}:")
+            if query_label_text:
+                search_content.append(f"Retrieved via: {query_label_text}")
+            search_content.append(f"Title: {title_text or 'Unknown'}")
+            if url:
+                search_content.append(f"URL: {url}")
+            search_content.append(f"Snippet: {clean}")
         for result_index, merged_result in enumerate(fallback_results[:2], start=1):
             title_text = str(merged_result.get("title_text", "") or "").strip()
             clean = str(merged_result.get("clean", "") or "").strip()
