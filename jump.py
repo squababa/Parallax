@@ -5504,7 +5504,7 @@ def _build_jump_search_content(
     merged_results: list[dict],
     blocked_cluster_tokens: set[str],
     strong_anchor_tokens: set[str],
-) -> tuple[str, list[dict], list[str], list[dict], bool]:
+) -> tuple[str, list[dict], list[str], list[dict], bool, dict[str, object]]:
     def _excerpt_rank(text: str, labels: list[str]) -> tuple[int, int, int, int, int]:
         tokens = _tokenize_query_terms(text)
         return (
@@ -5886,6 +5886,8 @@ def _build_jump_search_content(
     raw_target_candidates: list[dict] = []
     top_titles: list[str] = []
     enriched_packet = False
+    adjacent_highlighted_count = 0
+    adjacent_suppressed_count = 0
 
     for cluster_index, cluster in enumerate(clustered_results, start=1):
         cluster_hint = str(cluster.get("cluster_hint", "") or "").strip() or "Unknown"
@@ -5893,6 +5895,11 @@ def _build_jump_search_content(
         display_cluster_results = _compress_adjacent_display_results(
             cluster_results,
             adjacent_heavy_packet=adjacent_heavy_packet,
+        )
+        adjacent_suppressed_count += max(
+            sum(1 for result in cluster_results if _is_adjacent_result(result))
+            - sum(1 for result in display_cluster_results if _is_adjacent_result(result)),
+            0,
         )
         search_content.append(f"Candidate cluster {cluster_index}:")
         search_content.append(f"Cluster hint: {cluster_hint}")
@@ -5907,6 +5914,11 @@ def _build_jump_search_content(
         highlights = _select_stage_one_evidence_highlights(display_cluster_results)
         if highlights:
             enriched_packet = True
+        adjacent_highlighted_count += sum(
+            1
+            for highlight in highlights
+            if _is_adjacent_result(dict(highlight.get("result") or {}))
+        )
         for highlight in highlights:
             highlighted_result = dict(highlight.get("result") or {})
             title_text = str(highlighted_result.get("title_text", "") or "").strip()
@@ -5968,12 +5980,25 @@ def _build_jump_search_content(
                 search_content.append(f"Snippet: {clean}")
         search_content.append("")
 
+    packet_quality = "focused"
+    if adjacent_heavy_packet:
+        packet_quality = (
+            "adjacent_compressed"
+            if adjacent_suppressed_count > 0
+            else "adjacent_heavy"
+        )
+
     return (
         "\n".join(search_content),
         raw_target_candidates,
         top_titles,
         clustered_results,
         enriched_packet,
+        {
+            "packet_quality": packet_quality,
+            "adjacent_highlighted_count": adjacent_highlighted_count,
+            "adjacent_suppressed_count": adjacent_suppressed_count,
+        },
     )
 
 
@@ -6005,6 +6030,9 @@ def lateral_jump_with_diagnostics(
         "adjacent_result_count": 0,
         "adjacent_retained_result_count": 0,
         "retained_adjacent_result_count": 0,
+        "adjacent_highlighted_count": 0,
+        "adjacent_suppressed_count": 0,
+        "packet_quality": "focused",
         "alternate_retrieval_attempted": False,
         "alternate_jump_query": None,
         "alternate_result_count": 0,
@@ -6196,6 +6224,18 @@ def lateral_jump_with_diagnostics(
             if query_label not in existing_result["query_labels"]:
                 existing_result["query_labels"].append(query_label)
 
+    def _apply_packet_observability(packet_observability: dict[str, object]) -> None:
+        diagnostic["adjacent_highlighted_count"] = int(
+            packet_observability.get("adjacent_highlighted_count") or 0
+        )
+        diagnostic["adjacent_suppressed_count"] = int(
+            packet_observability.get("adjacent_suppressed_count") or 0
+        )
+        diagnostic["packet_quality"] = (
+            str(packet_observability.get("packet_quality") or "focused").strip()
+            or "focused"
+        )
+
     for index, current_query in enumerate(queries):
         try:
             results = _tavily.search(
@@ -6254,13 +6294,14 @@ def lateral_jump_with_diagnostics(
         diagnostic["stage1_failure_hint"] = "search_error"
         return None, diagnostic
 
-    combined, raw_target_candidates, top_titles, clustered_results, enriched_packet = (
+    combined, raw_target_candidates, top_titles, clustered_results, enriched_packet, packet_observability = (
         _build_jump_search_content(
             merged_results,
             blocked_cluster_tokens,
             strong_anchor_tokens,
         )
     )
+    _apply_packet_observability(packet_observability)
     if _should_attempt_alternate_jump_retrieval(merged_results, clustered_results):
         alternate_query = _build_alternate_jump_search_query(
             pattern,
@@ -6287,13 +6328,14 @@ def lateral_jump_with_diagnostics(
                 raw_alternate_results = []
             diagnostic["alternate_result_count"] = len(raw_alternate_results)
             _merge_search_results(raw_alternate_results, "alternate")
-            combined, raw_target_candidates, top_titles, clustered_results, enriched_packet = (
+            combined, raw_target_candidates, top_titles, clustered_results, enriched_packet, packet_observability = (
                 _build_jump_search_content(
                     merged_results,
                     blocked_cluster_tokens,
                     strong_anchor_tokens,
                 )
             )
+            _apply_packet_observability(packet_observability)
 
     diagnostic["intervention_promoted_result_count"] = sum(
         1 for result in merged_results if result.get("intervention_evidence")
@@ -6396,11 +6438,12 @@ def lateral_jump_with_diagnostics(
         diagnostic["intervention_promoted_result_count"] = sum(
             1 for result in merged_results if result.get("intervention_evidence")
         )
-        combined, raw_target_candidates, top_titles, clustered_results, enriched_packet = _build_jump_search_content(
+        combined, raw_target_candidates, top_titles, clustered_results, enriched_packet, packet_observability = _build_jump_search_content(
             merged_results,
             blocked_cluster_tokens,
             strong_anchor_tokens,
         )
+        _apply_packet_observability(packet_observability)
         diagnostic["result_count"] = len(merged_results)
         diagnostic["cluster_count"] = len(clustered_results)
         diagnostic["top_cluster_hints"] = [

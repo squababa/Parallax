@@ -3110,7 +3110,7 @@ def _jump_packet_result(
 
 
 def test_build_jump_search_content_compresses_adjacent_heavy_packet_to_strong_diverse_adjacent_roles() -> None:
-    search_content, _, _, clustered_results, enriched_packet = jump._build_jump_search_content(
+    search_content, _, _, clustered_results, enriched_packet, packet_observability = jump._build_jump_search_content(
         [
             _jump_packet_result(
                 "Electrochemical suppression mechanism",
@@ -3166,10 +3166,13 @@ def test_build_jump_search_content_compresses_adjacent_heavy_packet_to_strong_di
     assert "Title: Electrochemical suppression background" not in search_content
     assert search_content.count("Title:") == 3
     assert "Search result 1:" not in search_content
+    assert packet_observability["packet_quality"] == "adjacent_compressed"
+    assert packet_observability["adjacent_highlighted_count"] == 3
+    assert packet_observability["adjacent_suppressed_count"] == 2
 
 
 def test_build_jump_search_content_keeps_strong_keep_evidence_primary_during_adjacent_compression() -> None:
-    search_content, _, _, clustered_results, enriched_packet = jump._build_jump_search_content(
+    search_content, _, _, clustered_results, enriched_packet, packet_observability = jump._build_jump_search_content(
         [
             _jump_packet_result(
                 "Relay gating mismatch suppression",
@@ -3227,6 +3230,9 @@ def test_build_jump_search_content_keeps_strong_keep_evidence_primary_during_adj
     ) < search_content.index("Title: Relay gating mismatch workaround")
     assert search_content.count("Title:") == 3
     assert "Search result 1:" not in search_content
+    assert packet_observability["packet_quality"] == "adjacent_compressed"
+    assert packet_observability["adjacent_highlighted_count"] == 2
+    assert packet_observability["adjacent_suppressed_count"] == 2
 
 
 def test_lateral_jump_with_diagnostics_does_not_promote_descriptive_process_paper_as_intervention(
@@ -4083,9 +4089,12 @@ def test_jump_diagnostics_report_prints_prestage1_observability_when_relevant(
                     "stage1_outcome": "detect_no_signal",
                     "stage1_failure_hint": "no_connection",
                     "alternate_retrieval_attempted": True,
-                    "adjacent_result_count": 1,
-                    "retained_adjacent_result_count": 1,
+                    "adjacent_result_count": 9,
+                    "retained_adjacent_result_count": 9,
                     "enriched_packet": True,
+                    "packet_quality": "adjacent_compressed",
+                    "adjacent_highlighted_count": 3,
+                    "adjacent_suppressed_count": 6,
                 },
             ],
         },
@@ -4098,7 +4107,10 @@ def test_jump_diagnostics_report_prints_prestage1_observability_when_relevant(
     assert "prestage1=hard_no_signal" in output
     assert (
         "prestage1=adjacent_packet | alternate=yes | enriched_packet=yes | "
-        "adjacent=1 | retained_adjacent=1"
+        "adjacent=9 | retained_adjacent=9"
+    ) in output
+    assert (
+        "packet=adjacent_compressed | highlighted_adjacent=3 | suppressed_adjacent=6"
     ) in output
 
 
@@ -4241,6 +4253,7 @@ def test_jump_diagnostics_report_omits_soft_gate_line_for_ordinary_attempts(
     output = capsys.readouterr().out
 
     assert "pattern=Pattern Ordinary | query=query ordinary | results=2" in output
+    assert "packet=" not in output
     assert "soft_gate=" not in output
 
 
