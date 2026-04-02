@@ -99,6 +99,65 @@ def test_profile_pattern_quality_prefers_operational_mechanism() -> None:
     assert any("missing controllable lever" in item for item in weak["concerns"])
 
 
+def test_normalize_pattern_schema_backfills_nested_transferable_and_grounded_fields() -> None:
+    normalized = explore._normalize_pattern_schema(
+        {
+            "pattern_name": "Queue-threshold congestion gating",
+            "description": "Queue threshold gating suppresses inflow and stabilizes delay.",
+            "abstract_structure": "Increasing load crosses a queue threshold and throttles inflow.",
+            "search_query": "queue threshold throttling latency",
+            "measurable_signal": "queue length and mean delay",
+            "control_lever": "adjust the congestion threshold",
+            "transfer_rationale": "Transfers to buffered systems that gate inflow under overload.",
+        }
+    )
+
+    assert normalized["pattern_name"] == "Queue-threshold congestion gating"
+    assert normalized["abstract_structure"] == (
+        "Increasing load crosses a queue threshold and throttles inflow."
+    )
+    assert normalized["transferable"] == {
+        "mechanism": "Increasing load crosses a queue threshold and throttles inflow.",
+        "control_logic": "adjust the congestion threshold",
+        "signal_shape": "queue length and mean delay",
+        "_backfilled_fields": ["mechanism", "control_logic", "signal_shape"],
+    }
+    assert normalized["grounded"] == {
+        "source_control": "adjust the congestion threshold",
+        "source_metric": "queue length and mean delay",
+    }
+
+
+def test_profile_transferable_pattern_quality_flags_generic_leakage_and_overlap() -> None:
+    profile = explore._profile_transferable_pattern_quality(
+        explore._normalize_pattern_schema(
+            {
+                "pattern_name": "Supply-boundary throttling",
+                "description": "A permeability boundary throttles supply flow.",
+                "abstract_structure": "Transferable placeholder.",
+                "search_query": "boundary throttling flow",
+                "measurable_signal": "coal reservoir permeability",
+                "control_lever": "change reservoir boundary location",
+                "transferable": {
+                    "mechanism": "generic permeability adapts",
+                    "control_logic": "generic permeability adapts",
+                    "signal_shape": "generic permeability adapts",
+                },
+                "grounded": {
+                    "source_control": "change reservoir boundary location",
+                    "source_metric": "coal reservoir permeability",
+                },
+            }
+        ),
+        {"name": "Reservoir Flow", "category": "Geology"},
+    )
+
+    assert profile["usable"] is False
+    assert any("too_generic" in concern for concern in profile["concerns"])
+    assert "transferable_source_leakage" in profile["concerns"]
+    assert "transferable_field_overlap" in profile["concerns"]
+
+
 def test_build_jump_search_query_replaces_weak_feedback_style_terms() -> None:
     raw_query = "deficiency threshold triggered directed recruitment feedback"
     query = jump._build_jump_search_query(
@@ -819,6 +878,243 @@ def test_build_jump_search_queries_falls_back_from_supplier_drift_but_keeps_fami
     ][: len(queries)]
 
 
+def test_build_jump_search_queries_prefers_transferable_fields_over_grounded_source_terms(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(jump, "_generate_llm_jump_search_query", lambda *_args, **_kwargs: None)
+
+    queries = jump._build_jump_search_queries(
+        {
+            "pattern_name": "Supply-boundary throttling",
+            "description": "Permeability boundary placement changes source flow.",
+            "abstract_structure": "Location and permeability of the supply boundary shape source flow.",
+            "search_query": "location permeability supply boundary",
+            "measurable_signal": "reservoir permeability and coal flow rate",
+            "control_lever": "change supply boundary location and permeability",
+            "transfer_rationale": "Transfers to systems that gate flow under rising load.",
+            "transferable": {
+                "mechanism": "accumulated load crosses a gating limit and triggers demand rerouting",
+                "control_logic": "move the gating limit or raise the release threshold",
+                "signal_shape": "monotonic load rise to a release threshold",
+            },
+            "grounded": {
+                "source_control": "change supply boundary location and permeability",
+                "source_metric": "reservoir permeability and coal flow rate",
+            },
+        },
+        "Reservoir Engineering",
+        "Energy",
+    )
+
+    assert 1 <= len(queries) <= 3
+    assert "location" not in queries[0]
+    assert "permeability" not in queries[0]
+    assert "gating" in queries[0] or "rerouting" in queries[0]
+    assert jump._build_jump_search_queries.last_query_labels[0] == "mechanism-family"
+
+
+def test_build_jump_search_queries_falls_back_when_transferable_fields_are_low_quality(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(jump, "_generate_llm_jump_search_query", lambda *_args, **_kwargs: None)
+
+    pattern = {
+        "pattern_name": "Queue-threshold congestion gating",
+        "description": "Queue threshold gating suppresses inflow and stabilizes delay.",
+        "abstract_structure": "Increasing queue load crosses a threshold and throttles inflow.",
+        "search_query": "queue threshold throttling latency",
+        "measurable_signal": "queue length and mean delay",
+        "control_lever": "adjust the congestion threshold",
+        "transfer_rationale": "Transfers to buffered systems that gate inflow under overload.",
+        "transferable": {
+            "mechanism": "generic process",
+            "control_logic": "generic process",
+            "signal_shape": "generic process",
+        },
+    }
+
+    queries = jump._build_jump_search_queries(
+        pattern,
+        "Network Protocols",
+        "Technology",
+    )
+
+    assert queries[0] == jump._build_jump_search_query(
+        {
+            "pattern_name": "Queue-threshold congestion gating",
+            "abstract_structure": "Increasing queue load crosses a threshold and throttles inflow.",
+            "search_query": "queue threshold throttling latency",
+            "measurable_signal": "queue length and mean delay",
+            "control_lever": "adjust the congestion threshold",
+            "transfer_rationale": "Transfers to buffered systems that gate inflow under overload.",
+        },
+        "Network Protocols",
+        "Technology",
+    )
+    assert jump._build_jump_search_queries.last_transferable_query_profile["usable"] is False
+
+
+def test_jump_transferable_query_profile_rejects_backfilled_transferable_fields() -> None:
+    profile = jump._jump_transferable_query_profile(
+        explore._normalize_pattern_schema(
+            {
+                "pattern_name": "Queue-threshold congestion gating",
+                "description": "Queue threshold gating suppresses inflow and stabilizes delay.",
+                "abstract_structure": "Increasing queue load crosses a threshold and throttles inflow.",
+                "search_query": "queue threshold throttling latency",
+                "measurable_signal": "queue length and mean delay",
+                "control_lever": "adjust the congestion threshold",
+                "transfer_rationale": "Transfers to buffered systems that gate inflow under overload.",
+            }
+        ),
+        "Network Protocols",
+        "Technology",
+    )
+
+    assert profile["backfilled"] is True
+    assert profile["backfilled_fields"] == ["mechanism", "control_logic", "signal_shape"]
+    assert profile["usable"] is False
+
+
+def test_build_jump_search_queries_exposes_backfilled_transferable_profile_and_falls_back(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(jump, "_generate_llm_jump_search_query", lambda *_args, **_kwargs: None)
+
+    pattern = explore._normalize_pattern_schema(
+        {
+            "pattern_name": "Queue-threshold congestion gating",
+            "description": "Queue threshold gating suppresses inflow and stabilizes delay.",
+            "abstract_structure": "Increasing queue load crosses a threshold and throttles inflow.",
+            "search_query": "queue threshold throttling latency",
+            "measurable_signal": "queue length and mean delay",
+            "control_lever": "adjust the congestion threshold",
+            "transfer_rationale": "Transfers to buffered systems that gate inflow under overload.",
+        }
+    )
+
+    queries = jump._build_jump_search_queries(
+        pattern,
+        "Network Protocols",
+        "Technology",
+    )
+
+    assert queries[0] == jump._build_jump_search_query(
+        {
+            "pattern_name": "Queue-threshold congestion gating",
+            "abstract_structure": "Increasing queue load crosses a threshold and throttles inflow.",
+            "search_query": "queue threshold throttling latency",
+            "measurable_signal": "queue length and mean delay",
+            "control_lever": "adjust the congestion threshold",
+            "transfer_rationale": "Transfers to buffered systems that gate inflow under overload.",
+        },
+        "Network Protocols",
+        "Technology",
+    )
+    assert jump._build_jump_search_queries.last_transferable_query_profile["backfilled"] is True
+    assert jump._build_jump_search_queries.last_transferable_query_profile["backfilled_fields"] == [
+        "mechanism",
+        "control_logic",
+        "signal_shape",
+    ]
+    assert jump._build_jump_search_queries.last_transferable_query_profile["usable"] is False
+
+
+def test_build_jump_search_queries_uses_native_transferable_fields_when_one_field_is_backfilled(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(jump, "_generate_llm_jump_search_query", lambda *_args, **_kwargs: None)
+
+    pattern = explore._normalize_pattern_schema(
+        {
+            "pattern_name": "Supply-boundary throttling",
+            "description": "Permeability boundary placement changes source flow.",
+            "abstract_structure": "Location and permeability of the supply boundary shape source flow.",
+            "search_query": "location permeability supply boundary",
+            "measurable_signal": "reservoir permeability and coal flow rate",
+            "control_lever": "change supply boundary location and permeability",
+            "transfer_rationale": "",
+            "transferable": {
+                "mechanism": "accumulated load crosses a gating limit and triggers demand rerouting",
+                "control_logic": "move the gating limit or raise the release threshold",
+            },
+            "grounded": {
+                "source_control": "change supply boundary location and permeability",
+                "source_metric": "reservoir permeability and coal flow rate",
+            },
+        }
+    )
+
+    query_pattern, profile = jump._jump_query_pattern_view(
+        pattern,
+        "Reservoir Engineering",
+        "Energy",
+    )
+    queries = jump._build_jump_search_queries(
+        pattern,
+        "Reservoir Engineering",
+        "Energy",
+    )
+
+    assert profile["usable"] is True
+    assert profile["backfilled"] is False
+    assert profile["backfilled_fields"] == ["signal_shape"]
+    assert query_pattern["abstract_structure"] == (
+        "accumulated load crosses a gating limit and triggers demand rerouting"
+    )
+    assert query_pattern["control_lever"] == (
+        "move the gating limit or raise the release threshold"
+    )
+    assert query_pattern["measurable_signal"] == "reservoir permeability and coal flow rate"
+    assert "permeability" not in queries[0]
+    assert jump._build_jump_search_queries.last_transferable_query_profile["backfilled_fields"] == [
+        "signal_shape"
+    ]
+
+
+def test_jump_transferable_query_profile_rejects_source_leaky_transferable_fields() -> None:
+    profile = jump._jump_transferable_query_profile(
+        {
+            "transferable": {
+                "mechanism": "permeability boundary gates load release",
+                "control_logic": "raise a release threshold",
+                "signal_shape": "load rises until threshold release",
+            },
+            "grounded": {
+                "source_control": "change reservoir permeability boundary",
+                "source_metric": "reservoir permeability and source flow",
+            },
+        },
+        "Reservoir Engineering",
+        "Energy",
+    )
+
+    assert profile["usable"] is False
+    assert "transferable_source_leakage" in profile["concerns"]
+    assert "permeability" in profile["source_leakage_terms"]
+
+
+def test_jump_transferable_query_profile_rejects_overlap_collapsed_fields() -> None:
+    profile = jump._jump_transferable_query_profile(
+        {
+            "transferable": {
+                "mechanism": "threshold gating reroutes accumulated load",
+                "control_logic": "threshold gating reroutes accumulated load",
+                "signal_shape": "threshold gating reroutes accumulated load",
+            },
+            "grounded": {
+                "source_control": "retune queue dispatch limits",
+                "source_metric": "queue delay and service backlog",
+            },
+        },
+        "Network Systems",
+        "Technology",
+    )
+
+    assert profile["usable"] is False
+    assert "transferable_field_overlap" in profile["concerns"]
+
+
 def test_lateral_jump_with_diagnostics_academic_lane_uses_improved_base_query(
     monkeypatch,
 ) -> None:
@@ -925,6 +1221,78 @@ def test_lateral_jump_with_diagnostics_academic_lane_uses_improved_base_query(
     ]
     assert stage_inputs["stage1"] == stage_inputs["stage2"]
     assert "Retrieved via: academic" in stage_inputs["stage1"]
+
+
+def test_lateral_jump_with_diagnostics_records_legacy_and_transferable_query_spines(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(jump, "_generate_llm_jump_search_query", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        jump._tavily,
+        "search",
+        lambda **_kwargs: {
+            "results": [
+                {
+                    "title": "Transferable flow control note",
+                    "content": (
+                        "Load crosses a gating boundary and a workaround reroutes flow "
+                        "before overload accumulates."
+                    ),
+                    "url": "https://target.test/flow-control",
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        jump,
+        "_stage_one_detect_with_diagnostics",
+        lambda **kwargs: (
+            {
+                "target_domain": "Flow control",
+                "signal": "shared thresholded rerouting",
+                "evidence": "specific evidence",
+                "solution_evidence": "rerouting before overload is the workaround",
+            },
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        jump,
+        "_stage_two_hypothesize_with_diagnostics",
+        lambda **_kwargs: (_safety_interlock_jump_payload(), None, None),
+    )
+
+    connection, diagnostic = jump.lateral_jump_with_diagnostics(
+        {
+            "pattern_name": "Supply-boundary throttling",
+            "abstract_structure": (
+                "Location and permeability of the supply boundary shape source flow."
+            ),
+            "search_query": "location permeability supply boundary",
+            "measurable_signal": "reservoir permeability and coal flow rate",
+            "control_lever": "change supply boundary location and permeability",
+            "transfer_rationale": "",
+            "transferable": {
+                "mechanism": "accumulated load crosses a gating limit and triggers demand rerouting",
+                "control_logic": "move the gating limit or raise the release threshold",
+                "signal_shape": "monotonic load rise to a release threshold",
+            },
+            "grounded": {
+                "source_control": "change supply boundary location and permeability",
+                "source_metric": "reservoir permeability and coal flow rate",
+            },
+        },
+        "Reservoir Engineering",
+        "Energy",
+    )
+
+    assert connection is not None
+    assert "permeability" in diagnostic["legacy_built_jump_query"]
+    assert "permeability" not in diagnostic["built_jump_query"]
+    assert diagnostic["transferable_query_profile"]["backfilled"] is False
+    assert diagnostic["transferable_query_profile"]["backfilled_fields"] == []
+    assert diagnostic["transferable_query_profile"]["usable"] is True
+    assert diagnostic["transferable_query_profile"]["concerns"] == []
 
 
 def test_lateral_jump_with_diagnostics_reports_preserved_natural_language_built_queries(
@@ -1417,6 +1785,8 @@ def test_dive_keeps_stronger_patterns_and_attaches_quality_metadata(
     assert all("source_anchor" in pattern for pattern in patterns)
     assert all("_source_anchor_score" not in pattern for pattern in patterns)
     assert explore.PATTERN_REQUIRED_FIELDS.issubset(patterns[0].keys())
+    assert patterns[0]["transferable"]["mechanism"] == patterns[0]["abstract_structure"]
+    assert patterns[0]["grounded"]["source_control"] == patterns[0]["control_lever"]
     assert patterns[0]["seed_url"] == "https://seed.test/queue"
     assert patterns[0]["seed_excerpt"] == "Queue threshold gating stabilizes service latency under congestion."
     assert patterns[0]["source_anchor"]["title"] == "Queue control paper"
