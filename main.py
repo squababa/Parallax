@@ -1852,6 +1852,24 @@ def _print_jump_diagnostics(limit: int = 20) -> None:
                 )
             if prestage1_parts:
                 print("    " + " | ".join(prestage1_parts))
+            packet_quality = str(attempt.get("packet_quality") or "focused").strip() or "focused"
+            adjacent_highlighted_count = int(
+                attempt.get("adjacent_highlighted_count") or 0
+            )
+            adjacent_suppressed_count = int(
+                attempt.get("adjacent_suppressed_count") or 0
+            )
+            if packet_quality != "focused":
+                packet_parts = [f"packet={packet_quality}"]
+                if adjacent_highlighted_count > 0:
+                    packet_parts.append(
+                        f"highlighted_adjacent={adjacent_highlighted_count}"
+                    )
+                if adjacent_suppressed_count > 0 or packet_quality == "adjacent_compressed":
+                    packet_parts.append(
+                        f"suppressed_adjacent={adjacent_suppressed_count}"
+                    )
+                print("    " + " | ".join(packet_parts))
             soft_gate_attempted = bool(attempt.get("stage1_soft_gate_attempted"))
             soft_gate_recovered = bool(attempt.get("stage1_soft_gate_recovered"))
             if stage1_outcome == "weak_signal" or (
