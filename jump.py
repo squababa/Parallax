@@ -2270,16 +2270,95 @@ def _build_jump_search_queries(
     source_domain: str,
     source_category: str,
 ) -> list[str]:
+    def _family_support_terms(*texts: str) -> list[str]:
+        blocked_tokens, _preferred_anchor_phrases, _support_tokens = _jump_query_support_context(
+            pattern,
+            source_domain,
+            source_category,
+        )
+        terms: list[str] = []
+        seen_terms: set[str] = set()
+        base_tokens = set(_tokenize_query_terms(base_query))
+        for text in texts:
+            clean_text = str(text or "").strip()
+            if not clean_text:
+                continue
+            for phrase in _extract_jump_query_phrases(clean_text, blocked_tokens):
+                normalized_phrase = re.sub(r"\s+", " ", phrase).strip()
+                phrase_tokens = _tokenize_query_terms(normalized_phrase)
+                if (
+                    not phrase_tokens
+                    or all(token in base_tokens for token in phrase_tokens)
+                    or normalized_phrase in seen_terms
+                ):
+                    continue
+                seen_terms.add(normalized_phrase)
+                terms.append(normalized_phrase)
+            for token in _tokenize_query_terms(clean_text):
+                if (
+                    token in seen_terms
+                    or token in base_tokens
+                    or token in blocked_tokens
+                    or token in GENERIC_QUERY_TOKENS
+                    or token in WEAK_QUERY_TOKENS
+                    or token in OVERLOADED_JUMP_QUERY_TOKENS
+                    or len(token) <= 2
+                    or not (
+                        _is_specific_jump_query_token(token)
+                        or _is_causal_jump_query_token(token)
+                    )
+                ):
+                    continue
+                seen_terms.add(token)
+                terms.append(token)
+        return terms
+
+    def _build_family_variant(
+        family_terms: list[str],
+        fallback_terms: tuple[str, ...],
+    ) -> str:
+        base_tokens = _tokenize_query_terms(base_query)
+        selected = [base_query]
+        covered_tokens = set(base_tokens)
+        remaining_slots = max(0, 12 - len(base_tokens))
+        selected_family_term = False
+        for term in family_terms:
+            term_tokens = _tokenize_query_terms(term)
+            unseen_tokens = [
+                token for token in term_tokens if token not in covered_tokens
+            ]
+            if not unseen_tokens or remaining_slots <= 0:
+                continue
+            if len(unseen_tokens) > remaining_slots:
+                continue
+            selected.append(term)
+            covered_tokens.update(unseen_tokens)
+            remaining_slots -= len(unseen_tokens)
+            selected_family_term = True
+            break
+        for term in fallback_terms:
+            term_tokens = _tokenize_query_terms(term)
+            unseen_tokens = [
+                token for token in term_tokens if token not in covered_tokens
+            ]
+            if not unseen_tokens or len(unseen_tokens) > remaining_slots:
+                continue
+            selected.append(term)
+            covered_tokens.update(unseen_tokens)
+            break
+        return re.sub(r"\s+", " ", " ".join(selected)).strip()
+
     query, collision_guard_applied = _build_jump_search_query_with_metadata(
         pattern,
         source_domain,
         source_category,
     )
     _build_jump_search_queries.last_collision_guard_applied = collision_guard_applied
+    _build_jump_search_queries.last_query_labels = []
     if not query:
         return []
 
-    solution_terms = (
+    intervention_terms = (
         "workaround",
         "mitigation",
         "correction",
@@ -2287,16 +2366,57 @@ def _build_jump_search_queries(
         "compensation",
         "solution",
     )
-    query_tokens = set(_tokenize_query_terms(query))
-    solution_term = next(
-        (term for term in solution_terms if term not in query_tokens),
-        solution_terms[0],
-    )
     base_query = re.sub(r"\s+", " ", query).strip()
-    return [base_query, f"{base_query} {solution_term}"]
+    query_tokens = set(_tokenize_query_terms(base_query))
+    intervention_term = next(
+        (term for term in intervention_terms if term not in query_tokens),
+        intervention_terms[0],
+    )
+    mechanism_query = base_query
+    intervention_query = _build_family_variant(
+        _family_support_terms(
+            str(pattern.get("control_lever", "") or ""),
+            str(pattern.get("transfer_rationale", "") or ""),
+        ),
+        (intervention_term,),
+    )
+    operator_query = _build_family_variant(
+        _family_support_terms(
+            str(pattern.get("measurable_signal", "") or ""),
+            str(pattern.get("search_query", "") or ""),
+            str(pattern.get("abstract_structure", "") or ""),
+        ),
+        ("failure",),
+    )
+    query_entries = [
+        ("mechanism-family", mechanism_query),
+        ("intervention-family", intervention_query),
+        ("operator-family", operator_query),
+    ]
+    queries: list[str] = []
+    query_labels: list[str] = []
+    seen_queries: set[str] = set()
+    for label, built_query in query_entries:
+        normalized_query = re.sub(r"\s+", " ", str(built_query or "").strip())
+        if not normalized_query or normalized_query in seen_queries:
+            continue
+        seen_queries.add(normalized_query)
+        queries.append(normalized_query)
+        query_labels.append(label)
+    _build_jump_search_queries.last_query_labels = query_labels
+    return queries
 
 
 _build_jump_search_queries.last_collision_guard_applied = False
+_build_jump_search_queries.last_query_labels = []
+
+
+def _has_intervention_query_label(labels: list[str] | tuple[str, ...]) -> bool:
+    return any(
+        str(label).strip() in {"solution-biased", "intervention-family"}
+        for label in labels
+        if str(label).strip()
+    )
 
 
 def _build_alternate_jump_search_query(
@@ -5512,7 +5632,7 @@ def _build_jump_search_content(
             len(set(tokens)),
             len(tokens),
             len(text),
-            1 if "solution-biased" in labels else 0,
+            1 if _has_intervention_query_label(labels) else 0,
         )
 
     def _clustered_result_rank(
@@ -5536,7 +5656,7 @@ def _build_jump_search_content(
             int(result.get("intervention_marker_count") or 0)
             if intervention_evidence
             else 0,
-            1 if "solution-biased" in query_labels else 0,
+            1 if _has_intervention_query_label(query_labels) else 0,
             int(result.get("solution_marker_count") or excerpt_rank[0]),
             len(title_signature),
             excerpt_rank[1],
@@ -5589,7 +5709,7 @@ def _build_jump_search_content(
             1 if result.get("intervention_evidence") else 0,
             int(result.get("intervention_marker_count") or 0),
             int(result.get("solution_marker_count") or 0),
-            1 if "solution-biased" in query_labels else 0,
+            1 if _has_intervention_query_label(query_labels) else 0,
             int(result.get("anchor_overlap") or 0),
             1 if result.get("preferred_phrase_match") else 0,
             excerpt_rank[1],
@@ -5881,7 +6001,7 @@ def _build_jump_search_content(
             preferred_phrase_matches,
             1
             if any(
-                "solution-biased" in (result.get("query_labels") or [])
+                _has_intervention_query_label(result.get("query_labels") or [])
                 for result in cluster_results
             )
             else 0,
@@ -6203,6 +6323,7 @@ def lateral_jump_with_diagnostics(
         "raw_search_query": raw_search_query,
         "built_jump_query": None,
         "built_jump_queries": [],
+        "built_jump_query_labels": [],
         "query_collision_guard_applied": False,
         "result_count": 0,
         "general_result_count": 0,
@@ -6244,9 +6365,23 @@ def lateral_jump_with_diagnostics(
     diagnostic["query_collision_guard_applied"] = bool(
         getattr(_build_jump_search_queries, "last_collision_guard_applied", False)
     )
+    query_labels = [
+        str(label).strip()
+        for label in (getattr(_build_jump_search_queries, "last_query_labels", []) or [])
+        if str(label).strip()
+    ]
+    while len(query_labels) < len(queries):
+        index = len(query_labels)
+        if index == 0:
+            query_labels.append("base")
+        elif index == 1:
+            query_labels.append("solution-biased")
+        else:
+            query_labels.append(f"variant-{index + 1}")
     query = queries[0] if queries else ""
     diagnostic["built_jump_query"] = query
     diagnostic["built_jump_queries"] = queries
+    diagnostic["built_jump_query_labels"] = query_labels[: len(queries)]
     if not query:
         diagnostic["stage1_outcome"] = "no_results"
         diagnostic["stage1_failure_hint"] = "empty_jump_query"
@@ -6256,7 +6391,6 @@ def lateral_jump_with_diagnostics(
     category_lower = source_category.lower()
     merged_results: list[dict] = []
     merged_result_index: dict[str, int] = {}
-    query_labels = ("base", "solution-biased")
     query_error_count = 0
     general_result_count = 0
     academic_result_count = 0
@@ -6278,7 +6412,7 @@ def lateral_jump_with_diagnostics(
             len(set(tokens)),
             len(tokens),
             len(text),
-            1 if "solution-biased" in labels else 0,
+            1 if _has_intervention_query_label(labels) else 0,
         )
 
     def _merge_search_results(
