@@ -2526,7 +2526,22 @@ def _classify_weak_jump_result(
         solution_marker_count=solution_marker_count,
         specificity_score=specificity_score,
     )
+    intervention_marker_count = int(
+        intervention_context.get("intervention_marker_count") or 0
+    )
     intervention_evidence = bool(intervention_context.get("intervention_evidence"))
+    # Metadata-only additive signal for later adjacent-result compression.
+    adjacent_strength = min(anchor_overlap, 2)
+    if preferred_phrase_match:
+        adjacent_strength += 2
+    adjacent_strength += min(solution_marker_count, 2)
+    if specificity_score >= 4:
+        adjacent_strength += 1
+    if specificity_score >= 6:
+        adjacent_strength += 1
+    if intervention_evidence:
+        adjacent_strength += 2
+    adjacent_strength += min(intervention_marker_count, 2)
     strong_grounding_signal = intervention_evidence or reliable_solution_evidence
     adjacent_retained = (
         anchor_overlap < 2
@@ -2558,10 +2573,9 @@ def _classify_weak_jump_result(
         "preferred_phrase_match": preferred_phrase_match,
         "solution_marker_count": solution_marker_count,
         "specificity_score": specificity_score,
+        "adjacent_strength": adjacent_strength,
         "triage_class": triage_class,
-        "intervention_marker_count": int(
-            intervention_context.get("intervention_marker_count") or 0
-        ),
+        "intervention_marker_count": intervention_marker_count,
         "intervention_evidence": intervention_evidence,
         "intervention_signal": str(
             intervention_context.get("intervention_signal") or ""
@@ -5997,6 +6011,7 @@ def lateral_jump_with_diagnostics(
             solution_marker_count = int(
                 weak_result_context.get("solution_marker_count") or 0
             )
+            adjacent_strength = int(weak_result_context.get("adjacent_strength") or 0)
             intervention_marker_count = int(
                 weak_result_context.get("intervention_marker_count") or 0
             )
@@ -6020,6 +6035,7 @@ def lateral_jump_with_diagnostics(
                         "anchor_overlap": anchor_overlap,
                         "preferred_phrase_match": preferred_phrase_match,
                         "solution_marker_count": solution_marker_count,
+                        "adjacent_strength": adjacent_strength,
                         "intervention_marker_count": intervention_marker_count,
                         "intervention_evidence": intervention_evidence,
                         "intervention_signal": intervention_signal,
@@ -6042,11 +6058,16 @@ def lateral_jump_with_diagnostics(
                 existing_result["anchor_overlap"] = anchor_overlap
                 existing_result["preferred_phrase_match"] = preferred_phrase_match
                 existing_result["solution_marker_count"] = solution_marker_count
+                existing_result["adjacent_strength"] = adjacent_strength
                 existing_result["intervention_marker_count"] = intervention_marker_count
                 existing_result["intervention_evidence"] = intervention_evidence
                 existing_result["intervention_signal"] = intervention_signal
                 existing_result["triage_class"] = triage_class
             else:
+                existing_result["adjacent_strength"] = max(
+                    int(existing_result.get("adjacent_strength") or 0),
+                    adjacent_strength,
+                )
                 existing_result["intervention_marker_count"] = max(
                     int(existing_result.get("intervention_marker_count") or 0),
                     intervention_marker_count,
