@@ -3078,6 +3078,157 @@ def test_lateral_jump_with_diagnostics_enriches_stage1_packet_with_evidence_role
     assert stage_inputs["stage1"].count("Snippet:") <= 5
 
 
+def _jump_packet_result(
+    title_text: str,
+    clean: str,
+    url: str,
+    *,
+    triage_class: str = "adjacent",
+    adjacent_strength: int = 0,
+    query_labels: list[str] | None = None,
+    anchor_overlap: int = 1,
+    preferred_phrase_match: bool = False,
+    solution_marker_count: int = 0,
+    intervention_marker_count: int = 0,
+    intervention_evidence: bool = False,
+    intervention_signal: str = "",
+) -> dict[str, object]:
+    return {
+        "title_text": title_text,
+        "clean": clean,
+        "url": url,
+        "query_labels": list(query_labels or ["base"]),
+        "anchor_overlap": anchor_overlap,
+        "preferred_phrase_match": preferred_phrase_match,
+        "solution_marker_count": solution_marker_count,
+        "adjacent_strength": adjacent_strength,
+        "intervention_marker_count": intervention_marker_count,
+        "intervention_evidence": intervention_evidence,
+        "intervention_signal": intervention_signal,
+        "triage_class": triage_class,
+    }
+
+
+def test_build_jump_search_content_compresses_adjacent_heavy_packet_to_strong_diverse_adjacent_roles() -> None:
+    search_content, _, _, clustered_results, enriched_packet = jump._build_jump_search_content(
+        [
+            _jump_packet_result(
+                "Electrochemical suppression mechanism",
+                "Threshold routing channels stabilize latency under rising load.",
+                "https://adjacent.test/mechanism",
+                adjacent_strength=6,
+            ),
+            _jump_packet_result(
+                "Electrochemical suppression workaround",
+                "A practical workaround isolates the unstable lane during startup.",
+                "https://adjacent.test/workaround",
+                adjacent_strength=8,
+                solution_marker_count=2,
+                intervention_marker_count=2,
+                intervention_evidence=True,
+            ),
+            _jump_packet_result(
+                "Electrochemical suppression operator response",
+                "Operators isolate the unstable lane and switch flow when alarms trigger.",
+                "https://adjacent.test/operator",
+                adjacent_strength=7,
+                solution_marker_count=1,
+                intervention_marker_count=2,
+                intervention_evidence=True,
+                intervention_signal="operators isolate",
+            ),
+            _jump_packet_result(
+                "Electrochemical suppression overview",
+                "Broad context overview of suppression behavior.",
+                "https://adjacent.test/overview",
+                adjacent_strength=1,
+            ),
+            _jump_packet_result(
+                "Electrochemical suppression background",
+                "General background context for suppression behavior.",
+                "https://adjacent.test/background",
+                adjacent_strength=2,
+            ),
+        ],
+        set(),
+        {"threshold", "routing", "latency", "queue"},
+    )
+
+    assert len(clustered_results) == 1
+    assert enriched_packet is True
+    assert "Mechanism evidence:" in search_content
+    assert "Intervention/workaround evidence:" in search_content
+    assert "Operator response evidence:" in search_content
+    assert "Title: Electrochemical suppression mechanism" in search_content
+    assert "Title: Electrochemical suppression workaround" in search_content
+    assert "Title: Electrochemical suppression operator response" in search_content
+    assert "Title: Electrochemical suppression overview" not in search_content
+    assert "Title: Electrochemical suppression background" not in search_content
+    assert search_content.count("Title:") == 3
+    assert "Search result 1:" not in search_content
+
+
+def test_build_jump_search_content_keeps_strong_keep_evidence_primary_during_adjacent_compression() -> None:
+    search_content, _, _, clustered_results, enriched_packet = jump._build_jump_search_content(
+        [
+            _jump_packet_result(
+                "Relay gating mismatch suppression",
+                "Relay gating mismatch suppression isolates the mismatched lane before actuator switching.",
+                "https://target.test/keep",
+                triage_class="keep",
+                adjacent_strength=6,
+                anchor_overlap=3,
+            ),
+            _jump_packet_result(
+                "Relay gating mismatch workaround",
+                "A practical workaround isolates the failing lane during startup.",
+                "https://target.test/workaround",
+                adjacent_strength=8,
+                solution_marker_count=2,
+                intervention_marker_count=2,
+                intervention_evidence=True,
+            ),
+            _jump_packet_result(
+                "Relay gating mismatch operator response",
+                "Operators isolate the failing lane and switch control when alarms trigger.",
+                "https://target.test/operator",
+                adjacent_strength=7,
+                solution_marker_count=1,
+                intervention_marker_count=2,
+                intervention_evidence=True,
+                intervention_signal="operators isolate",
+            ),
+            _jump_packet_result(
+                "Relay gating mismatch context",
+                "Broad context overview of mismatch behavior.",
+                "https://target.test/context",
+                adjacent_strength=1,
+            ),
+            _jump_packet_result(
+                "Relay gating mismatch background",
+                "General background description of mismatch behavior.",
+                "https://target.test/background",
+                adjacent_strength=2,
+            ),
+        ],
+        set(),
+        {"relay", "gating", "mismatch", "actuator"},
+    )
+
+    assert len(clustered_results) == 1
+    assert enriched_packet is True
+    assert "Title: Relay gating mismatch suppression" in search_content
+    assert "Title: Relay gating mismatch workaround" in search_content
+    assert "Title: Relay gating mismatch operator response" in search_content
+    assert "Title: Relay gating mismatch context" not in search_content
+    assert "Title: Relay gating mismatch background" not in search_content
+    assert search_content.index(
+        "Title: Relay gating mismatch suppression"
+    ) < search_content.index("Title: Relay gating mismatch workaround")
+    assert search_content.count("Title:") == 3
+    assert "Search result 1:" not in search_content
+
+
 def test_lateral_jump_with_diagnostics_does_not_promote_descriptive_process_paper_as_intervention(
     monkeypatch,
 ) -> None:

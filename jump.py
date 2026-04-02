@@ -5544,6 +5544,12 @@ def _build_jump_search_content(
             excerpt_rank[3],
         )
 
+    def _is_adjacent_result(result: dict) -> bool:
+        return str(result.get("triage_class") or "keep").strip() == "adjacent"
+
+    def _adjacent_strength(result: dict) -> int:
+        return int(result.get("adjacent_strength") or 0)
+
     def _stage_one_mechanism_evidence_rank(
         result: dict,
     ) -> tuple[int, int, int, int, int, int, int]:
@@ -5589,12 +5595,110 @@ def _build_jump_search_content(
             excerpt_rank[1],
         )
 
+    def _mechanism_highlight_predicate(result: dict) -> bool:
+        return (
+            bool(result.get("preferred_phrase_match"))
+            or int(result.get("anchor_overlap") or 0) >= 2
+            or _stage_one_mechanism_evidence_rank(result)[3] >= 3
+        )
+
+    def _intervention_highlight_predicate(result: dict) -> bool:
+        return bool(result.get("intervention_evidence")) or int(
+            result.get("solution_marker_count") or 0
+        ) > 0
+
+    def _operator_response_highlight_predicate(result: dict) -> bool:
+        return (
+            bool(str(result.get("intervention_signal", "") or "").strip())
+            or bool(result.get("intervention_evidence"))
+            or int(result.get("solution_marker_count") or 0) > 0
+        )
+
     def _stage_one_packet_result_key(result: dict) -> str:
         return (
             str(result.get("url", "") or "").strip().lower()
             or str(result.get("title_text", "") or "").strip().lower()
             or str(result.get("clean", "") or "").strip().lower()
         )
+
+    def _compress_adjacent_display_results(
+        cluster_results: list[dict],
+        *,
+        adjacent_heavy_packet: bool,
+    ) -> list[dict]:
+        if not adjacent_heavy_packet:
+            return cluster_results
+        adjacent_results = [
+            result for result in cluster_results if _is_adjacent_result(result)
+        ]
+        keep_results = [
+            result for result in cluster_results if not _is_adjacent_result(result)
+        ]
+        if len(adjacent_results) < 4 or len(adjacent_results) < len(keep_results) + 2:
+            return cluster_results
+
+        selected_adjacent_keys: set[str] = set()
+
+        def _select_adjacent(predicate, ranker) -> None:
+            candidates = [
+                result
+                for result in adjacent_results
+                if predicate(result)
+                and _stage_one_packet_result_key(result) not in selected_adjacent_keys
+            ]
+            if not candidates:
+                return
+            best_result = max(candidates, key=ranker)
+            selected_adjacent_keys.add(_stage_one_packet_result_key(best_result))
+
+        # Keep one strong adjacent per evidence role, plus at most one extra fallback.
+        _select_adjacent(
+            _mechanism_highlight_predicate,
+            lambda result: (
+                _adjacent_strength(result),
+                *_stage_one_mechanism_evidence_rank(result),
+            ),
+        )
+        _select_adjacent(
+            _intervention_highlight_predicate,
+            lambda result: (
+                _adjacent_strength(result),
+                *_stage_one_intervention_evidence_rank(result),
+            ),
+        )
+        _select_adjacent(
+            _operator_response_highlight_predicate,
+            lambda result: (
+                1 if str(result.get("intervention_signal", "") or "").strip() else 0,
+                _adjacent_strength(result),
+                *_stage_one_intervention_evidence_rank(result),
+            ),
+        )
+        remaining_adjacent = [
+            result
+            for result in adjacent_results
+            if _stage_one_packet_result_key(result) not in selected_adjacent_keys
+        ]
+        if remaining_adjacent:
+            best_remaining_adjacent = max(
+                remaining_adjacent,
+                key=lambda result: (
+                    _adjacent_strength(result),
+                    *_stage_one_intervention_evidence_rank(result),
+                    *_stage_one_mechanism_evidence_rank(result),
+                ),
+            )
+            if _adjacent_strength(best_remaining_adjacent) >= 4 or not selected_adjacent_keys:
+                selected_adjacent_keys.add(
+                    _stage_one_packet_result_key(best_remaining_adjacent)
+                )
+
+        return [
+            result
+            for result in cluster_results
+            if not _is_adjacent_result(result)
+            or _stage_one_packet_result_key(result) in selected_adjacent_keys
+        ]
 
     def _select_stage_one_evidence_highlights(
         cluster_results: list[dict],
@@ -5622,28 +5726,17 @@ def _build_jump_search_content(
 
         _pick_highlight(
             "Mechanism evidence",
-            lambda result: (
-                bool(result.get("preferred_phrase_match"))
-                or int(result.get("anchor_overlap") or 0) >= 2
-                or _stage_one_mechanism_evidence_rank(result)[3] >= 3
-            ),
+            _mechanism_highlight_predicate,
             _stage_one_mechanism_evidence_rank,
         )
         _pick_highlight(
             "Intervention/workaround evidence",
-            lambda result: (
-                bool(result.get("intervention_evidence"))
-                or int(result.get("solution_marker_count") or 0) > 0
-            ),
+            _intervention_highlight_predicate,
             _stage_one_intervention_evidence_rank,
         )
         _pick_highlight(
             "Operator response evidence",
-            lambda result: (
-                bool(str(result.get("intervention_signal", "") or "").strip())
-                or bool(result.get("intervention_evidence"))
-                or int(result.get("solution_marker_count") or 0) > 0
-            ),
+            _operator_response_highlight_predicate,
             lambda result: (
                 1 if str(result.get("intervention_signal", "") or "").strip() else 0,
                 *_stage_one_intervention_evidence_rank(result),
@@ -5778,6 +5871,16 @@ def _build_jump_search_content(
         or (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
         reverse=True,
     )
+    adjacent_result_count = sum(
+        1 for result in merged_results if _is_adjacent_result(result)
+    )
+    keep_result_count = sum(
+        1 for result in merged_results if not _is_adjacent_result(result)
+    )
+    adjacent_heavy_packet = (
+        adjacent_result_count >= 4
+        and adjacent_result_count >= keep_result_count + 2
+    )
 
     search_content: list[str] = []
     raw_target_candidates: list[dict] = []
@@ -5787,6 +5890,10 @@ def _build_jump_search_content(
     for cluster_index, cluster in enumerate(clustered_results, start=1):
         cluster_hint = str(cluster.get("cluster_hint", "") or "").strip() or "Unknown"
         cluster_results = list(cluster.get("results") or [])
+        display_cluster_results = _compress_adjacent_display_results(
+            cluster_results,
+            adjacent_heavy_packet=adjacent_heavy_packet,
+        )
         search_content.append(f"Candidate cluster {cluster_index}:")
         search_content.append(f"Cluster hint: {cluster_hint}")
         search_content.append(f"Supporting results: {len(cluster_results)}")
@@ -5797,7 +5904,7 @@ def _build_jump_search_content(
         elif int(cluster.get("intervention_score") or 0) > 0:
             search_content.append("Intervention evidence: yes")
         highlighted_result_keys: set[str] = set()
-        highlights = _select_stage_one_evidence_highlights(cluster_results)
+        highlights = _select_stage_one_evidence_highlights(display_cluster_results)
         if highlights:
             enriched_packet = True
         for highlight in highlights:
@@ -5843,6 +5950,7 @@ def _build_jump_search_content(
             )
             if title_text and title_text not in top_titles and len(top_titles) < 3:
                 top_titles.append(title_text)
+        for merged_result in display_cluster_results:
             if _stage_one_packet_result_key(merged_result) not in highlighted_result_keys:
                 fallback_results.append(merged_result)
         for result_index, merged_result in enumerate(fallback_results[:2], start=1):
