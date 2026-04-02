@@ -518,6 +518,114 @@ def test_is_acceptable_llm_jump_query_rejects_vague_preferred_phrase_fragment() 
     assert acceptable is False
 
 
+def test_is_acceptable_llm_jump_query_rejects_unsupported_supplier_drift() -> None:
+    pattern = {
+        "search_query": "blocking unit removal restoring aggregate throughput",
+        "pattern_name": "Blocked-unit ejection restores throughput",
+        "abstract_structure": (
+            "a blocking unit is removed after a decision threshold so aggregate "
+            "throughput recovers"
+        ),
+        "measurable_signal": "aggregate throughput after blocked-unit removal",
+        "control_lever": "adjust the ejection decision threshold for blocked units",
+    }
+
+    acceptable = jump._is_acceptable_llm_jump_query(
+        "bottleneck supplier ejection decision threshold restore flow",
+        pattern,
+        "Robotics",
+        "Technology",
+        jump._build_jump_search_query_heuristic(
+            pattern,
+            "Robotics",
+            "Technology",
+        ),
+    )
+
+    assert acceptable is False
+
+
+def test_is_acceptable_llm_jump_query_accepts_grounded_blockage_recovery_query() -> None:
+    pattern = {
+        "search_query": "blocking unit removal restoring aggregate throughput",
+        "pattern_name": "Blocked-unit ejection restores throughput",
+        "abstract_structure": (
+            "a blocking unit is removed after a decision threshold so aggregate "
+            "throughput recovers"
+        ),
+        "measurable_signal": "aggregate throughput after blocked-unit removal",
+        "control_lever": "adjust the ejection decision threshold for blocked units",
+    }
+
+    acceptable = jump._is_acceptable_llm_jump_query(
+        "blocked unit ejection threshold restores aggregate throughput",
+        pattern,
+        "Robotics",
+        "Technology",
+        jump._build_jump_search_query_heuristic(
+            pattern,
+            "Robotics",
+            "Technology",
+        ),
+    )
+
+    assert acceptable is True
+
+
+def test_is_acceptable_llm_jump_query_rejects_single_anchor_token_with_drift() -> None:
+    pattern = {
+        "search_query": "blocking unit removal restoring aggregate throughput",
+        "pattern_name": "Blocked-unit ejection restores throughput",
+        "abstract_structure": (
+            "a blocking unit is removed after a decision threshold so aggregate "
+            "throughput recovers"
+        ),
+        "measurable_signal": "aggregate throughput after blocked-unit removal",
+        "control_lever": "adjust the ejection decision threshold for blocked units",
+    }
+
+    acceptable = jump._is_acceptable_llm_jump_query(
+        "supplier procurement backlog ejection",
+        pattern,
+        "Robotics",
+        "Technology",
+        jump._build_jump_search_query_heuristic(
+            pattern,
+            "Robotics",
+            "Technology",
+        ),
+    )
+
+    assert acceptable is False
+
+
+def test_is_acceptable_llm_jump_query_rejects_supported_anchor_plus_supplier_drift() -> None:
+    pattern = {
+        "search_query": "blocking unit removal restoring aggregate throughput",
+        "pattern_name": "Blocked-unit ejection restores throughput",
+        "abstract_structure": (
+            "a blocking unit is removed after a decision threshold so aggregate "
+            "throughput recovers"
+        ),
+        "measurable_signal": "aggregate throughput after blocked-unit removal",
+        "control_lever": "adjust the ejection decision threshold for blocked units",
+    }
+
+    acceptable = jump._is_acceptable_llm_jump_query(
+        "blocked unit supplier ejection threshold",
+        pattern,
+        "Robotics",
+        "Technology",
+        jump._build_jump_search_query_heuristic(
+            pattern,
+            "Robotics",
+            "Technology",
+        ),
+    )
+
+    assert acceptable is False
+
+
 def test_build_jump_search_query_falls_back_from_vague_llm_base_query(
     monkeypatch,
 ) -> None:
@@ -666,6 +774,49 @@ def test_build_jump_search_queries_strengthens_thin_mechanism_family_spine(
     assert queries[0].startswith("finer types gate them earlier")
     assert "fine-grained" in queries[0] or "validation" in queries[0]
     assert jump._build_jump_search_queries.last_query_labels[0] == "mechanism-family"
+
+
+def test_build_jump_search_queries_falls_back_from_supplier_drift_but_keeps_family_labels(
+    monkeypatch,
+) -> None:
+    pattern = {
+        "search_query": "blocking unit removal restoring aggregate throughput",
+        "pattern_name": "Blocked-unit ejection restores throughput",
+        "abstract_structure": (
+            "a blocking unit is removed after a decision threshold so aggregate "
+            "throughput recovers"
+        ),
+        "measurable_signal": "aggregate throughput after blocked-unit removal",
+        "control_lever": "adjust the ejection decision threshold for blocked units",
+    }
+    monkeypatch.setattr(
+        jump,
+        "_generate_json_with_retry",
+        lambda *_args, **_kwargs: json.dumps(
+            {"query": "bottleneck supplier ejection decision threshold restore flow"}
+        ),
+    )
+
+    queries = jump._build_jump_search_queries(
+        pattern,
+        "Robotics",
+        "Technology",
+    )
+
+    assert queries == jump._build_jump_search_queries(
+        pattern,
+        "Robotics",
+        "Technology",
+    )
+    assert 1 <= len(queries) <= 3
+    assert all("supplier" not in query for query in queries)
+    assert "decision threshold" in queries[0]
+    assert "blocking" in queries[0] or "throughput" in queries[0]
+    assert jump._build_jump_search_queries.last_query_labels == [
+        "mechanism-family",
+        "intervention-family",
+        "operator-family",
+    ][: len(queries)]
 
 
 def test_lateral_jump_with_diagnostics_academic_lane_uses_improved_base_query(
