@@ -1151,6 +1151,32 @@ QUERY_PHRASE_STOPWORDS = {
     "with",
     "without",
 }
+JUMP_QUERY_ACTION_VERB_TOKENS = {
+    "adjust",
+    "change",
+    "move",
+    "tighten",
+    "tune",
+    "vary",
+}
+JUMP_QUERY_TRAILING_CONNECTORS = {
+    "after",
+    "before",
+    "by",
+    "for",
+    "from",
+    "into",
+    "that",
+    "to",
+    "under",
+    "until",
+    "via",
+    "when",
+    "where",
+    "which",
+    "with",
+    "without",
+}
 
 JUMP_QUERY_CAUSAL_VERB_STEMS = (
     "attenuat",
@@ -1218,6 +1244,7 @@ JUMP_QUERY_FILLER_TOKENS = {
     "long",
     "most",
     "one",
+    "previously",
     "raise",
     "same",
     "term",
@@ -1805,6 +1832,23 @@ def _score_jump_query_clause(
     )
 
 
+def _trim_jump_query_connector_tail(query: str) -> str:
+    tokens = _tokenize_query_terms(query)
+    while tokens and tokens[-1] in JUMP_QUERY_TRAILING_CONNECTORS:
+        tokens.pop()
+    return " ".join(tokens).strip()
+
+
+def _looks_like_jump_query_verb_token(token: str) -> bool:
+    return (
+        _is_causal_jump_query_token(token)
+        or token in JUMP_QUERY_ACTION_VERB_TOKENS
+        or token.endswith("ing")
+        or token.endswith("ed")
+        or token.endswith("es")
+    ) and token not in MECHANISM_QUERY_TOKENS and token not in JUMP_QUERY_CAUSAL_OUTCOME_HINTS
+
+
 def _is_compact_natural_language_jump_query(
     query: str,
     blocked_tokens: set[str],
@@ -1841,6 +1885,35 @@ def _is_compact_natural_language_jump_query(
     return any(_is_causal_jump_query_token(token) for token in candidate_tokens) and len(
         candidate_tokens
     ) <= 5
+
+
+def _is_compact_keyword_jump_query(
+    query: str,
+    blocked_tokens: set[str],
+) -> bool:
+    candidate_tokens = _tokenize_query_terms(
+        _trim_jump_query_connector_tail(str(query or "").strip())
+    )
+    if len(candidate_tokens) < 4 or len(candidate_tokens) > 8:
+        return False
+    if _looks_like_formal_jump_query_token_soup(str(query or ""), candidate_tokens):
+        return False
+    strong_tokens = [
+        token
+        for token in candidate_tokens
+        if token not in blocked_tokens
+        and token not in GENERIC_QUERY_TOKENS
+        and token not in WEAK_QUERY_TOKENS
+        and token not in JUMP_QUERY_FILLER_TOKENS
+        and token not in QUERY_PHRASE_STOPWORDS
+        and token not in OVERLOADED_JUMP_QUERY_TOKENS
+    ]
+    clause_score = _score_jump_query_clause(" ".join(candidate_tokens), blocked_tokens)
+    return (
+        len(strong_tokens) >= 3
+        and clause_score[1] >= 1
+        and clause_score[2] >= 3
+    )
 
 
 def _build_causal_jump_query_fragment(
@@ -1918,7 +1991,281 @@ def _build_causal_jump_query_fragment(
             strong_token_count += 1
         if len(selected) >= 7:
             break
-    return " ".join(selected[:7]).strip()
+    fallback = " ".join(selected[:7]).strip()
+    trimmed = _trim_jump_query_connector_tail(fallback)
+    if len(_tokenize_query_terms(trimmed)) >= 4:
+        return trimmed
+    return trimmed or fallback
+
+
+def _build_jump_keyword_query_fragment(
+    pattern: dict,
+    raw_query: str,
+    blocked_tokens: set[str],
+) -> str:
+    selected: list[str] = []
+    covered_tokens: set[str] = set()
+    has_causal_term = False
+    has_outcome_term = False
+    mechanism_support_tokens: set[str] = set()
+    for text in (
+        str(pattern.get("control_lever", "") or ""),
+        str(pattern.get("abstract_structure", "") or ""),
+        str(pattern.get("transfer_rationale", "") or ""),
+    ):
+        for token in _tokenize_query_terms(text):
+            if (
+                token in blocked_tokens
+                or token in GENERIC_QUERY_TOKENS
+                or token in WEAK_QUERY_TOKENS
+                or token in OVERLOADED_JUMP_QUERY_TOKENS
+                or token in JUMP_QUERY_FILLER_TOKENS
+                or token in QUERY_PHRASE_STOPWORDS
+                or len(token) <= 2
+            ):
+                continue
+            if (
+                _is_concrete_jump_query_token(token)
+                or _is_causal_jump_query_token(token)
+                or token in MECHANISM_QUERY_TOKENS
+                or token in PHRASE_ANCHOR_TAIL_TOKENS
+                or token in JUMP_QUERY_CAUSAL_OUTCOME_HINTS
+            ):
+                mechanism_support_tokens.add(token)
+                mechanism_support_tokens.update(
+                    part for part in token.split("-") if len(part) > 2
+                )
+    source_surface_tokens = {
+        token
+        for token in _tokenize_query_terms(raw_query)
+        if (
+            token not in mechanism_support_tokens
+            and token not in blocked_tokens
+            and token not in GENERIC_QUERY_TOKENS
+            and token not in WEAK_QUERY_TOKENS
+            and token not in OVERLOADED_JUMP_QUERY_TOKENS
+            and token not in JUMP_QUERY_FILLER_TOKENS
+            and token not in QUERY_PHRASE_STOPWORDS
+            and token not in MECHANISM_QUERY_TOKENS
+            and token not in PHRASE_ANCHOR_TAIL_TOKENS
+            and token not in JUMP_QUERY_CAUSAL_OUTCOME_HINTS
+            and not _is_causal_jump_query_token(token)
+            and len(token) > 2
+        )
+    }
+
+    def _token_budget() -> int:
+        return 8 - len(_tokenize_query_terms(" ".join(selected)))
+
+    def _is_source_surface_token(token: str) -> bool:
+        if token in source_surface_tokens:
+            return True
+        token_parts = [part for part in str(token or "").split("-") if len(part) > 2]
+        return bool(token_parts) and all(part in source_surface_tokens for part in token_parts)
+
+    def _is_keyword_token(token: str, *, allow_causal: bool = False) -> bool:
+        if (
+            token in blocked_tokens
+            or _is_source_surface_token(token)
+            or token in GENERIC_QUERY_TOKENS
+            or token in WEAK_QUERY_TOKENS
+            or token in OVERLOADED_JUMP_QUERY_TOKENS
+            or token in JUMP_QUERY_FILLER_TOKENS
+            or token in QUERY_PHRASE_STOPWORDS
+            or len(token) <= 2
+        ):
+            return False
+        if (
+            token in MECHANISM_QUERY_TOKENS
+            or token in PHRASE_ANCHOR_TAIL_TOKENS
+            or token in JUMP_QUERY_CAUSAL_OUTCOME_HINTS
+        ):
+            return True
+        if not allow_causal and _looks_like_jump_query_verb_token(token):
+            return False
+        if _is_concrete_jump_query_token(token):
+            return not _is_causal_jump_query_token(token) or allow_causal
+        return allow_causal and _is_causal_jump_query_token(token)
+
+    def _is_keyword_phrase(phrase: str) -> bool:
+        phrase_tokens = _tokenize_query_terms(phrase)
+        return (
+            len(phrase_tokens) >= 2
+            and phrase_tokens[0] not in blocked_tokens
+            and phrase_tokens[0] not in GENERIC_QUERY_TOKENS
+            and phrase_tokens[0] not in WEAK_QUERY_TOKENS
+            and phrase_tokens[0] not in JUMP_QUERY_FILLER_TOKENS
+            and phrase_tokens[0] not in QUERY_PHRASE_STOPWORDS
+            and phrase_tokens[0] not in OVERLOADED_JUMP_QUERY_TOKENS
+            and len(phrase_tokens[0]) > 2
+            and not _looks_like_jump_query_verb_token(phrase_tokens[0])
+            and _is_keyword_token(phrase_tokens[1])
+            and not _looks_like_jump_query_verb_token(phrase_tokens[1])
+        )
+
+    def _append_part(part: str) -> None:
+        nonlocal has_causal_term, has_outcome_term
+        normalized = _trim_jump_query_connector_tail(
+            re.sub(r"\s+", " ", str(part or "").strip().lower())
+        )
+        if not normalized or normalized in selected:
+            return
+        part_tokens = _tokenize_query_terms(normalized)
+        if (
+            not part_tokens
+            or len(part_tokens) > _token_budget()
+            or any(token in covered_tokens for token in part_tokens)
+        ):
+            return
+        selected.append(normalized)
+        covered_tokens.update(part_tokens)
+        has_causal_term = has_causal_term or any(
+            _is_causal_jump_query_token(token) for token in part_tokens
+        )
+        has_outcome_term = has_outcome_term or any(
+            token in JUMP_QUERY_CAUSAL_OUTCOME_HINTS for token in part_tokens
+        )
+
+    preferred_field_texts = [
+        str(pattern.get("control_lever", "") or ""),
+        str(pattern.get("measurable_signal", "") or ""),
+        str(pattern.get("abstract_structure", "") or ""),
+        str(pattern.get("transfer_rationale", "") or ""),
+    ]
+    fallback_field_texts = [
+        str(pattern.get("pattern_name", "") or ""),
+        raw_query,
+    ]
+    phrase_candidates: list[str] = []
+    phrase_seen: set[str] = set()
+    token_groups: dict[str, list[str]] = {
+        "mechanism": [],
+        "outcome": [],
+        "causal": [],
+    }
+    token_seen: set[str] = set()
+
+    def _collect_anchor_phrases(anchor_pattern: dict) -> None:
+        preferred_anchor_phrases = _preferred_jump_query_anchor_phrases(
+            anchor_pattern,
+            blocked_tokens,
+        )
+        best_anchor_phrase = _select_best_jump_anchor_phrase(preferred_anchor_phrases)
+        for phrase in [best_anchor_phrase, *preferred_anchor_phrases]:
+            normalized_phrase = _trim_jump_query_connector_tail(phrase)
+            if (
+                not normalized_phrase
+                or normalized_phrase in phrase_seen
+                or not _is_keyword_phrase(normalized_phrase)
+            ):
+                continue
+            phrase_seen.add(normalized_phrase)
+            phrase_candidates.append(normalized_phrase)
+
+    def _collect_from_texts(field_texts: list[str]) -> None:
+        for text in field_texts:
+            normalized_text = _normalize_jump_query_clause(text)
+            if not normalized_text:
+                continue
+            for phrase in _extract_jump_query_phrases(normalized_text, blocked_tokens):
+                normalized_phrase = _trim_jump_query_connector_tail(phrase)
+                if (
+                    not normalized_phrase
+                    or normalized_phrase in phrase_seen
+                    or not _is_keyword_phrase(normalized_phrase)
+                ):
+                    continue
+                phrase_seen.add(normalized_phrase)
+                phrase_candidates.append(normalized_phrase)
+
+            text_tokens = _tokenize_query_terms(normalized_text)
+            for index in range(len(text_tokens) - 1):
+                first = text_tokens[index]
+                second = text_tokens[index + 1]
+                if not _is_keyword_token(first) or not _is_keyword_token(second):
+                    continue
+                if _looks_like_jump_query_verb_token(second):
+                    continue
+                phrase = _trim_jump_query_connector_tail(f"{first} {second}")
+                if (
+                    phrase
+                    and phrase not in phrase_seen
+                    and _is_keyword_phrase(phrase)
+                ):
+                    phrase_seen.add(phrase)
+                    phrase_candidates.append(phrase)
+
+            for token in text_tokens:
+                if token in token_seen:
+                    continue
+                if token in JUMP_QUERY_CAUSAL_OUTCOME_HINTS and _is_keyword_token(token):
+                    token_groups["outcome"].append(token)
+                    token_seen.add(token)
+                    continue
+                if token in MECHANISM_QUERY_TOKENS and _is_keyword_token(token):
+                    token_groups["mechanism"].append(token)
+                    token_seen.add(token)
+                    continue
+                if _is_concrete_jump_query_token(token) and _is_keyword_token(token):
+                    token_groups["mechanism"].append(token)
+                    token_seen.add(token)
+                    continue
+                if (
+                    _is_keyword_token(token, allow_causal=True)
+                    and _is_causal_jump_query_token(token)
+                ):
+                    token_groups["causal"].append(token)
+                    token_seen.add(token)
+
+    def _compose_selected_query() -> str:
+        for phrase in phrase_candidates:
+            if len(selected) >= 2 or _token_budget() < 2:
+                break
+            _append_part(phrase)
+
+        for token in token_groups["mechanism"]:
+            if _token_budget() <= 0:
+                break
+            _append_part(token)
+
+        if _token_budget() > 0 and not has_outcome_term:
+            for token in token_groups["outcome"]:
+                _append_part(token)
+                if has_outcome_term or _token_budget() <= 0:
+                    break
+
+        if _token_budget() > 0 and not has_causal_term and not has_outcome_term:
+            for token in token_groups["causal"]:
+                _append_part(token)
+                if has_causal_term or _token_budget() <= 0:
+                    break
+
+        return _trim_jump_query_connector_tail(" ".join(selected))
+
+    _collect_anchor_phrases(
+        {
+            "pattern_name": "",
+            "control_lever": str(pattern.get("control_lever", "") or ""),
+            "abstract_structure": str(pattern.get("abstract_structure", "") or ""),
+        }
+    )
+    _collect_from_texts(preferred_field_texts)
+    composed_query = _compose_selected_query()
+    if len(_tokenize_query_terms(composed_query)) >= 4:
+        return composed_query
+
+    _collect_anchor_phrases(
+        {
+            "pattern_name": str(pattern.get("pattern_name", "") or ""),
+            "control_lever": "",
+            "abstract_structure": "",
+        }
+    )
+    _collect_from_texts(fallback_field_texts)
+    composed_query = _compose_selected_query()
+    if len(_tokenize_query_terms(composed_query)) < 4:
+        return ""
+    return composed_query
 
 
 def _jump_query_anchor_support(
@@ -2465,31 +2812,13 @@ def _build_jump_search_query_heuristic(
     blocked_tokens = set(_tokenize_query_terms(source_domain))
     blocked_tokens.update(_tokenize_query_terms(source_category))
 
-    causal_candidates: list[tuple[int, str]] = []
-    for priority, text in enumerate(
-        (
-            str(query_pattern.get("transfer_rationale", "") or ""),
-            str(query_pattern.get("abstract_structure", "") or ""),
-        ),
-        start=1,
-    ):
-        causal_fragment = _build_causal_jump_query_fragment(text, blocked_tokens)
-        causal_tokens = _tokenize_query_terms(causal_fragment)
-        if len(causal_tokens) >= 4 and any(
-            _is_causal_jump_query_token(token) for token in causal_tokens
-        ):
-            causal_candidates.append((priority, causal_fragment))
-    if causal_candidates:
-        return max(
-            causal_candidates,
-            key=lambda item: (
-                _score_jump_query_clause(item[1], blocked_tokens)[3],
-                _score_jump_query_clause(item[1], blocked_tokens)[1],
-                _score_jump_query_clause(item[1], blocked_tokens)[2],
-                -item[0],
-                _score_jump_query_clause(item[1], blocked_tokens)[4],
-            ),
-        )[1]
+    keyword_query = _build_jump_keyword_query_fragment(
+        query_pattern,
+        raw_query,
+        blocked_tokens,
+    )
+    if keyword_query:
+        return keyword_query
 
     def _filtered_tokens(text: str, *, specific_only: bool = False) -> list[str]:
         out = []
@@ -2569,7 +2898,8 @@ def _build_jump_search_query_heuristic(
         if len(selected) >= max_parts:
             break
 
-    return " ".join(selected[:6]) or raw_query
+    fallback_query = _trim_jump_query_connector_tail(" ".join(selected[:6]))
+    return fallback_query or raw_query
 
 
 def _is_acceptable_llm_jump_query(
@@ -2713,9 +3043,25 @@ def _preserve_jump_query_causal_shape(
 
     blocked_tokens = set(_tokenize_query_terms(source_domain))
     blocked_tokens.update(_tokenize_query_terms(source_category))
+    rebuilt_is_natural_language = _is_compact_natural_language_jump_query(
+        clean_rebuilt,
+        blocked_tokens,
+    )
+    rebuilt_is_keyword_query = _is_compact_keyword_jump_query(
+        clean_rebuilt,
+        blocked_tokens,
+    )
+    original_has_source_overhang = _has_source_surface_jump_query_overhang(
+        _tokenize_query_terms(clean_original),
+        pattern,
+        source_domain,
+        source_category,
+    )
     if not _is_compact_natural_language_jump_query(clean_original, blocked_tokens):
         return clean_rebuilt
-    if _is_compact_natural_language_jump_query(clean_rebuilt, blocked_tokens):
+    if rebuilt_is_natural_language or (
+        rebuilt_is_keyword_query and original_has_source_overhang
+    ):
         return clean_rebuilt
 
     preferred_anchor_phrases = _preferred_jump_query_anchor_phrases(pattern, blocked_tokens)
@@ -2727,7 +3073,9 @@ def _preserve_jump_query_causal_shape(
     if not original_has_phrase and len(original_concrete_tokens) < 2:
         return clean_rebuilt
 
-    if not _is_compact_natural_language_jump_query(clean_rebuilt, blocked_tokens):
+    if not rebuilt_is_natural_language and not (
+        rebuilt_is_keyword_query and original_has_source_overhang
+    ):
         return clean_original
 
     original_score = _score_jump_query_clause(clean_original, blocked_tokens)
