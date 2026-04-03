@@ -58,6 +58,28 @@ def test_extract_prompt_requires_domain_neutral_transferable_rewrites() -> None:
         "transferable.mechanism should describe only the functional causal relation"
         in explore.EXTRACT_PROMPT
     )
+    assert "first write grounded.source_control and grounded.source_metric" in explore.EXTRACT_PROMPT
+    assert (
+        "then write transferable.mechanism, transferable.control_logic, and transferable.signal_shape"
+        in explore.EXTRACT_PROMPT
+    )
+    assert (
+        "re-read grounded.source_control and grounded.source_metric, mentally list their major nouns"
+        in explore.EXTRACT_PROMPT
+    )
+    assert (
+        "avoid reusing those grounded nouns in transferable.* unless no viable abstract substitute exists"
+        in explore.EXTRACT_PROMPT
+    )
+    assert (
+        "functional relations, thresholds, comparators, phase changes, bottlenecks, resets, saturation, rate changes, and trajectory shape"
+        in explore.EXTRACT_PROMPT
+    )
+    assert "signal amplitude drops and coherence collapses" in explore.EXTRACT_PROMPT
+    assert (
+        "representation resolution collapses when encoder span greatly exceeds source variation scale"
+        in explore.EXTRACT_PROMPT
+    )
     assert "additive increase multiplicative decrease" in explore.EXTRACT_PROMPT
     assert (
         "gradual linear ramp-up interrupted by proportional rollback after threshold breach"
