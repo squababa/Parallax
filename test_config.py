@@ -86,6 +86,17 @@ def test_valid_gemini_provider_model_pair_loads(monkeypatch) -> None:
     assert config.MODEL == "gemini-2.5-flash"
 
 
+def test_local_llm_only_ignores_stale_hosted_model_override(monkeypatch) -> None:
+    config = _reload_config(
+        monkeypatch,
+        LOCAL_LLM_ONLY="1",
+        BLACKCLAW_MODEL="claude-sonnet-4-6",
+    )
+    assert config.LOCAL_LLM_ONLY is True
+    assert config.LLM_PROVIDER == "ollama"
+    assert config.MODEL == "qwen3:8b"
+
+
 def test_invalid_gemini_provider_with_claude_model_fails_fast(
     monkeypatch,
     capsys,

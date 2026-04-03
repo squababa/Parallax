@@ -1271,6 +1271,7 @@ JUMP_SOURCE_LEAKAGE_GENERIC_TOKENS = {
     "event",
     "initial",
     "response",
+    "scale-free",
     "signal",
     "state",
 }
@@ -1402,26 +1403,8 @@ def _jump_source_shaped_terms(candidate_text: str, pattern: dict) -> list[str]:
         and not _is_generic_jump_grounded_source_token(token)
         and len(token) > 2
     }
-    source_tokens = {
-        token
-        for token in _tokenize_query_terms(
-            " ".join(
-                [
-                    str(pattern.get("pattern_name", "") or ""),
-                    str(pattern.get("search_query", "") or ""),
-                    str(pattern.get("measurable_signal", "") or ""),
-                    str(pattern.get("control_lever", "") or ""),
-                ]
-            )
-        )
-        if token not in GENERIC_QUERY_TOKENS
-        and token not in WEAK_QUERY_TOKENS
-        and token not in JUMP_QUERY_FILLER_TOKENS
-        and token not in QUERY_PHRASE_STOPWORDS
-        and token not in OVERLOADED_JUMP_QUERY_TOKENS
-        and not _is_generic_jump_grounded_source_token(token)
-        and len(token) > 2
-    }
+    grounded = pattern.get("grounded") if isinstance(pattern.get("grounded"), dict) else {}
+    source_tokens = _jump_grounded_source_tokens(grounded)
     return sorted(candidate_tokens.intersection(source_tokens))
 
 
@@ -1571,6 +1554,7 @@ def _classify_jump_intervention_evidence(
 
 
 def _jump_legacy_flat_pattern(pattern: dict) -> dict:
+    grounded = pattern.get("grounded") if isinstance(pattern.get("grounded"), dict) else {}
     return {
         "pattern_name": str(pattern.get("pattern_name", "") or "").strip(),
         "abstract_structure": str(pattern.get("abstract_structure", "") or "").strip(),
@@ -1578,6 +1562,7 @@ def _jump_legacy_flat_pattern(pattern: dict) -> dict:
         "measurable_signal": str(pattern.get("measurable_signal", "") or "").strip(),
         "control_lever": str(pattern.get("control_lever", "") or "").strip(),
         "transfer_rationale": str(pattern.get("transfer_rationale", "") or "").strip(),
+        "grounded": dict(grounded),
     }
 
 
@@ -2486,6 +2471,16 @@ def _unsupported_llm_jump_query_tokens(
         "with",
         "without",
     }
+    grounded = pattern.get("grounded") if isinstance(pattern.get("grounded"), dict) else {}
+    grounded_source_tokens = _jump_grounded_source_tokens(grounded)
+    if grounded_source_tokens:
+        return _strong_jump_source_terms(
+            _jump_transferable_source_leakage_terms(
+                set(candidate_tokens),
+                grounded_source_tokens,
+            )
+        )
+
     grounded_tokens = set(support_tokens)
     for phrase in preferred_anchor_phrases:
         grounded_tokens.update(_tokenize_query_terms(phrase))
