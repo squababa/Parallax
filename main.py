@@ -9504,7 +9504,9 @@ def _score_store_and_transmit(
     chain_path: list[str],
     exploration_path: list[str],
     threshold: float,
-) -> tuple[bool, float, bool]:
+    *,
+    include_hop2_allowed: bool = False,
+) -> tuple[bool, float] | tuple[bool, float, bool]:
     """Score one connection, store it, run convergence handling, and transmit if valid."""
     candidate = _evaluate_connection_candidate(
         score_label=score_label,
@@ -9637,11 +9639,10 @@ def _score_store_and_transmit(
         print_transmission(formatted)
         transmitted = True
 
-    return (
-        transmitted,
-        float(candidate["total_score"] or 0.0),
-        _should_launch_hop2(candidate),
-    )
+    total_score = float(candidate["total_score"] or 0.0)
+    if include_hop2_allowed:
+        return transmitted, total_score, _should_launch_hop2(candidate)
+    return transmitted, total_score
 
 
 def _seed_quality_text(seed: dict) -> str | None:
@@ -9784,6 +9785,7 @@ def run_cycle(
             chain_path=[seed["name"], target],
             exploration_path=[seed["name"], pattern.get("pattern_name", "Pattern"), target],
             threshold=threshold,
+            include_hop2_allowed=True,
         )
         if tx_sent:
             transmitted = True
@@ -9866,6 +9868,7 @@ def run_cycle(
                 chain_path=[seed["name"], target, target_2],
                 exploration_path=[seed["name"], target, target_2],
                 threshold=threshold,
+                include_hop2_allowed=True,
             )
             if tx_sent_2:
                 transmitted = True
