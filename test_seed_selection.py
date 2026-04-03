@@ -1,3 +1,6 @@
+import importlib
+import sys
+
 import pytest
 
 import config
@@ -406,6 +409,79 @@ def test_pick_seed_random_floor_preserves_exploration_reason(monkeypatch) -> Non
     assert selected["selection_diagnostics"]["mode"] == "random_floor"
     assert "random exploration pick (20% diversity floor)" in selected["selection_reason"]
     assert "weak-quality seed" in selected["selection_reason"]
+
+
+def test_pick_seed_honors_stale_config_object_after_prior_reload(monkeypatch) -> None:
+    domains = [
+        {
+            "name": "Strong Seed",
+            "category": "Technology",
+            "seed_queries": [
+                "queue routing latency control",
+                "load balancing failover schedule",
+            ],
+        },
+        {
+            "name": "Storytelling",
+            "category": "Communication",
+            "seed_queries": [
+                "narrative structure universal patterns",
+                "hero journey monomyth story",
+            ],
+        },
+    ]
+    previous_config_module = sys.modules.get("config")
+
+    monkeypatch.setenv("GEMINI_API_KEY", config.GEMINI_API_KEY or "test-gemini-key")
+    monkeypatch.setenv(
+        "ANTHROPIC_API_KEY",
+        config.ANTHROPIC_API_KEY or "test-anthropic-key",
+    )
+    monkeypatch.setenv("TAVILY_API_KEY", config.TAVILY_API_KEY or "test-tavily-key")
+    monkeypatch.setenv("LLM_PROVIDER", config.LLM_PROVIDER)
+    monkeypatch.setenv("BLACKCLAW_MODEL", config.MODEL)
+    monkeypatch.setenv("LOCAL_LLM_ONLY", "1" if config.LOCAL_LLM_ONLY else "0")
+    monkeypatch.setenv("PERSONALIZATION", "0")
+
+    sys.modules.pop("config", None)
+    importlib.import_module("config")
+
+    try:
+        assert sys.modules["config"] is not config
+        monkeypatch.setattr(seed, "_load_domains", lambda: domains)
+        monkeypatch.setattr(config, "PERSONALIZATION", True, raising=False)
+        monkeypatch.setattr(config, "SEED_EXCLUSION_WINDOW", 0, raising=False)
+
+        captured = {}
+
+        def _capture_recent_domains(exclusion_window=0):
+            captured["exclusion_window"] = exclusion_window
+            return []
+
+        monkeypatch.setattr(store, "get_recent_domains", _capture_recent_domains)
+        monkeypatch.setattr(store, "get_recent_seed_selection_context", lambda _n=0: {})
+        monkeypatch.setattr(
+            store,
+            "get_seed_outcome_metrics",
+            lambda: {
+                "global_metrics": {"raw_expected_value": 0.33},
+                "domain_metrics": {},
+                "category_metrics": {},
+            },
+        )
+        monkeypatch.setattr(seed.random, "random", lambda: 0.0)
+        monkeypatch.setattr(seed.random, "choice", lambda population: population[1])
+
+        selected = seed.pick_seed()
+
+        assert captured["exclusion_window"] == 0
+        assert selected["name"] == "Storytelling"
+        assert selected["selection_diagnostics"]["mode"] == "random_floor"
+    finally:
+        if previous_config_module is None:
+            sys.modules.pop("config", None)
+        else:
+            sys.modules["config"] = previous_config_module
 
 
 def test_seed_selection_metadata_round_trips_into_review_items(temp_db) -> None:
