@@ -921,6 +921,102 @@ def test_build_jump_search_query_heuristic_composes_keyword_packet_without_dangl
     assert "compares" not in tokens
 
 
+def _glassblowing_relative_reset_pattern() -> dict:
+    return {
+        "search_query": (
+            "calibrate reset position relative feasibility corrective injection because"
+        ),
+        "pattern_name": "Corrective reset injection",
+        "abstract_structure": (
+            "calibrate reset position relative feasibility corrective injection because"
+        ),
+        "measurable_signal": "reset position feasibility",
+        "control_lever": "calibrate reset position with corrective injection",
+        "transfer_rationale": (
+            "relative position reset improves corrective injection feasibility because"
+        ),
+    }
+
+
+def test_build_jump_search_query_heuristic_trims_because_connector_tail() -> None:
+    query = jump._build_jump_search_query_heuristic(
+        _glassblowing_relative_reset_pattern(),
+        "Glassblowing",
+        "Manufacturing",
+    )
+
+    tokens = query.split()
+    assert tokens[-1] != "because"
+    assert "because" not in tokens
+
+
+def test_build_jump_search_query_heuristic_drops_standalone_weak_relational_tokens() -> None:
+    query = jump._build_jump_search_query_heuristic(
+        _glassblowing_relative_reset_pattern(),
+        "Glassblowing",
+        "Manufacturing",
+    )
+
+    tokens = query.split()
+    assert "relative" not in tokens
+    assert "position" not in tokens
+
+
+def test_build_jump_search_query_heuristic_keeps_anchored_weak_relational_phrase() -> None:
+    query = jump._build_jump_search_query_heuristic(
+        {
+            "search_query": "relative gating threshold cascade",
+            "pattern_name": "Relative gating threshold",
+            "abstract_structure": "relative gating threshold suppresses cascade",
+            "measurable_signal": "relative gating threshold",
+            "control_lever": "tighten relative gating threshold",
+            "transfer_rationale": "relative gating suppresses cascade",
+        },
+        "Glassblowing",
+        "Manufacturing",
+    )
+
+    assert "relative gating" in query
+    assert "relative" in query.split()
+    assert "gating" in query.split()
+
+
+def test_build_jump_search_query_heuristic_rewrites_glassblowing_malformed_packet() -> None:
+    query = jump._build_jump_search_query_heuristic(
+        _glassblowing_relative_reset_pattern(),
+        "Glassblowing",
+        "Manufacturing",
+    )
+
+    tokens = query.split()
+    assert query != "calibrate reset position relative feasibility corrective injection because"
+    assert {"reset", "corrective", "injection"}.issubset(tokens)
+    assert "relative" not in tokens
+    assert "position" not in tokens
+    assert "because" not in tokens
+    assert 4 <= len(tokens) <= 8
+
+
+def test_build_jump_search_queries_keeps_family_labels_and_bounded_keyword_queries(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(jump, "_generate_llm_jump_search_query", lambda *_args, **_kwargs: None)
+
+    queries = jump._build_jump_search_queries(
+        _glassblowing_relative_reset_pattern(),
+        "Glassblowing",
+        "Manufacturing",
+    )
+
+    assert len(queries) == 3
+    assert all(4 <= len(query.split()) <= 8 for query in queries)
+    assert jump._build_jump_search_queries.last_query_labels == [
+        "mechanism-family",
+        "intervention-family",
+        "operator-family",
+    ]
+
+
 def test_build_jump_search_query_heuristic_compacts_reduced_dispersion_text() -> None:
     query = jump._build_jump_search_query_heuristic(
         {

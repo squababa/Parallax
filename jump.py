@@ -983,6 +983,19 @@ WEAK_QUERY_TOKENS = {
     "triggered",
     "triggers",
 }
+WEAK_RELATIONAL_QUERY_TOKENS = {
+    "adjacent",
+    "adjacency",
+    "around",
+    "between",
+    "near",
+    "nearby",
+    "position",
+    "positions",
+    "relation",
+    "relations",
+    "relative",
+}
 AMBIGUOUS_JUMP_QUERY_TOKENS = {
     "channel",
     "channels",
@@ -1161,6 +1174,7 @@ JUMP_QUERY_ACTION_VERB_TOKENS = {
 }
 JUMP_QUERY_TRAILING_CONNECTORS = {
     "after",
+    "because",
     "before",
     "by",
     "for",
@@ -1239,6 +1253,7 @@ JUMP_QUERY_FILLER_TOKENS = {
     "any",
     "are",
     "be",
+    "because",
     "by",
     "durable",
     "long",
@@ -2018,6 +2033,7 @@ def _build_jump_keyword_query_fragment(
                 token in blocked_tokens
                 or token in GENERIC_QUERY_TOKENS
                 or token in WEAK_QUERY_TOKENS
+                or token in WEAK_RELATIONAL_QUERY_TOKENS
                 or token in OVERLOADED_JUMP_QUERY_TOKENS
                 or token in JUMP_QUERY_FILLER_TOKENS
                 or token in QUERY_PHRASE_STOPWORDS
@@ -2043,6 +2059,7 @@ def _build_jump_keyword_query_fragment(
             and token not in blocked_tokens
             and token not in GENERIC_QUERY_TOKENS
             and token not in WEAK_QUERY_TOKENS
+            and token not in WEAK_RELATIONAL_QUERY_TOKENS
             and token not in OVERLOADED_JUMP_QUERY_TOKENS
             and token not in JUMP_QUERY_FILLER_TOKENS
             and token not in QUERY_PHRASE_STOPWORDS
@@ -2063,12 +2080,46 @@ def _build_jump_keyword_query_fragment(
         token_parts = [part for part in str(token or "").split("-") if len(part) > 2]
         return bool(token_parts) and all(part in source_surface_tokens for part in token_parts)
 
-    def _is_keyword_token(token: str, *, allow_causal: bool = False) -> bool:
+    def _is_keyword_phrase_anchor_token(token: str) -> bool:
+        if token in WEAK_RELATIONAL_QUERY_TOKENS:
+            return False
+        return (
+            token in MECHANISM_QUERY_TOKENS
+            or token in PHRASE_ANCHOR_TAIL_TOKENS
+            or token in JUMP_QUERY_CAUSAL_OUTCOME_HINTS
+            or _is_causal_jump_query_token(token)
+            or any(
+                token.startswith(marker)
+                for marker in (
+                    SOLUTION_EVIDENCE_MARKERS
+                    + INTERVENTION_CONTROL_MARKERS
+                    + INTERVENTION_RESPONSE_MARKERS
+                )
+            )
+            or (
+                token in mechanism_support_tokens
+                and _is_concrete_jump_query_token(token)
+                and token.endswith(
+                    ("ance", "ence", "ing", "ion", "ment", "sis", "ure")
+                )
+            )
+        )
+
+    def _is_keyword_token(
+        token: str,
+        *,
+        allow_causal: bool = False,
+        allow_weak_relational: bool = False,
+    ) -> bool:
         if (
             token in blocked_tokens
             or _is_source_surface_token(token)
             or token in GENERIC_QUERY_TOKENS
             or token in WEAK_QUERY_TOKENS
+            or (
+                token in WEAK_RELATIONAL_QUERY_TOKENS
+                and not allow_weak_relational
+            )
             or token in OVERLOADED_JUMP_QUERY_TOKENS
             or token in JUMP_QUERY_FILLER_TOKENS
             or token in QUERY_PHRASE_STOPWORDS
@@ -2089,19 +2140,46 @@ def _build_jump_keyword_query_fragment(
 
     def _is_keyword_phrase(phrase: str) -> bool:
         phrase_tokens = _tokenize_query_terms(phrase)
-        return (
-            len(phrase_tokens) >= 2
-            and phrase_tokens[0] not in blocked_tokens
-            and phrase_tokens[0] not in GENERIC_QUERY_TOKENS
-            and phrase_tokens[0] not in WEAK_QUERY_TOKENS
-            and phrase_tokens[0] not in JUMP_QUERY_FILLER_TOKENS
-            and phrase_tokens[0] not in QUERY_PHRASE_STOPWORDS
-            and phrase_tokens[0] not in OVERLOADED_JUMP_QUERY_TOKENS
-            and len(phrase_tokens[0]) > 2
-            and not _looks_like_jump_query_verb_token(phrase_tokens[0])
-            and _is_keyword_token(phrase_tokens[1])
-            and not _looks_like_jump_query_verb_token(phrase_tokens[1])
+        if len(phrase_tokens) < 2 or len(phrase_tokens) > 3:
+            return False
+        first_token = phrase_tokens[0]
+        if (
+            first_token in blocked_tokens
+            or first_token in GENERIC_QUERY_TOKENS
+            or first_token in WEAK_QUERY_TOKENS
+            or first_token in JUMP_QUERY_FILLER_TOKENS
+            or first_token in QUERY_PHRASE_STOPWORDS
+            or first_token in OVERLOADED_JUMP_QUERY_TOKENS
+            or len(first_token) <= 2
+            or _looks_like_jump_query_verb_token(first_token)
+        ):
+            return False
+        weak_relational_count = sum(
+            token in WEAK_RELATIONAL_QUERY_TOKENS for token in phrase_tokens
         )
+        if weak_relational_count > 1:
+            return False
+        for token in phrase_tokens[1:]:
+            if token in WEAK_RELATIONAL_QUERY_TOKENS:
+                continue
+            if (
+                not _is_keyword_token(token)
+                or _looks_like_jump_query_verb_token(token)
+            ):
+                return False
+        if not any(
+            _is_keyword_phrase_anchor_token(token)
+            for token in phrase_tokens
+            if token not in WEAK_RELATIONAL_QUERY_TOKENS
+        ):
+            return False
+        if weak_relational_count:
+            return any(
+                _is_keyword_phrase_anchor_token(token)
+                for token in phrase_tokens
+                if token not in WEAK_RELATIONAL_QUERY_TOKENS
+            )
+        return _is_keyword_token(phrase_tokens[1])
 
     def _append_part(part: str) -> None:
         nonlocal has_causal_term, has_outcome_term
