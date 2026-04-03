@@ -1445,11 +1445,21 @@ def _search_seed(seed: dict) -> tuple[str, dict]:
             )
         ]
 
+    provenance_anchor = next(
+        (
+            result
+            for result in selected_results[:SEED_SEARCH_SELECTED_RESULT_LIMIT]
+            if str(result.get("url") or "").strip()
+        ),
+        selected_results[0] if selected_results else None,
+    )
+    if provenance_anchor is not None:
+        provenance["seed_url"] = str(provenance_anchor.get("url") or "").strip() or None
+        provenance["seed_excerpt"] = (
+            str(provenance_anchor.get("clean") or "").strip()[:500] or None
+        )
+
     for result in selected_results[:SEED_SEARCH_SELECTED_RESULT_LIMIT]:
-        if provenance["seed_excerpt"] is None:
-            provenance["seed_excerpt"] = str(result.get("clean") or "")[:500]
-        if provenance["seed_url"] is None and str(result.get("url") or "").strip():
-            provenance["seed_url"] = str(result.get("url") or "").strip()
         source_type_label = str(result.get("source_type") or "general_web").replace("_", " ")
         selected_because = ", ".join(result.get("selection_reasons") or []) or "usable source detail"
         combined.append(f"Source: {result.get('title_text') or 'Unknown'}")

@@ -2605,7 +2605,11 @@ def test_stage_one_detect_requires_solution_evidence_field_on_positive_payload(
     data, failure_hint = jump._stage_one_detect_with_diagnostics(
         source_domain="Network Protocols",
         abstract_structure="load compared against a queue threshold",
-        search_results="Retrieved via: solution-biased\nTitle: Target paper\nresponse details",
+        search_results=(
+            "Retrieved via: solution-biased\n"
+            "Title: Target paper\n"
+            "Snippet: redundant interlock logic suppresses actuation during mismatch faults"
+        ),
     )
 
     assert failure_hint is None
@@ -2643,6 +2647,72 @@ def test_stage_one_detect_returns_partial_payload_without_solution_evidence(
     assert data["target_domain"] == "Safety Interlock Monitoring"
     assert data["signal"] == "shared thresholded gating structure"
     assert data["evidence"] == "diagnostic comparison reveals the same constraint"
+    assert "solution_evidence" not in data
+
+
+def test_stage_one_detect_rejects_placeholder_solution_evidence(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        jump,
+        "_generate_json_with_retry",
+        lambda *_args, **_kwargs: json.dumps(
+            {
+                "no_connection": False,
+                "target_domain": "Safety Interlock Monitoring",
+                "signal": "shared thresholded gating structure",
+                "evidence": "diagnostic comparison reveals the same constraint",
+                "solution_evidence": "N/A",
+            }
+        ),
+    )
+
+    data, failure_hint = jump._stage_one_detect_with_diagnostics(
+        source_domain="Network Protocols",
+        abstract_structure="load compared against a queue threshold",
+        search_results=(
+            "Retrieved via: solution-biased\n"
+            "Title: Target paper\n"
+            "Snippet: redundant interlock logic suppresses actuation during mismatch faults"
+        ),
+    )
+
+    assert data is not None
+    assert failure_hint == "missing_solution_evidence"
+    assert data["target_domain"] == "Safety Interlock Monitoring"
+    assert "solution_evidence" not in data
+
+
+def test_stage_one_detect_rejects_ungrounded_solution_evidence(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        jump,
+        "_generate_json_with_retry",
+        lambda *_args, **_kwargs: json.dumps(
+            {
+                "no_connection": False,
+                "target_domain": "Safety Interlock Monitoring",
+                "signal": "shared thresholded gating structure",
+                "evidence": "diagnostic comparison reveals the same constraint",
+                "solution_evidence": "redundant interlock logic suppresses actuation during mismatch faults",
+            }
+        ),
+    )
+
+    data, failure_hint = jump._stage_one_detect_with_diagnostics(
+        source_domain="Network Protocols",
+        abstract_structure="load compared against a queue threshold",
+        search_results=(
+            "Retrieved via: solution-biased\n"
+            "Title: Target paper\n"
+            "Snippet: broad background context with no concrete workaround details"
+        ),
+    )
+
+    assert data is not None
+    assert failure_hint == "missing_solution_evidence"
+    assert data["target_domain"] == "Safety Interlock Monitoring"
     assert "solution_evidence" not in data
 
 
@@ -3007,6 +3077,48 @@ def test_search_seed_skips_empty_or_noisy_results_and_keeps_first_usable_provena
     )
     assert provenance["seed_url"] == "https://seed.test/useful"
     assert provenance["seed_excerpt"] == "Signal threshold gating stabilizes queue delay."
+
+
+def test_search_seed_keeps_seed_url_and_excerpt_from_same_selected_result(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        explore._tavily,
+        "search",
+        lambda **_kwargs: {
+            "results": [
+                {
+                    "title": "High-signal threshold control note",
+                    "content": (
+                        "Detailed mechanism note: threshold gating and mitigation workflow "
+                        "with operator control."
+                    ),
+                    "url": "",
+                },
+                {
+                    "title": "Field note on runtime tuning",
+                    "content": "Short workflow note on tuning one operating parameter.",
+                    "url": "https://seed.test/runtime-tuning",
+                },
+            ]
+        },
+    )
+    monkeypatch.setattr(explore, "increment_tavily_calls", lambda _count: None)
+    monkeypatch.setattr(explore, "sanitize", lambda value: " ".join(value.split()).strip())
+
+    _combined, provenance = explore._search_seed(
+        {
+            "name": "Battery Chemistry",
+            "category": "Chemistry",
+            "seed_queries": ["runaway threshold control"],
+        }
+    )
+
+    assert provenance["seed_url"] == "https://seed.test/runtime-tuning"
+    assert provenance["seed_excerpt"] == "Short workflow note on tuning one operating parameter."
+    assert provenance["selected_seed_sources"][0]["title_text"] == (
+        "High-signal threshold control note"
+    )
 
 
 def test_classify_seed_search_result_keeps_scholarly_type_for_review_language() -> None:
@@ -4080,6 +4192,71 @@ def test_lateral_jump_with_diagnostics_reports_general_and_academic_result_count
     assert diagnostic["general_result_count"] == 1
     assert diagnostic["academic_result_count"] == 1
     assert "[Jump] general_results=1 academic_results=1" in output
+
+
+def test_lateral_jump_with_diagnostics_drops_same_source_domain_hits_from_snippet_and_url(
+    monkeypatch,
+) -> None:
+    def fake_build_jump_search_queries(*_args, **_kwargs):
+        return ["threshold runaway control"]
+
+    fake_build_jump_search_queries.last_collision_guard_applied = False
+    fake_build_jump_search_queries.last_query_labels = ["mechanism-family"]
+    fake_build_jump_search_queries.last_legacy_query = "threshold runaway control"
+    fake_build_jump_search_queries.last_transferable_query_profile = {"usable": False}
+
+    def fake_search(**kwargs):
+        if kwargs.get("include_domains"):
+            return {"results": []}
+        return {
+            "results": [
+                {
+                    "title": "Voltage thresholds and runaway control",
+                    "content": (
+                        "Battery chemistry runaway is controlled by thresholded ion transport "
+                        "and mitigation protocols."
+                    ),
+                    "url": "https://target.test/threshold-control",
+                },
+                {
+                    "title": "Independent control note",
+                    "content": "Threshold mitigation protocol in a neighboring field.",
+                    "url": "https://battery-chemistry.example.com/not-a-target",
+                },
+            ]
+        }
+
+    monkeypatch.setattr(jump, "_build_jump_search_queries", fake_build_jump_search_queries)
+    monkeypatch.setattr(jump._tavily, "search", fake_search)
+    monkeypatch.setattr(jump, "increment_tavily_calls", lambda _count=1: None)
+    monkeypatch.setattr(
+        jump,
+        "_stage_one_detect_with_diagnostics",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Stage 1 should not run when all results are same-domain leaks")
+        ),
+    )
+
+    connection, diagnostic = jump.lateral_jump_with_diagnostics(
+        {
+            "pattern_name": "Thermal runaway thresholding",
+            "abstract_structure": (
+                "Stored energy accumulates until threshold crossing triggers runaway "
+                "release; mitigation throttles the transport channel."
+            ),
+            "search_query": "threshold runaway control",
+            "measurable_signal": "threshold crossing rate",
+            "control_lever": "transport throttling",
+            "transfer_rationale": "same thresholded runaway suppression process",
+        },
+        "Battery Chemistry",
+        "Chemistry",
+    )
+
+    assert connection is None
+    assert diagnostic["result_count"] == 0
+    assert diagnostic["stage1_outcome"] == "no_results"
+    assert diagnostic["stage1_failure_hint"] == "no_usable_results"
 
 
 def test_lateral_jump_with_diagnostics_clusters_coherent_results_ahead_of_generic_singleton(

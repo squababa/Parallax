@@ -603,6 +603,47 @@ JSON_RETRY_PROMPT = (
     "no markdown, no explanation, no trailing commas, no comments. Here is what I need:"
 )
 
+STAGE_ONE_SOLUTION_EVIDENCE_PLACEHOLDERS = {
+    "n a",
+    "na",
+    "n/a",
+    "none",
+    "null",
+    "not applicable",
+    "not available",
+    "no",
+    "no evidence",
+    "no solution evidence",
+    "no workaround evidence",
+    "no mitigation evidence",
+    "no concrete workaround evidence",
+    "unknown",
+    "unspecified",
+}
+
+STAGE_ONE_SOLUTION_EVIDENCE_GENERIC_TOKENS = {
+    "candidate",
+    "cluster",
+    "domain",
+    "evidence",
+    "intervention",
+    "mechanism",
+    "mitigation",
+    "operator",
+    "response",
+    "result",
+    "results",
+    "retrieved",
+    "search",
+    "signal",
+    "snippet",
+    "solution",
+    "supporting",
+    "title",
+    "via",
+    "workaround",
+}
+
 JUMP_QUERY_PROMPT = """Write one compact technical web search query for cross-domain jump retrieval.
 
 Return JSON only:
@@ -1432,6 +1473,43 @@ def _normalize_jump_result_host(url: str) -> str:
     if host.startswith("www."):
         host = host[4:]
     return host
+
+
+def _normalize_jump_scope_text(value: object) -> str:
+    """Normalize one scope or result string for source-domain containment checks."""
+    return " ".join(re.findall(r"[a-z0-9]+", str(value or "").lower())).strip()
+
+
+def _jump_result_mentions_source_domain(
+    title_text: str,
+    clean: str,
+    url: str,
+    normalized_host: str,
+    source_domain: str,
+) -> bool:
+    """Reject same-source-domain hits even when the title omits the source domain."""
+    source_scope = _normalize_jump_scope_text(source_domain)
+    if not source_scope:
+        return False
+    candidate_scope = _normalize_jump_scope_text(
+        " ".join(
+            part
+            for part in (
+                title_text,
+                clean,
+                url,
+                normalized_host,
+            )
+            if str(part or "").strip()
+        )
+    )
+    if not candidate_scope:
+        return False
+    source_tokens = source_scope.split()
+    candidate_tokens = candidate_scope.split()
+    if len(source_tokens) == 1:
+        return source_tokens[0] in set(candidate_tokens)
+    return f" {source_scope} " in f" {candidate_scope} "
 
 
 def _host_matches_jump_include_domains(host: str, include_domains: tuple[str, ...]) -> bool:
@@ -6357,6 +6435,89 @@ def salvage_high_value_candidate(
     return repaired_candidate
 
 
+def _normalize_stage_one_solution_evidence_text(value: object) -> str:
+    """Normalize Stage 1 solution evidence for placeholder and grounding checks."""
+    return " ".join(_tokenize_query_terms(str(value or ""))).strip()
+
+
+def _stage_one_solution_evidence_is_placeholder(solution_evidence: str) -> bool:
+    """Return True for empty or placeholder-only solution evidence payloads."""
+    normalized = _normalize_stage_one_solution_evidence_text(solution_evidence)
+    if not normalized:
+        return True
+    if normalized in STAGE_ONE_SOLUTION_EVIDENCE_PLACEHOLDERS:
+        return True
+    return normalized.startswith("no ") and any(
+        token in normalized
+        for token in (
+            "evidence",
+            "intervention",
+            "mitigation",
+            "solution",
+            "workaround",
+        )
+    )
+
+
+def _stage_one_search_result_grounding_tokens(search_results: str) -> set[str]:
+    """Extract non-metadata tokens from Stage 1 title/snippet lines."""
+    evidence_lines: list[str] = []
+    for raw_line in str(search_results or "").splitlines():
+        clean_line = " ".join(str(raw_line or "").split()).strip()
+        if not clean_line:
+            continue
+        lower_line = clean_line.lower()
+        for prefix in ("title:", "snippet:"):
+            if lower_line.startswith(prefix):
+                evidence_lines.append(clean_line[len(prefix):].strip())
+                break
+    corpus = " ".join(evidence_lines).strip() or str(search_results or "")
+    return {
+        token
+        for token in _tokenize_query_terms(corpus)
+        if token not in GENERIC_QUERY_TOKENS
+        and token not in WEAK_QUERY_TOKENS
+        and token not in JUMP_QUERY_FILLER_TOKENS
+        and token not in QUERY_PHRASE_STOPWORDS
+        and token not in STAGE_ONE_SOLUTION_EVIDENCE_GENERIC_TOKENS
+        and len(token) > 2
+    }
+
+
+def _stage_one_solution_evidence_is_grounded(
+    solution_evidence: str,
+    search_results: str,
+) -> bool:
+    """Check that Stage 1 solution evidence is concrete and grounded in retrieved text."""
+    if _stage_one_solution_evidence_is_placeholder(solution_evidence):
+        return False
+    normalized_solution_evidence = " ".join(
+        str(solution_evidence or "").split()
+    ).strip()
+    if not normalized_solution_evidence:
+        return False
+    if normalized_solution_evidence.lower() in str(search_results or "").lower():
+        return True
+
+    grounding_tokens = _stage_one_search_result_grounding_tokens(search_results)
+    solution_tokens = {
+        token
+        for token in _tokenize_query_terms(normalized_solution_evidence)
+        if token not in GENERIC_QUERY_TOKENS
+        and token not in WEAK_QUERY_TOKENS
+        and token not in JUMP_QUERY_FILLER_TOKENS
+        and token not in QUERY_PHRASE_STOPWORDS
+        and token not in STAGE_ONE_SOLUTION_EVIDENCE_GENERIC_TOKENS
+        and len(token) > 2
+    }
+    if not solution_tokens:
+        return False
+    return len(solution_tokens.intersection(grounding_tokens)) >= min(
+        2,
+        len(solution_tokens),
+    )
+
+
 def _stage_one_detect_with_diagnostics(
     source_domain: str,
     abstract_structure: str,
@@ -6387,7 +6548,10 @@ def _stage_one_detect_with_diagnostics(
     data["target_domain"] = target_domain
     data["signal"] = signal
     data["evidence"] = evidence
-    if not solution_evidence:
+    if not _stage_one_solution_evidence_is_grounded(
+        solution_evidence,
+        search_results,
+    ):
         data.pop("solution_evidence", None)
         return data, "missing_solution_evidence"
     data["solution_evidence"] = solution_evidence
@@ -7548,7 +7712,6 @@ def lateral_jump_with_diagnostics(
         diagnostic["stage1_failure_hint"] = "empty_jump_query"
         return None, diagnostic
 
-    source_lower = source_domain.lower()
     category_lower = source_category.lower()
     merged_results: list[dict] = []
     merged_result_index: dict[str, int] = {}
@@ -7586,13 +7749,21 @@ def lateral_jump_with_diagnostics(
             title_text = str(result.get("title", "") or "").strip()
             title = title_text.lower()
             content = result.get("content", "")
-            if source_lower in title or category_lower in title:
+            if category_lower and category_lower in title:
                 continue
             clean = sanitize(content)
             if not clean:
                 continue
             url = str(result.get("url", "") or "").strip()
             normalized_host = _normalize_jump_result_host(url)
+            if _jump_result_mentions_source_domain(
+                title_text,
+                clean,
+                url,
+                normalized_host,
+                source_domain,
+            ):
+                continue
             if include_domains and not _host_matches_jump_include_domains(
                 normalized_host,
                 include_domains,
