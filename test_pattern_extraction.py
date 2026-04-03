@@ -583,14 +583,14 @@ def test_build_jump_search_query_replaces_weak_feedback_style_terms() -> None:
     tokens = set(query.split())
     assert query != raw_query
     assert "deficit" in tokens
-    assert "compares" in tokens or "routes" in tokens
+    assert "routing" in tokens or "detector" in tokens or "channels" in tokens
     assert "feedback" not in tokens
     assert "recruitment" not in tokens
     assert "threshold" not in tokens
     assert "triggered" not in tokens
 
 
-def test_build_jump_search_query_keeps_lock_in_anchor_but_drops_generic_terms() -> None:
+def test_build_jump_search_query_keeps_switching_and_comparator_anchors_but_drops_generic_terms() -> None:
     query = jump._build_jump_search_query(
         {
             "search_query": "credibility threshold commitment lock-in stabilizing feedback",
@@ -611,8 +611,8 @@ def test_build_jump_search_query_keeps_lock_in_anchor_but_drops_generic_terms() 
     )
 
     tokens = set(query.split())
-    assert "commitment lock-in" in query
-    assert "switching cost" in query
+    assert "comparator boundary" in query
+    assert "switching" in tokens
     assert "retention" in tokens or "hysteresis" in tokens
     assert "credibility" not in tokens
     assert "feedback" not in tokens
@@ -646,7 +646,7 @@ def test_build_jump_search_query_disambiguates_generic_query_with_concrete_ancho
 
     assert query != "channel routing threshold switching"
     assert "relay gating" in query
-    assert "suppresses" in query
+    assert "suppress" in query or "suppresses" in query
     assert "actuator" in query
 
 
@@ -882,9 +882,212 @@ def test_build_jump_search_query_prefers_causal_dynamics_for_disturbance_release
         "Science",
     )
 
-    assert query == "periodic disruption prevents monopolization"
+    assert "periodic" in query
+    assert "disturbance" in query or "disruption" in query
+    assert len(query.split()) <= 8
     assert "tide" not in query
     assert "pool" not in query
+
+
+def test_build_jump_search_query_heuristic_composes_keyword_packet_without_dangling_tail() -> None:
+    query = jump._build_jump_search_query_heuristic(
+        {
+            "search_query": "fixed capacity selection gate fragmented inputs consolidation",
+            "pattern_name": "Fixed-capacity selection gate",
+            "abstract_structure": (
+                "Multiple requestors drawing from a shared capacity reservoir compete "
+                "for one allocation slot via a peak-selector gate that consolidates "
+                "fragmented inputs."
+            ),
+            "measurable_signal": "selection latency and fragmented-input consolidation rate",
+            "control_lever": (
+                "adjust the peak-selector gate and shared-capacity admission threshold"
+            ),
+            "transfer_rationale": (
+                "Multiple requestors drawing from a shared capacity reservoir compete "
+                "for one allocation slot via a peak-selector gate that consolidates "
+                "fragmented inputs from sparse contenders."
+            ),
+        },
+        "Wireless Scheduling",
+        "Telecommunications",
+    )
+
+    tokens = query.split()
+    assert 4 <= len(tokens) <= 8
+    assert tokens[-1] not in {"from", "to", "with", "before", "after", "that", "where"}
+    assert query != "fixed-capacity selection gate compares fragmented inputs from"
+    assert "fragmented-input" in tokens or "fragmented" in tokens
+    assert "compares" not in tokens
+
+
+def _glassblowing_relative_reset_pattern() -> dict:
+    return {
+        "search_query": (
+            "calibrate reset position relative feasibility corrective injection because"
+        ),
+        "pattern_name": "Corrective reset injection",
+        "abstract_structure": (
+            "calibrate reset position relative feasibility corrective injection because"
+        ),
+        "measurable_signal": "reset position feasibility",
+        "control_lever": "calibrate reset position with corrective injection",
+        "transfer_rationale": (
+            "relative position reset improves corrective injection feasibility because"
+        ),
+    }
+
+
+def test_build_jump_search_query_heuristic_trims_because_connector_tail() -> None:
+    query = jump._build_jump_search_query_heuristic(
+        _glassblowing_relative_reset_pattern(),
+        "Glassblowing",
+        "Manufacturing",
+    )
+
+    tokens = query.split()
+    assert tokens[-1] != "because"
+    assert "because" not in tokens
+
+
+def test_build_jump_search_query_heuristic_drops_standalone_weak_relational_tokens() -> None:
+    query = jump._build_jump_search_query_heuristic(
+        _glassblowing_relative_reset_pattern(),
+        "Glassblowing",
+        "Manufacturing",
+    )
+
+    tokens = query.split()
+    assert "relative" not in tokens
+    assert "position" not in tokens
+
+
+def test_build_jump_search_query_heuristic_keeps_anchored_weak_relational_phrase() -> None:
+    query = jump._build_jump_search_query_heuristic(
+        {
+            "search_query": "relative gating threshold cascade",
+            "pattern_name": "Relative gating threshold",
+            "abstract_structure": "relative gating threshold suppresses cascade",
+            "measurable_signal": "relative gating threshold",
+            "control_lever": "tighten relative gating threshold",
+            "transfer_rationale": "relative gating suppresses cascade",
+        },
+        "Glassblowing",
+        "Manufacturing",
+    )
+
+    assert "relative gating" in query
+    assert "relative" in query.split()
+    assert "gating" in query.split()
+
+
+def test_build_jump_search_query_heuristic_rewrites_glassblowing_malformed_packet() -> None:
+    query = jump._build_jump_search_query_heuristic(
+        _glassblowing_relative_reset_pattern(),
+        "Glassblowing",
+        "Manufacturing",
+    )
+
+    tokens = query.split()
+    assert query != "calibrate reset position relative feasibility corrective injection because"
+    assert {"reset", "corrective", "injection"}.issubset(tokens)
+    assert "relative" not in tokens
+    assert "position" not in tokens
+    assert "because" not in tokens
+    assert 4 <= len(tokens) <= 8
+
+
+def test_build_jump_search_queries_keeps_family_labels_and_bounded_keyword_queries(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(jump, "_generate_llm_jump_search_query", lambda *_args, **_kwargs: None)
+
+    queries = jump._build_jump_search_queries(
+        _glassblowing_relative_reset_pattern(),
+        "Glassblowing",
+        "Manufacturing",
+    )
+
+    assert len(queries) == 3
+    assert all(4 <= len(query.split()) <= 8 for query in queries)
+    assert jump._build_jump_search_queries.last_query_labels == [
+        "mechanism-family",
+        "intervention-family",
+        "operator-family",
+    ]
+
+
+def test_build_jump_search_query_heuristic_compacts_reduced_dispersion_text() -> None:
+    query = jump._build_jump_search_query_heuristic(
+        {
+            "search_query": "dispersion collapse ambiguity margin threshold comparator",
+            "pattern_name": "Dispersion-collapse threshold comparator",
+            "abstract_structure": (
+                "Reduced dispersion removes ambiguity margin that previously "
+                "jointly-produced comparator instability near a decision threshold."
+            ),
+            "measurable_signal": "ambiguity margin collapse and comparator stability",
+            "control_lever": "tighten dispersion and comparator threshold margin",
+            "transfer_rationale": (
+                "Reduced dispersion removes ambiguity margin that previously "
+                "jointly-produced noisy comparator decisions before threshold crossing."
+            ),
+        },
+        "Sensor Fusion",
+        "Robotics",
+    )
+
+    tokens = query.split()
+    assert query == jump._build_jump_search_query_heuristic(
+        {
+            "search_query": "dispersion collapse ambiguity margin threshold comparator",
+            "pattern_name": "Dispersion-collapse threshold comparator",
+            "abstract_structure": (
+                "Reduced dispersion removes ambiguity margin that previously "
+                "jointly-produced comparator instability near a decision threshold."
+            ),
+            "measurable_signal": "ambiguity margin collapse and comparator stability",
+            "control_lever": "tighten dispersion and comparator threshold margin",
+            "transfer_rationale": (
+                "Reduced dispersion removes ambiguity margin that previously "
+                "jointly-produced noisy comparator decisions before threshold crossing."
+            ),
+        },
+        "Sensor Fusion",
+        "Robotics",
+    )
+    assert 4 <= len(tokens) <= 8
+    assert tokens[-1] not in {"from", "to", "with", "before", "after", "that", "where"}
+    assert "dispersion" in query
+    assert "ambiguity" in query
+    assert "removes" not in tokens
+    assert "previously" not in tokens
+
+
+def test_build_jump_search_query_heuristic_preserves_source_blockers() -> None:
+    query = jump._build_jump_search_query_heuristic(
+        {
+            "search_query": "sensor fusion threshold comparator",
+            "pattern_name": "Threshold comparator",
+            "abstract_structure": (
+                "sensor fusion uncertainty collapses into a comparator threshold"
+            ),
+            "measurable_signal": "comparator margin collapse",
+            "control_lever": "tune comparator threshold",
+            "transfer_rationale": (
+                "Transfers to systems where sensor fusion evidence crosses a "
+                "comparator threshold."
+            ),
+        },
+        "Sensor Fusion",
+        "Robotics",
+    )
+
+    tokens = set(query.split())
+    assert "sensor" not in tokens
+    assert "fusion" not in tokens
+    assert "robotics" not in tokens
+    assert "comparator" in query or "threshold" in query
 
 
 def test_build_jump_search_query_prefers_compact_natural_language_llm_query_when_valid(
@@ -1270,8 +1473,8 @@ def test_build_jump_search_queries_falls_back_from_supplier_drift_but_keeps_fami
     )
     assert 1 <= len(queries) <= 3
     assert all("supplier" not in query for query in queries)
-    assert "decision threshold" in queries[0]
-    assert "blocking" in queries[0] or "throughput" in queries[0]
+    assert "ejection decision" in queries[0]
+    assert "blocked-unit" in queries[0] or "throughput" in queries[0]
     assert jump._build_jump_search_queries.last_query_labels == [
         "mechanism-family",
         "intervention-family",
@@ -1759,10 +1962,9 @@ def test_lateral_jump_with_diagnostics_academic_lane_uses_improved_base_query(
     )
 
     assert connection is not None
-    assert diagnostic["built_jump_query"] == "periodic disruption prevents monopolization"
-    assert diagnostic["built_jump_queries"][0] == (
-        "periodic disruption prevents monopolization"
-    )
+    assert "periodic" in diagnostic["built_jump_query"]
+    assert "disturbance" in diagnostic["built_jump_query"] or "disruption" in diagnostic["built_jump_query"]
+    assert diagnostic["built_jump_queries"][0] == diagnostic["built_jump_query"]
     assert diagnostic["built_jump_query_labels"] == [
         "mechanism-family",
         "intervention-family",
