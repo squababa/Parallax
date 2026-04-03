@@ -1235,6 +1235,66 @@ def test_is_acceptable_llm_jump_query_accepts_grounded_blockage_recovery_query()
     assert acceptable is True
 
 
+def test_is_acceptable_llm_jump_query_accepts_transferable_scale_free_network_query() -> None:
+    pattern = {
+        "pattern_name": "Hub-weighted contagion routing bottleneck",
+        "abstract_structure": (
+            "A propagation process on a heterogeneous graph routes most flow "
+            "through a minority of high-degree nodes and collapses after "
+            "targeted hub removal."
+        ),
+        "search_query": "high-degree node removal percolation bottleneck routing",
+        "measurable_signal": "final spread size and giant-component collapse",
+        "control_lever": "remove high-degree hubs above a connectivity cutoff",
+        "transfer_rationale": (
+            "Transfers to networks where throughput concentrates in a small "
+            "high-connectivity backbone."
+        ),
+        "transferable": {
+            "mechanism": (
+                "A diffusion process across a heterogeneous relay structure "
+                "concentrates most transit through a small high-connectivity "
+                "backbone that fragments after selective junction saturation."
+            ),
+            "control_logic": (
+                "Apply gating pressure to the highest-connectivity tier and tune "
+                "the cutoff where residual throughput falls below a sustaining "
+                "boundary."
+            ),
+            "signal_shape": (
+                "Global reach stays nearly flat under low-linkage attrition, then "
+                "collapses sharply after high-linkage junction removal crosses a "
+                "critical fraction."
+            ),
+            "_backfilled_fields": [],
+        },
+        "grounded": {
+            "source_control": (
+                "Targeted immunization of high-degree nodes in scale-free "
+                "contact networks"
+            ),
+            "source_metric": "epidemic final size and giant connected component size",
+        },
+    }
+    query_pattern, profile = jump._jump_query_pattern_view(
+        pattern,
+        "Epidemiology",
+        "Medicine",
+    )
+
+    acceptable = jump._is_acceptable_llm_jump_query(
+        "hub-weighted selective gating scale-free network flow collapse threshold",
+        query_pattern,
+        "Epidemiology",
+        "Medicine",
+        "apply gating pressure preferentially uppermost calibrate connectivity minimal",
+    )
+
+    assert profile["usable"] is True
+    assert query_pattern["grounded"] == pattern["grounded"]
+    assert acceptable is True
+
+
 def test_is_acceptable_llm_jump_query_rejects_single_anchor_token_with_drift() -> None:
     pattern = {
         "search_query": "blocking unit removal restoring aggregate throughput",
