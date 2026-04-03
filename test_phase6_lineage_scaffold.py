@@ -1861,6 +1861,46 @@ def test_score_store_and_transmit_saves_extracted_scar_summary(
     ]
 
 
+def test_score_store_and_transmit_keeps_two_value_unpack_contract(
+    temp_db,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        main,
+        "_evaluate_connection_candidate",
+        lambda **kwargs: _build_strong_rejection_candidate(),
+    )
+    monkeypatch.setattr(main, "_handle_convergence", lambda **kwargs: False)
+    monkeypatch.setattr(
+        main,
+        "resolve_candidate_lineage_metadata",
+        lambda **kwargs: {
+            "parent_transmission_number": None,
+            "parent_strong_rejection_id": None,
+            "lineage_root_id": None,
+            "lineage_change": None,
+        },
+    )
+
+    transmitted, total_score = main._score_store_and_transmit(
+        score_label="Test",
+        source_domain="systems.test",
+        source_category="ops",
+        root_seed_name="queue pressure",
+        seed_selection=None,
+        pattern_diagnostics=None,
+        patterns_payload=[{"pattern_name": "Queue feedback"}],
+        connection={"target_domain": "latency.test"},
+        target_domain="latency.test",
+        chain_path=["systems.test"],
+        exploration_path=["systems.test", "latency.test"],
+        threshold=0.6,
+    )
+
+    assert transmitted is False
+    assert total_score == pytest.approx(0.94)
+
+
 def test_score_store_and_transmit_increments_matching_parent_scar_count(
     temp_db,
     monkeypatch,
