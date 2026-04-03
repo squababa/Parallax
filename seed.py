@@ -8,6 +8,8 @@ import random
 import re
 from pathlib import Path
 
+import config
+
 
 PERSONALIZATION_RANDOM_FLOOR = 0.2
 PERSONALIZATION_WEIGHT_STRENGTH = 0.6
@@ -688,7 +690,6 @@ def pick_seed() -> dict:
     5. Weight boost for never-visited domains
     6. Return: {"name": str, "category": str, "seed_queries": list[str]}
     """
-    from config import PERSONALIZATION, SEED_EXCLUSION_WINDOW
     from store import (
         get_recent_domains,
         get_recent_seed_selection_context,
@@ -696,7 +697,7 @@ def pick_seed() -> dict:
     )
 
     domains = _load_domains()
-    recent = set(get_recent_domains(SEED_EXCLUSION_WINDOW))
+    recent = set(get_recent_domains(config.SEED_EXCLUSION_WINDOW))
     selection_context = get_recent_seed_selection_context(SEED_DIVERSITY_HISTORY_WINDOW)
     # Filter out recently explored
     candidates = [d for d in domains if d["name"] not in recent]
@@ -742,7 +743,7 @@ def pick_seed() -> dict:
     else:
         candidate_pool_reason = "full pool: insufficient medium/high seed coverage"
 
-    outcome_metrics = get_seed_outcome_metrics() if PERSONALIZATION else {}
+    outcome_metrics = get_seed_outcome_metrics() if config.PERSONALIZATION else {}
 
     weights = []
     reasons_by_domain: dict[str, str] = {}
@@ -762,7 +763,7 @@ def pick_seed() -> dict:
 
         personalization_multiplier = 1.0
         personalization_reason = "personalization disabled"
-        if PERSONALIZATION:
+        if config.PERSONALIZATION:
             multiplier, reason = _expected_value_multiplier(
                 d["name"],
                 d["category"],
@@ -809,7 +810,7 @@ def pick_seed() -> dict:
             "quality_profile": quality_profile,
         }
 
-    if PERSONALIZATION and random.random() < PERSONALIZATION_RANDOM_FLOOR:
+    if config.PERSONALIZATION and random.random() < PERSONALIZATION_RANDOM_FLOOR:
         selected = random.choice(candidates)
         diagnostics = dict(diagnostics_by_domain.get(selected["name"], {}))
         random_reason = "random exploration pick (20% diversity floor)"
