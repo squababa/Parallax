@@ -165,10 +165,14 @@ Rules:
 - measurable_signal should name one metric, threshold, rate, count, error mode, load measure, or state variable that a target-domain operator could plausibly check.
 - control_lever should name one concrete operator action, tuning knob, gating rule, scheduling choice, routing decision, filter, or intervention implied by the mechanism.
 - transfer_rationale should say why the process shape can transfer across domains without reverting to domain-specific nouns.
+- Fill the nested schema in this sequence: first write grounded.source_control and grounded.source_metric using source-domain implementation and measurement vocabulary; then write transferable.mechanism, transferable.control_logic, and transferable.signal_shape as a domain-neutral rewrite with different nouns.
+- Before writing transferable.*, re-read grounded.source_control and grounded.source_metric, mentally list their major nouns and technical terms, do not output that list, and avoid reusing those grounded nouns in transferable.* unless no viable abstract substitute exists.
+- transferable.* should describe only functional relations, thresholds, comparators, phase changes, bottlenecks, resets, saturation, rate changes, and trajectory shape.
 - transferable.mechanism should describe only the functional causal relation in domain-neutral relational language, not source-domain algorithm names, protocol names, or canonical source labels.
 - transferable.control_logic should state the intervention principle in generic control language, not source-domain algorithm/protocol terms or implementation labels.
 - transferable.signal_shape should describe only trajectory/topology (for example, monotonic rise to threshold collapse), not source-domain signal names, metric names, or canonical mechanism labels.
-- Never copy canonical source-domain names into transferable.* when an abstract relational rewrite is possible. Bad: `additive increase multiplicative decrease`; better: `gradual linear ramp-up interrupted by proportional rollback after threshold breach`. Bad: `TCP retry timeout`; better: `geometrically expanding wait intervals capped by a finite retry ceiling`. Bad: `nociceptive inhibitory gating`; better: `sustained suppressive bias that shifts a downstream activation threshold`.
+- Never copy canonical source-domain names or grounded measurement/implementation nouns into transferable.* when an abstract relational rewrite is possible. Bad grounded/transferable pair: grounded.source_control=`signal amplitude`, grounded.source_metric=`coherence function, FRF amplitude bias`, transferable=`signal amplitude drops and coherence collapses`. Better transferable.mechanism=`representation resolution collapses when encoder span greatly exceeds source variation scale`; transferable.control_logic=`retune active span to bracket the expected input range and preserve effective level usage`; transferable.signal_shape=`monotonic sensitivity loss as mismatch ratio grows, followed by a floor effect once representation is dominated by quantization`.
+- Additional rewrite examples: Bad: `additive increase multiplicative decrease`; better: `gradual linear ramp-up interrupted by proportional rollback after threshold breach`. Bad: `TCP retry timeout`; better: `geometrically expanding wait intervals capped by a finite retry ceiling`. Bad: `nociceptive inhibitory gating`; better: `sustained suppressive bias that shifts a downstream activation threshold`.
 - grounded.source_control should preserve source-domain implementation details for downstream reporting.
 - grounded.source_metric should preserve source-domain metric wording for downstream reporting.
 - Reject patterns that collapse to generic statements like "systems adapt to change", "multiple forces interact", or "local averaging occurs".
@@ -206,6 +210,22 @@ Output schema:
 JSON_RETRY_PROMPT = (
     "Your last response was invalid JSON. Return valid JSON only matching the required schema."
 )
+TRANSFERABLE_REWRITE_PROMPT = """Rewrite only the nested transferable fields for one already-extracted pattern.
+
+Rules:
+- Preserve the same causal mechanism, intervention principle, and trajectory shape as the first-pass pattern.
+- Use domain-neutral relational language with different nouns than grounded.source_control and grounded.source_metric wherever a viable abstract substitute exists.
+- Before rewriting, re-read grounded.source_control and grounded.source_metric, mentally list their major nouns and technical terms, do not output that list, and avoid reusing those nouns/terms in transferable.mechanism, transferable.control_logic, and transferable.signal_shape.
+- Keep each field concise, concrete, and mechanism-specific; do not return generic mush.
+- Do not change pattern_name, description, abstract_structure, search_query, measurable_signal, control_lever, transfer_rationale, or grounded.*.
+- Return ONLY valid JSON with keys mechanism, control_logic, and signal_shape.
+
+Bad transferable rewrite:
+{"mechanism": "signal amplitude drops and coherence collapses", "control_logic": "retune signal amplitude around the coherence function", "signal_shape": "FRF amplitude bias and coherence loss grow together"}
+
+Better transferable rewrite:
+{"mechanism": "representation resolution collapses when encoder span greatly exceeds source variation scale", "control_logic": "retune active span to bracket the expected input range and preserve effective level usage", "signal_shape": "monotonic sensitivity loss as mismatch ratio grows, followed by a floor effect once representation is dominated by quantization"}"""
+TRANSFERABLE_REWRITE_MAX_OUTPUT_TOKENS = 512
 PATTERN_QUALITY_HIGH_THRESHOLD = 0.72
 PATTERN_QUALITY_MEDIUM_THRESHOLD = 0.5
 PATTERN_JUMP_READY_THRESHOLD = 0.64
@@ -417,11 +437,17 @@ PATTERN_ANCHOR_STOPWORDS = {
     "within",
 }
 PATTERN_SOURCE_LEAKAGE_GENERIC_TERMS = {
+    "abundance",
+    "aperture",
+    "composition",
     "declaration",
     "event",
     "initial",
+    "limits",
+    "lower",
     "response",
     "state",
+    "stress",
 }
 
 
@@ -594,6 +620,14 @@ def _profile_transferable_pattern_quality(pattern: dict, seed: dict) -> dict:
     )
     if len(source_shape_terms) >= 2:
         concerns.append("transferable_source_shaped")
+    strong_source_leakage_terms = _strong_pattern_source_terms(leakage_terms)
+    strong_source_shape_terms = _strong_pattern_source_terms(
+        [
+            token
+            for token in source_shape_terms
+            if token in source_tokens
+        ]
+    )
 
     overlap_pairs: list[str] = []
     for left_name, right_name in (
@@ -614,17 +648,101 @@ def _profile_transferable_pattern_quality(pattern: dict, seed: dict) -> dict:
 
     return {
         "usable": not any(
-            concern != "transferable_source_shaped"
+            concern
+            not in {
+                "transferable_source_leakage",
+                "transferable_source_shaped",
+            }
             for concern in concerns
-        ),
+        )
+        and not strong_source_leakage_terms
+        and not strong_source_shape_terms,
         "concerns": concerns[:4],
         "source_overlap_terms": leakage_terms[:4],
+        "strong_source_overlap_terms": strong_source_leakage_terms[:4],
         "source_shape_terms": source_shape_terms[:4],
+        "strong_source_shape_terms": strong_source_shape_terms[:4],
         "field_token_counts": {
             field_name: len(tokens)
             for field_name, tokens in field_tokens.items()
         },
     }
+
+
+def _rewrite_transferable_pattern_fields(pattern: dict, seed: dict) -> dict:
+    """Apply a safe second-pass abstraction rewrite to nested transferable fields only."""
+    rewritten = dict(pattern)
+    transferable = (
+        pattern.get("transferable")
+        if isinstance(pattern.get("transferable"), dict)
+        else {}
+    )
+    grounded = pattern.get("grounded") if isinstance(pattern.get("grounded"), dict) else {}
+    first_pass_transferable = {
+        "mechanism": _normalize_text(transferable.get("mechanism")),
+        "control_logic": _normalize_text(transferable.get("control_logic")),
+        "signal_shape": _normalize_text(transferable.get("signal_shape")),
+    }
+    backfilled_fields = (
+        list(transferable.get("_backfilled_fields"))
+        if isinstance(transferable.get("_backfilled_fields"), list)
+        else []
+    )
+    rewritten["transferable_rewrite_attempted"] = True
+    rewritten["transferable_rewrite_applied"] = False
+    rewritten["transferable_first_pass_fields"] = dict(first_pass_transferable)
+    rewritten["transferable_rewrite_quality"] = _profile_transferable_pattern_quality(
+        rewritten,
+        seed,
+    )
+
+    rewrite_payload = {
+        "pattern_name": _normalize_text(pattern.get("pattern_name")),
+        "description": _normalize_text(pattern.get("description")),
+        "abstract_structure": _normalize_text(pattern.get("abstract_structure")),
+        "search_query": _normalize_text(pattern.get("search_query")),
+        "measurable_signal": _normalize_text(pattern.get("measurable_signal")),
+        "control_lever": _normalize_text(pattern.get("control_lever")),
+        "transfer_rationale": _normalize_text(pattern.get("transfer_rationale")),
+        "grounded": {
+            "source_control": _normalize_text(grounded.get("source_control")),
+            "source_metric": _normalize_text(grounded.get("source_metric")),
+        },
+        "transferable": dict(first_pass_transferable),
+    }
+    full_prompt = (
+        f"{TRANSFERABLE_REWRITE_PROMPT}\n\n"
+        f"Pattern JSON:\n{json.dumps(rewrite_payload, ensure_ascii=False)}"
+    )
+
+    try:
+        rewrite_json = _generate_json_with_retry(
+            full_prompt,
+            TRANSFERABLE_REWRITE_MAX_OUTPUT_TOKENS,
+        )
+        rewrite_data = json.loads(rewrite_json)
+    except Exception:
+        return rewritten
+
+    candidate_transferable = {
+        "mechanism": _normalize_text(rewrite_data.get("mechanism")),
+        "control_logic": _normalize_text(rewrite_data.get("control_logic")),
+        "signal_shape": _normalize_text(rewrite_data.get("signal_shape")),
+    }
+    if not all(candidate_transferable.values()):
+        return rewritten
+
+    candidate_transferable["_backfilled_fields"] = backfilled_fields
+    rewritten["transferable"] = candidate_transferable
+    rewritten["transferable_rewrite_applied"] = any(
+        candidate_transferable[field_name] != first_pass_transferable[field_name]
+        for field_name in PATTERN_TRANSFERABLE_FIELDS
+    )
+    rewritten["transferable_rewrite_quality"] = _profile_transferable_pattern_quality(
+        rewritten,
+        seed,
+    )
+    return rewritten
 
 
 def _profile_pattern_quality(pattern: dict, seed: dict) -> dict:
@@ -819,6 +937,28 @@ def _pattern_grounded_source_tokens(*values: object) -> set[str]:
         for token in _pattern_anchor_tokens(*values)
         if not _is_generic_grounded_source_token(token)
     }
+
+
+def _is_strong_pattern_source_term(token: str) -> bool:
+    """Return True for overlap tokens that look strongly source-specific."""
+    candidate = str(token or "").strip().lower()
+    if (
+        len(candidate) < 4
+        or candidate in PATTERN_SOURCE_LEAKAGE_GENERIC_TERMS
+        or candidate in PATTERN_ANCHOR_STOPWORDS
+        or candidate in PATTERN_GENERIC_TERMS
+    ):
+        return False
+    return "-" in candidate or any(char.isdigit() for char in candidate) or len(candidate) >= 6
+
+
+def _strong_pattern_source_terms(terms: list[str]) -> list[str]:
+    """Keep only overlap terms that are strong enough to block transferable use."""
+    return sorted(
+        token
+        for token in terms
+        if _is_strong_pattern_source_term(token)
+    )
 
 
 def _transferable_source_shaped_terms(
@@ -1498,6 +1638,7 @@ def dive(seed: dict) -> list[dict]:
                 }
             )
             continue
+        normalized = _rewrite_transferable_pattern_fields(normalized, seed)
         quality = _profile_pattern_quality(normalized, seed)
         normalized["pattern_quality"] = quality
         if quality.get("band") == "weak":
