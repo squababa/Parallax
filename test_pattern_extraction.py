@@ -97,6 +97,22 @@ def test_extract_prompt_requires_domain_neutral_transferable_rewrites() -> None:
     )
 
 
+def test_transferable_rewrite_prompt_requires_grounded_noun_substitution() -> None:
+    assert "Rewrite only the nested transferable fields" in explore.TRANSFERABLE_REWRITE_PROMPT
+    assert (
+        "avoid reusing those nouns/terms in transferable.mechanism, transferable.control_logic, and transferable.signal_shape"
+        in explore.TRANSFERABLE_REWRITE_PROMPT
+    )
+    assert "signal amplitude drops and coherence collapses" in explore.TRANSFERABLE_REWRITE_PROMPT
+    assert (
+        "representation resolution collapses when encoder span greatly exceeds source variation scale"
+        in explore.TRANSFERABLE_REWRITE_PROMPT
+    )
+    assert "Return ONLY valid JSON with keys mechanism, control_logic, and signal_shape" in (
+        explore.TRANSFERABLE_REWRITE_PROMPT
+    )
+
+
 def test_profile_pattern_quality_prefers_operational_mechanism() -> None:
     seed = {"name": "Network Protocols", "category": "Technology"}
     strong = explore._profile_pattern_quality(
@@ -169,6 +185,193 @@ def test_normalize_pattern_schema_backfills_nested_transferable_and_grounded_fie
     assert normalized["grounded"] == {
         "source_control": "adjust the congestion threshold",
         "source_metric": "queue length and mean delay",
+    }
+
+
+def test_rewrite_transferable_pattern_fields_updates_only_transferable_and_reprofiles_quality(
+    monkeypatch,
+) -> None:
+    pattern = explore._normalize_pattern_schema(
+        {
+            "pattern_name": "Quantized span mismatch",
+            "description": (
+                "Oversized signal amplitude range lowers coherence and biases the "
+                "frequency response function."
+            ),
+            "abstract_structure": (
+                "A representational span much wider than input variation collapses "
+                "effective resolution and produces a low-sensitivity floor."
+            ),
+            "search_query": "span mismatch resolution floor",
+            "measurable_signal": "coherence function and FRF amplitude bias",
+            "control_lever": "retune signal amplitude range",
+            "transfer_rationale": "Transfers to any encoder with limited level resolution.",
+            "transferable": {
+                "mechanism": "Signal amplitude mismatch reduces coherence.",
+                "control_logic": "Retune signal amplitude range.",
+                "signal_shape": "Coherence drops as FRF amplitude bias rises.",
+            },
+            "grounded": {
+                "source_control": "signal amplitude range",
+                "source_metric": "coherence function and FRF amplitude bias",
+            },
+        }
+    )
+    token_budgets = []
+    profiled_mechanisms = []
+
+    def fake_generate_json_with_retry(prompt, max_output_tokens):
+        assert "Quantized span mismatch" in prompt
+        assert "signal amplitude range" in prompt
+        token_budgets.append(max_output_tokens)
+        return json.dumps(
+            {
+                "mechanism": (
+                    "representation resolution collapses when encoder span greatly "
+                    "exceeds source variation scale"
+                ),
+                "control_logic": (
+                    "retune active span to bracket the expected input range and "
+                    "preserve effective level usage"
+                ),
+                "signal_shape": (
+                    "monotonic sensitivity loss as mismatch ratio grows, followed "
+                    "by a floor effect"
+                ),
+            }
+        )
+
+    def fake_profile_transferable_pattern_quality(candidate, _seed):
+        profiled_mechanisms.append(candidate["transferable"]["mechanism"])
+        return {
+            "usable": True,
+            "concerns": [],
+            "source_overlap_terms": [],
+            "strong_source_overlap_terms": [],
+            "source_shape_terms": [],
+            "strong_source_shape_terms": [],
+            "field_token_counts": {
+                "mechanism": 7,
+                "control_logic": 9,
+                "signal_shape": 10,
+            },
+        }
+
+    monkeypatch.setattr(
+        explore,
+        "_generate_json_with_retry",
+        fake_generate_json_with_retry,
+    )
+    monkeypatch.setattr(
+        explore,
+        "_profile_transferable_pattern_quality",
+        fake_profile_transferable_pattern_quality,
+    )
+
+    rewritten = explore._rewrite_transferable_pattern_fields(
+        pattern,
+        {"name": "Signal Processing", "category": "Engineering"},
+    )
+
+    assert rewritten["pattern_name"] == pattern["pattern_name"]
+    assert rewritten["description"] == pattern["description"]
+    assert rewritten["abstract_structure"] == pattern["abstract_structure"]
+    assert rewritten["search_query"] == pattern["search_query"]
+    assert rewritten["measurable_signal"] == pattern["measurable_signal"]
+    assert rewritten["control_lever"] == pattern["control_lever"]
+    assert rewritten["transfer_rationale"] == pattern["transfer_rationale"]
+    assert rewritten["grounded"] == pattern["grounded"]
+    assert rewritten["transferable"] == {
+        "mechanism": (
+            "representation resolution collapses when encoder span greatly exceeds "
+            "source variation scale"
+        ),
+        "control_logic": (
+            "retune active span to bracket the expected input range and preserve "
+            "effective level usage"
+        ),
+        "signal_shape": (
+            "monotonic sensitivity loss as mismatch ratio grows, followed by a "
+            "floor effect"
+        ),
+        "_backfilled_fields": [],
+    }
+    assert rewritten["transferable_rewrite_attempted"] is True
+    assert rewritten["transferable_rewrite_applied"] is True
+    assert rewritten["transferable_first_pass_fields"] == {
+        "mechanism": "Signal amplitude mismatch reduces coherence.",
+        "control_logic": "Retune signal amplitude range.",
+        "signal_shape": "Coherence drops as FRF amplitude bias rises.",
+    }
+    assert token_budgets == [explore.TRANSFERABLE_REWRITE_MAX_OUTPUT_TOKENS]
+    assert profiled_mechanisms == [
+        "Signal amplitude mismatch reduces coherence.",
+        "representation resolution collapses when encoder span greatly exceeds "
+        "source variation scale",
+    ]
+    assert rewritten["transferable_rewrite_quality"]["usable"] is True
+
+
+@pytest.mark.parametrize(
+    "rewrite_output",
+    [
+        "not-json",
+        json.dumps(
+            {
+                "mechanism": "",
+                "control_logic": "",
+                "signal_shape": "",
+            }
+        ),
+    ],
+)
+def test_rewrite_transferable_pattern_fields_falls_back_on_invalid_or_empty_output(
+    monkeypatch,
+    rewrite_output,
+) -> None:
+    pattern = explore._normalize_pattern_schema(
+        {
+            "pattern_name": "Frontier interior redistribution",
+            "description": "Frontier and interior zones exchange load under a shifting boundary.",
+            "abstract_structure": (
+                "Load shifts from one region to another when a moving boundary creates "
+                "a pressure imbalance."
+            ),
+            "search_query": "moving boundary load redistribution",
+            "measurable_signal": "frontier coverage ratio",
+            "control_lever": "adjust interior boundary placement",
+            "transfer_rationale": "Transfers to partitioned systems with moving allocation boundaries.",
+            "transferable": {
+                "mechanism": "Frontier and interior load rebalance.",
+                "control_logic": "Adjust frontier and interior boundaries.",
+                "signal_shape": "Coverage shifts between frontier and interior.",
+            },
+            "grounded": {
+                "source_control": "frontier/interior boundary placement",
+                "source_metric": "frontier coverage ratio",
+            },
+        }
+    )
+    monkeypatch.setattr(
+        explore,
+        "_generate_json_with_retry",
+        lambda *_args, **_kwargs: rewrite_output,
+    )
+
+    rewritten = explore._rewrite_transferable_pattern_fields(
+        pattern,
+        {"name": "Spatial Coverage", "category": "Planning"},
+    )
+
+    assert rewritten["transferable"] == pattern["transferable"]
+    assert rewritten["grounded"] == pattern["grounded"]
+    assert rewritten["abstract_structure"] == pattern["abstract_structure"]
+    assert rewritten["transferable_rewrite_attempted"] is True
+    assert rewritten["transferable_rewrite_applied"] is False
+    assert rewritten["transferable_first_pass_fields"] == {
+        "mechanism": "Frontier and interior load rebalance.",
+        "control_logic": "Adjust frontier and interior boundaries.",
+        "signal_shape": "Coverage shifts between frontier and interior.",
     }
 
 
