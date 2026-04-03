@@ -1699,6 +1699,71 @@ def test_jump_transferable_query_profile_rejects_source_leaky_transferable_field
     assert "permeability" in profile["strong_source_leakage_terms"]
 
 
+def test_jump_transferable_query_profile_ignores_flat_field_only_source_shape_terms() -> None:
+    profile = jump._jump_transferable_query_profile(
+        {
+            "pattern_name": "Propeller-hull clearance pressure-pulse bottleneck",
+            "abstract_structure": (
+                "A controllable lever is the spatial gap set during geometric layout."
+            ),
+            "control_lever": (
+                "Vertical clearance between propeller blade tip and adjacent hull surface, "
+                "set during propulsion system layout"
+            ),
+            "transferable": {
+                "mechanism": (
+                    "A cyclically driven element near a boundary produces periodic force "
+                    "disturbances that intensify as an intervening void narrows."
+                ),
+                "control_logic": (
+                    "Fix the minimum void dimension above the critical threshold during "
+                    "geometric layout to avoid the steep near-threshold load increase."
+                ),
+                "signal_shape": (
+                    "Transmitted load rises sharply as the void closes toward the "
+                    "threshold and then settles onto a high-amplitude floor."
+                ),
+                "_backfilled_fields": [],
+            },
+            "grounded": {
+                "source_control": "fixture offset specified in draft drawings",
+                "source_metric": "sensor envelope trace",
+            },
+        },
+        "Shipbuilding",
+        "Maritime Engineering",
+    )
+
+    assert profile["usable"] is True
+    assert "during" not in profile["source_shape_terms"]
+    assert "layout" not in profile["source_shape_terms"]
+    assert profile["strong_source_shape_terms"] == []
+
+
+def test_jump_transferable_query_profile_still_blocks_true_grounded_source_overlap() -> None:
+    profile = jump._jump_transferable_query_profile(
+        {
+            "transferable": {
+                "mechanism": "accumulated load crosses a threshold and drives degradation",
+                "control_logic": "enforce a minimum-gap arrangement constraint",
+                "signal_shape": "load rises as spacing narrows toward threshold",
+                "_backfilled_fields": [],
+            },
+            "grounded": {
+                "source_control": "minimum spacing arrangement drawings",
+                "source_metric": "spacing-dependent load amplitude",
+            },
+        },
+        "Shipbuilding",
+        "Maritime Engineering",
+    )
+
+    assert profile["usable"] is False
+    assert "transferable_source_leakage" in profile["concerns"]
+    assert "arrangement" in profile["source_leakage_terms"]
+    assert "arrangement" in profile["strong_source_leakage_terms"]
+
+
 def test_jump_transferable_query_profile_ignores_portable_mechanism_and_connector_overlap() -> None:
     profile = jump._jump_transferable_query_profile(
         {
@@ -2208,6 +2273,10 @@ def test_lateral_jump_with_diagnostics_marks_transferable_used_but_source_shaped
             "search_query": "additive increase multiplicative decrease",
             "measurable_signal": "window slope and rollback depth",
             "control_lever": "tune additive increase step and multiplicative decrease factor",
+            "grounded": {
+                "source_control": "tune additive increase step and multiplicative decrease factor",
+                "source_metric": "window slope and rollback depth",
+            },
         },
         "TCP Congestion Control",
         "Networking",

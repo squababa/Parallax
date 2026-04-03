@@ -1402,26 +1402,8 @@ def _jump_source_shaped_terms(candidate_text: str, pattern: dict) -> list[str]:
         and not _is_generic_jump_grounded_source_token(token)
         and len(token) > 2
     }
-    source_tokens = {
-        token
-        for token in _tokenize_query_terms(
-            " ".join(
-                [
-                    str(pattern.get("pattern_name", "") or ""),
-                    str(pattern.get("search_query", "") or ""),
-                    str(pattern.get("measurable_signal", "") or ""),
-                    str(pattern.get("control_lever", "") or ""),
-                ]
-            )
-        )
-        if token not in GENERIC_QUERY_TOKENS
-        and token not in WEAK_QUERY_TOKENS
-        and token not in JUMP_QUERY_FILLER_TOKENS
-        and token not in QUERY_PHRASE_STOPWORDS
-        and token not in OVERLOADED_JUMP_QUERY_TOKENS
-        and not _is_generic_jump_grounded_source_token(token)
-        and len(token) > 2
-    }
+    grounded = pattern.get("grounded") if isinstance(pattern.get("grounded"), dict) else {}
+    source_tokens = _jump_grounded_source_tokens(grounded)
     return sorted(candidate_tokens.intersection(source_tokens))
 
 
