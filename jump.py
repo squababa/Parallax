@@ -7367,6 +7367,7 @@ def _build_jump_search_content(
     raw_target_candidates: list[dict] = []
     top_titles: list[str] = []
     enriched_packet = False
+    highlighted_evidence_count = 0
     adjacent_highlighted_count = 0
     adjacent_suppressed_count = 0
     cluster_packet_sections: list[dict[str, object]] = []
@@ -7509,6 +7510,11 @@ def _build_jump_search_content(
                 in kept_adjacent_highlight_keys
             ]
 
+    highlighted_evidence_count = sum(
+        1
+        for section in cluster_packet_sections
+        for _highlight in list(section.get("highlights") or [])
+    )
     adjacent_highlighted_count = sum(
         1
         for section in cluster_packet_sections
@@ -7637,6 +7643,7 @@ def _build_jump_search_content(
         enriched_packet,
         {
             "packet_quality": packet_quality,
+            "highlighted_evidence_count": highlighted_evidence_count,
             "adjacent_highlighted_count": adjacent_highlighted_count,
             "adjacent_suppressed_count": adjacent_suppressed_count,
         },
@@ -7678,6 +7685,7 @@ def lateral_jump_with_diagnostics(
         "adjacent_result_count": 0,
         "adjacent_retained_result_count": 0,
         "retained_adjacent_result_count": 0,
+        "highlighted_evidence_count": 0,
         "adjacent_highlighted_count": 0,
         "adjacent_suppressed_count": 0,
         "packet_quality": "focused",
@@ -7907,6 +7915,9 @@ def lateral_jump_with_diagnostics(
                 existing_result["query_labels"].append(query_label)
 
     def _apply_packet_observability(packet_observability: dict[str, object]) -> None:
+        diagnostic["highlighted_evidence_count"] = int(
+            packet_observability.get("highlighted_evidence_count") or 0
+        )
         diagnostic["adjacent_highlighted_count"] = int(
             packet_observability.get("adjacent_highlighted_count") or 0
         )

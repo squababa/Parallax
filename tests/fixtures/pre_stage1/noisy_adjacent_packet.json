@@ -1,0 +1,112 @@
+{
+  "id": "noisy_adjacent_packet",
+  "description": "Noisy retrieval with one real keep result and several adjacent signals that should remain observable without Stage 1 approval.",
+  "source_domain": "Network Protocols",
+  "source_category": "Technology",
+  "llm_jump_query": null,
+  "pattern": {
+    "pattern_name": "Queue-threshold congestion gating",
+    "abstract_structure": "load compared against a queue threshold throttles arrivals before spillover cascades into delay growth",
+    "search_query": "queue threshold throttling latency",
+    "measurable_signal": "queue length and tail latency under burst load",
+    "control_lever": "raise the queue threshold or throttle arrival rate",
+    "transfer_rationale": "transfers to systems that gate inflow when backlog crosses a threshold",
+    "transferable": {
+      "mechanism": "backlog crosses a gating threshold and inflow is throttled before spillover amplifies delay",
+      "control_logic": "raise the gating threshold or throttle arrivals during burst conditions",
+      "signal_shape": "backlog and delay rise sharply once the threshold is exceeded"
+    },
+    "grounded": {
+      "source_control": "raise the queue threshold or throttle arrival rate",
+      "source_metric": "queue length and tail latency under burst load"
+    }
+  },
+  "search_responses": [
+    {
+      "query": "queue threshold throttling latency",
+      "lane": "general",
+      "results": [
+        {
+          "title": "Threshold-gated backlog shedding paper",
+          "content": "Backlog crosses a gating threshold and operators throttle intake before spillover drives delay escalation across the constrained service lane.",
+          "url": "https://target.test/backlog-threshold"
+        },
+        {
+          "title": "Bursty intake safeguard bulletin",
+          "content": "Operators watch admission imbalance, saturation episodes, comparator alarms, overflow windows, handoff stalls, and recovery lag in a burst-handling workflow.",
+          "url": "https://target.test/burst-safeguard"
+        },
+        {
+          "title": "General queueing overview",
+          "content": "Introduction overview tutorial on queueing systems and general latency concepts.",
+          "url": "https://overview.test/queueing-overview"
+        }
+      ]
+    },
+    {
+      "query": "queue threshold throttling latency gating threshold workaround",
+      "lane": "general",
+      "results": [
+        {
+          "title": "Delay surge reroute memo",
+          "content": "Burst-handling teams use diversion windows, manual intake shaping, spillway isolation, comparator alarms, and downstream recovery checks during overload episodes.",
+          "url": "https://target.test/delay-reroute"
+        },
+        {
+          "title": "Spillway reset operations note",
+          "content": "Manual reset timing, surge containment, operator triage, backlog partitioning, diversion cadence, and fallback sequencing govern overload recovery.",
+          "url": "https://target.test/spillway-reset"
+        }
+      ]
+    },
+    {
+      "query": "queue threshold throttling latency backlog failure",
+      "lane": "general",
+      "results": [
+        {
+          "title": "Comparator alarm playbook",
+          "content": "Comparator drift, alarm persistence, saturation bursts, intake mismatch, recovery lag, and downstream queue spillback shape operator escalation decisions.",
+          "url": "https://target.test/comparator-alarm"
+        }
+      ]
+    },
+    {
+      "query": "queue threshold throttling latency",
+      "lane": "academic",
+      "results": [
+        {
+          "title": "Adaptive spillover throttling study",
+          "content": "Adaptive throttling reduces overload spillover once backlog exceeds a decision threshold in bursty service networks.",
+          "url": "https://arxiv.org/abs/2604.00003"
+        }
+      ]
+    }
+  ],
+  "stage1_stub": {
+    "data": null,
+    "failure_hint": "no_connection"
+  },
+  "expect": {
+    "built_queries": [
+      "queue threshold throttling latency",
+      "queue threshold throttling latency gating threshold workaround",
+      "queue threshold throttling latency backlog failure"
+    ],
+    "raw_result_count": 7,
+    "filtered_result_count": 1,
+    "retained_result_count": 6,
+    "cluster_count": 6,
+    "highlighted_evidence_count": 5,
+    "intervention_bearing_result_count": 2,
+    "packet_quality": "adjacent_heavy",
+    "top_cluster_hints": [
+      "threshold-gated backlog shedding",
+      "spillover throttling adaptive",
+      "reset operations spillway"
+    ],
+    "obvious_source_leakage": false,
+    "stage1_outcome": "detect_no_signal",
+    "search_call_count": 4,
+    "unexpected_search_calls": 0
+  }
+}
