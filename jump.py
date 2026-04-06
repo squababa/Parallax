@@ -27,6 +27,11 @@ from llm_client import get_llm_client
 from sanitize import sanitize, check_llm_output
 from store import get_relevant_scars, increment_tavily_calls, increment_llm_calls
 from debug_log import log_gemini_output
+from jump_pre_stage1 import (
+    PreStage1Dependencies,
+    augment_pre_stage1_with_query,
+    run_pre_stage1,
+)
 
 _llm_client = get_llm_client()
 _tavily = TavilyClient(api_key=TAVILY_API_KEY)
@@ -7650,6 +7655,35 @@ def _build_jump_search_content(
     )
 
 
+def _make_pre_stage1_dependencies() -> PreStage1Dependencies:
+    return PreStage1Dependencies(
+        build_jump_search_queries=_build_jump_search_queries,
+        jump_source_shaped_terms=_jump_source_shaped_terms,
+        tokenize_query_terms=_tokenize_query_terms,
+        jump_solution_marker_count=_jump_solution_marker_count,
+        has_intervention_query_label=_has_intervention_query_label,
+        jump_result_anchor_context=_jump_result_anchor_context,
+        sanitize=sanitize,
+        normalize_jump_result_host=_normalize_jump_result_host,
+        jump_result_mentions_source_domain=_jump_result_mentions_source_domain,
+        host_matches_jump_include_domains=_host_matches_jump_include_domains,
+        classify_weak_jump_result=_classify_weak_jump_result,
+        build_jump_search_content=_build_jump_search_content,
+        should_attempt_alternate_jump_retrieval=_should_attempt_alternate_jump_retrieval,
+        build_alternate_jump_search_query=_build_alternate_jump_search_query,
+        tavily_search=_tavily.search,
+        increment_tavily_calls=increment_tavily_calls,
+        academic_jump_include_domains=ACADEMIC_JUMP_INCLUDE_DOMAINS,
+    )
+
+
+def _apply_pre_stage1_diagnostics(
+    diagnostic: dict[str, object],
+    pre_stage1_diagnostics,
+) -> None:
+    diagnostic.update(pre_stage1_diagnostics.to_dict())
+
+
 def lateral_jump_with_diagnostics(
     pattern: dict,
     source_domain: str,
@@ -7706,228 +7740,14 @@ def lateral_jump_with_diagnostics(
         "benchmark_snapshot": None,
     }
 
-    queries = _build_jump_search_queries(
-        pattern,
-        source_domain,
-        source_category,
-    )
-    diagnostic["query_collision_guard_applied"] = bool(
-        getattr(_build_jump_search_queries, "last_collision_guard_applied", False)
-    )
-    diagnostic["legacy_built_jump_query"] = str(
-        getattr(_build_jump_search_queries, "last_legacy_query", "") or ""
-    ).strip()
-    diagnostic["transferable_query_profile"] = dict(
-        getattr(_build_jump_search_queries, "last_transferable_query_profile", {}) or {}
-    )
-    query_labels = [
-        str(label).strip()
-        for label in (getattr(_build_jump_search_queries, "last_query_labels", []) or [])
-        if str(label).strip()
-    ]
-    while len(query_labels) < len(queries):
-        index = len(query_labels)
-        if index == 0:
-            query_labels.append("base")
-        elif index == 1:
-            query_labels.append("solution-biased")
-        else:
-            query_labels.append(f"variant-{index + 1}")
-    query = queries[0] if queries else ""
-    diagnostic["built_jump_query"] = query
-    diagnostic["built_jump_queries"] = queries
-    diagnostic["built_jump_query_labels"] = query_labels[: len(queries)]
-    source_shape_terms = _jump_source_shaped_terms(query, pattern)
-    diagnostic["transferable_fallback_gate_blocked"] = not bool(
-        diagnostic["transferable_query_profile"].get("usable")
-    )
-    diagnostic["transferable_used_but_source_shaped"] = bool(
-        diagnostic["transferable_query_profile"].get("usable")
-    ) and len(source_shape_terms) >= 2
-    diagnostic["transferable_used_source_shape_terms"] = source_shape_terms[:4]
-    if not query:
-        diagnostic["stage1_outcome"] = "no_results"
-        diagnostic["stage1_failure_hint"] = "empty_jump_query"
+    def _apply_pre_stage1_terminal_result(pre_stage1_result) -> tuple[None, dict]:
+        diagnostic["stage1_outcome"] = (
+            str(pre_stage1_result.stage1_outcome or "").strip() or "no_results"
+        )
+        diagnostic["stage1_failure_hint"] = pre_stage1_result.stage1_failure_hint
+        if pre_stage1_result.budget_stop is not None:
+            diagnostic["budget_stop"] = pre_stage1_result.budget_stop
         return None, diagnostic
-
-    category_lower = source_category.lower()
-    merged_results: list[dict] = []
-    merged_result_index: dict[str, int] = {}
-    query_error_count = 0
-    general_result_count = 0
-    academic_result_count = 0
-    filtered_result_reason_counts: dict[str, int] = {}
-    filtered_result_reason_keys: dict[str, set[str]] = {}
-    blocked_cluster_tokens = set(_tokenize_query_terms(source_domain))
-    blocked_cluster_tokens.update(_tokenize_query_terms(source_category))
-    _blocked_anchor_tokens, preferred_anchor_phrases, strong_anchor_tokens = _jump_result_anchor_context(
-        pattern,
-        source_domain,
-        source_category,
-        queries,
-    )
-
-    def _excerpt_rank(text: str, labels: list[str]) -> tuple[int, int, int, int, int]:
-        tokens = _tokenize_query_terms(text)
-        return (
-            _jump_solution_marker_count(text),
-            len(set(tokens)),
-            len(tokens),
-            len(text),
-            1 if _has_intervention_query_label(labels) else 0,
-        )
-
-    def _merge_search_results(
-        raw_results: list[dict],
-        query_label: str,
-        *,
-        include_domains: tuple[str, ...] | None = None,
-    ) -> None:
-        for result in raw_results:
-            title_text = str(result.get("title", "") or "").strip()
-            title = title_text.lower()
-            content = result.get("content", "")
-            if category_lower and category_lower in title:
-                continue
-            clean = sanitize(content)
-            if not clean:
-                continue
-            url = str(result.get("url", "") or "").strip()
-            normalized_host = _normalize_jump_result_host(url)
-            if _jump_result_mentions_source_domain(
-                title_text,
-                clean,
-                url,
-                normalized_host,
-                source_domain,
-            ):
-                continue
-            if include_domains and not _host_matches_jump_include_domains(
-                normalized_host,
-                include_domains,
-            ):
-                continue
-            should_drop, weak_result_context = _classify_weak_jump_result(
-                title_text,
-                url,
-                clean,
-                preferred_anchor_phrases,
-                strong_anchor_tokens,
-            )
-            if should_drop:
-                filtered_key = (url or title_text or clean).lower()
-                existing_reason_codes = filtered_result_reason_keys.setdefault(
-                    filtered_key,
-                    set(),
-                )
-                if not existing_reason_codes:
-                    diagnostic["filtered_result_count"] += 1
-                for reason_code in weak_result_context.get("reason_codes") or []:
-                    if reason_code in existing_reason_codes:
-                        continue
-                    existing_reason_codes.add(reason_code)
-                    filtered_result_reason_counts[reason_code] = (
-                        filtered_result_reason_counts.get(reason_code, 0) + 1
-                    )
-                continue
-            anchor_overlap = int(weak_result_context.get("anchor_overlap") or 0)
-            preferred_phrase_match = bool(
-                weak_result_context.get("preferred_phrase_match")
-            )
-            solution_marker_count = int(
-                weak_result_context.get("solution_marker_count") or 0
-            )
-            adjacent_strength = int(weak_result_context.get("adjacent_strength") or 0)
-            intervention_marker_count = int(
-                weak_result_context.get("intervention_marker_count") or 0
-            )
-            intervention_evidence = bool(
-                weak_result_context.get("intervention_evidence")
-            )
-            intervention_signal = str(
-                weak_result_context.get("intervention_signal") or ""
-            ).strip()
-            triage_class = str(weak_result_context.get("triage_class") or "keep").strip() or "keep"
-            dedupe_key = (url or title_text or clean).lower()
-            existing_index = merged_result_index.get(dedupe_key)
-            if existing_index is None:
-                merged_result_index[dedupe_key] = len(merged_results)
-                merged_results.append(
-                    {
-                        "title_text": title_text,
-                        "clean": clean,
-                        "url": url,
-                        "query_labels": [query_label],
-                        "anchor_overlap": anchor_overlap,
-                        "preferred_phrase_match": preferred_phrase_match,
-                        "solution_marker_count": solution_marker_count,
-                        "adjacent_strength": adjacent_strength,
-                        "intervention_marker_count": intervention_marker_count,
-                        "intervention_evidence": intervention_evidence,
-                        "intervention_signal": intervention_signal,
-                        "triage_class": triage_class,
-                    }
-                )
-                continue
-            existing_result = merged_results[existing_index]
-            existing_labels = list(existing_result["query_labels"])
-            incoming_labels = [query_label]
-            incoming_rank = _excerpt_rank(clean, incoming_labels)
-            existing_rank = _excerpt_rank(
-                str(existing_result.get("clean", "") or ""),
-                existing_labels,
-            )
-            if incoming_rank > existing_rank:
-                existing_result["clean"] = clean
-                if title_text:
-                    existing_result["title_text"] = title_text
-                existing_result["anchor_overlap"] = anchor_overlap
-                existing_result["preferred_phrase_match"] = preferred_phrase_match
-                existing_result["solution_marker_count"] = solution_marker_count
-                existing_result["adjacent_strength"] = adjacent_strength
-                existing_result["intervention_marker_count"] = intervention_marker_count
-                existing_result["intervention_evidence"] = intervention_evidence
-                existing_result["intervention_signal"] = intervention_signal
-                existing_result["triage_class"] = triage_class
-            else:
-                existing_result["adjacent_strength"] = max(
-                    int(existing_result.get("adjacent_strength") or 0),
-                    adjacent_strength,
-                )
-                existing_result["intervention_marker_count"] = max(
-                    int(existing_result.get("intervention_marker_count") or 0),
-                    intervention_marker_count,
-                )
-                existing_result["intervention_evidence"] = bool(
-                    existing_result.get("intervention_evidence")
-                ) or intervention_evidence
-                if (
-                    intervention_signal
-                    and not str(existing_result.get("intervention_signal") or "").strip()
-                ):
-                    existing_result["intervention_signal"] = intervention_signal
-                existing_triage = str(existing_result.get("triage_class") or "keep").strip() or "keep"
-                if existing_triage != "keep":
-                    existing_result["triage_class"] = (
-                        "keep" if triage_class == "keep" else "adjacent"
-                    )
-            if query_label not in existing_result["query_labels"]:
-                existing_result["query_labels"].append(query_label)
-
-    def _apply_packet_observability(packet_observability: dict[str, object]) -> None:
-        diagnostic["highlighted_evidence_count"] = int(
-            packet_observability.get("highlighted_evidence_count") or 0
-        )
-        diagnostic["adjacent_highlighted_count"] = int(
-            packet_observability.get("adjacent_highlighted_count") or 0
-        )
-        diagnostic["adjacent_suppressed_count"] = int(
-            packet_observability.get("adjacent_suppressed_count") or 0
-        )
-        diagnostic["packet_quality"] = (
-            str(packet_observability.get("packet_quality") or "focused").strip()
-            or "focused"
-        )
 
     def _apply_budget_exhausted(
         exhausted: CycleBudgetExhausted,
@@ -7938,163 +7758,27 @@ def lateral_jump_with_diagnostics(
         diagnostic["budget_stop"] = exhausted.to_diagnostic()
         return None, diagnostic
 
-    for index, current_query in enumerate(queries):
-        try:
-            if cycle_budget is not None:
-                cycle_budget.consume_tavily(
-                    outcome="budget_exhausted_pre_stage1",
-                    callsite="stage1_search",
-                )
-            results = _tavily.search(
-                query=current_query,
-                max_results=5,
-                include_answer=False,
-                search_depth="basic",
-            )
-            increment_tavily_calls(1)
-        except CycleBudgetExhausted as exhausted:
-            return _apply_budget_exhausted(exhausted, "budget_exhausted_pre_stage1")
-        except Exception as e:
-            print(f"  [!] Tavily search failed for jump query '{current_query}': {e}")
-            query_error_count += 1
-            continue
-
-        raw_results = results.get("results", [])
-        if not isinstance(raw_results, list):
-            raw_results = []
-        general_result_count += len(raw_results)
-
-        query_label = query_labels[index] if index < len(query_labels) else f"variant-{index + 1}"
-        _merge_search_results(raw_results, query_label)
-
-    try:
-        if cycle_budget is not None:
-            cycle_budget.consume_tavily(
-                outcome="budget_exhausted_pre_stage1",
-                callsite="stage1_academic_search",
-            )
-        academic_results = _tavily.search(
-            query=query,
-            max_results=5,
-            include_answer=False,
-            search_depth="basic",
-            include_domains=list(ACADEMIC_JUMP_INCLUDE_DOMAINS),
-        )
-        increment_tavily_calls(1)
-    except CycleBudgetExhausted as exhausted:
-        return _apply_budget_exhausted(exhausted, "budget_exhausted_pre_stage1")
-    except Exception as e:
-        print(f"  [!] Tavily academic jump search failed for query '{query}': {e}")
-        query_error_count += 1
-        academic_results = {"results": []}
-
-    raw_academic_results = academic_results.get("results", [])
-    if not isinstance(raw_academic_results, list):
-        raw_academic_results = []
-    academic_result_count = len(raw_academic_results)
-    _merge_search_results(
-        raw_academic_results,
-        "academic",
-        include_domains=ACADEMIC_JUMP_INCLUDE_DOMAINS,
+    pre_stage1_dependencies = _make_pre_stage1_dependencies()
+    pre_stage1_result = run_pre_stage1(
+        pattern,
+        source_domain,
+        source_category,
+        cycle_budget=cycle_budget,
+        deps=pre_stage1_dependencies,
     )
-    diagnostic["general_result_count"] = general_result_count
-    diagnostic["academic_result_count"] = academic_result_count
-    print(
-        f"[Jump] general_results={general_result_count} academic_results={academic_result_count}"
-    )
+    _apply_pre_stage1_diagnostics(diagnostic, pre_stage1_result.diagnostics)
+    if pre_stage1_result.stage1_outcome is not None:
+        return _apply_pre_stage1_terminal_result(pre_stage1_result)
 
-    diagnostic["filtered_result_reason_counts"] = filtered_result_reason_counts
-
-    if query_error_count == len(queries) + 1:
-        diagnostic["stage1_outcome"] = "no_results"
-        diagnostic["stage1_failure_hint"] = "search_error"
-        return None, diagnostic
-
-    combined, raw_target_candidates, top_titles, clustered_results, enriched_packet, packet_observability = (
-        _build_jump_search_content(
-            merged_results,
-            blocked_cluster_tokens,
-            strong_anchor_tokens,
-        )
-    )
-    _apply_packet_observability(packet_observability)
-    if _should_attempt_alternate_jump_retrieval(merged_results, clustered_results):
-        alternate_query = _build_alternate_jump_search_query(
-            pattern,
-            source_domain,
-            source_category,
-            query,
-        )
-        if alternate_query and alternate_query not in queries:
-            diagnostic["alternate_retrieval_attempted"] = True
-            diagnostic["alternate_jump_query"] = alternate_query
-            try:
-                if cycle_budget is not None:
-                    cycle_budget.consume_tavily(
-                        outcome="budget_exhausted_pre_stage1",
-                        callsite="stage1_alternate_search",
-                    )
-                alternate_results = _tavily.search(
-                    query=alternate_query,
-                    max_results=5,
-                    include_answer=False,
-                    search_depth="basic",
-                )
-                increment_tavily_calls(1)
-            except CycleBudgetExhausted as exhausted:
-                return _apply_budget_exhausted(exhausted, "budget_exhausted_pre_stage1")
-            except Exception as e:
-                print(f"  [!] Tavily alternate jump search failed for query '{alternate_query}': {e}")
-                alternate_results = {"results": []}
-            raw_alternate_results = alternate_results.get("results", [])
-            if not isinstance(raw_alternate_results, list):
-                raw_alternate_results = []
-            diagnostic["alternate_result_count"] = len(raw_alternate_results)
-            _merge_search_results(raw_alternate_results, "alternate")
-            combined, raw_target_candidates, top_titles, clustered_results, enriched_packet, packet_observability = (
-                _build_jump_search_content(
-                    merged_results,
-                    blocked_cluster_tokens,
-                    strong_anchor_tokens,
-                )
-            )
-            _apply_packet_observability(packet_observability)
-
-    diagnostic["intervention_promoted_result_count"] = sum(
-        1 for result in merged_results if result.get("intervention_evidence")
-    )
-    adjacent_result_count = sum(
-        1 for result in merged_results if result.get("triage_class") == "adjacent"
-    )
-    diagnostic["adjacent_result_count"] = adjacent_result_count
-    diagnostic["adjacent_retained_result_count"] = adjacent_result_count
-    diagnostic["retained_adjacent_result_count"] = adjacent_result_count
-    diagnostic["result_count"] = len(merged_results)
-    diagnostic["cluster_count"] = len(clustered_results)
-    diagnostic["top_cluster_hints"] = [
-        str(cluster.get("cluster_hint", "") or "").strip()
-        for cluster in clustered_results[:3]
-        if str(cluster.get("cluster_hint", "") or "").strip()
-    ]
-    diagnostic["top_cluster_intervention_scores"] = [
-        int(cluster.get("intervention_score") or 0)
-        for cluster in clustered_results[:3]
-    ]
-    diagnostic["top_result_titles"] = top_titles
-    diagnostic["enriched_packet"] = enriched_packet
-
-    if not combined.strip():
+    pre_stage1_state = pre_stage1_result.state
+    if pre_stage1_state is None or pre_stage1_state.packet is None:
         diagnostic["stage1_outcome"] = "no_results"
         diagnostic["stage1_failure_hint"] = "no_usable_results"
         return None, diagnostic
-    diagnostic["benchmark_snapshot"] = {
-        "source_domain": source_domain,
-        "source_category": source_category,
-        "pattern_name": diagnostic["pattern_name"],
-        "abstract_structure": diagnostic["abstract_structure"],
-        "built_jump_query": query,
-        "search_results": combined,
-    }
+
+    query = str(pre_stage1_state.query_plan.built_jump_query or "").strip()
+    combined = pre_stage1_state.packet.search_content
+    raw_target_candidates = pre_stage1_state.packet.raw_target_candidates
 
     try:
         stage_one, stage_one_failure_hint = _stage_one_detect_with_diagnostics(
@@ -8116,90 +7800,34 @@ def lateral_jump_with_diagnostics(
             str(stage_one.get("target_domain", "") or "").strip(),
         )
         if recovery_query:
-            try:
-                if cycle_budget is not None:
-                    cycle_budget.consume_tavily(
-                        outcome="budget_exhausted_pre_stage1",
-                        callsite="stage1_soft_gate_search",
-                    )
-                recovery_results = _tavily.search(
-                    query=recovery_query,
-                    max_results=5,
-                    include_answer=False,
-                    search_depth="basic",
-                )
-                increment_tavily_calls(1)
-            except CycleBudgetExhausted as exhausted:
-                return _apply_budget_exhausted(exhausted, "budget_exhausted_pre_stage1")
-            except Exception as e:
-                print(
-                    f"  [!] Tavily soft-gate search failed for jump query '{recovery_query}': {e}"
-                )
-                recovery_results = {"results": []}
-            raw_recovery_results = recovery_results.get("results", [])
-            if not isinstance(raw_recovery_results, list):
-                raw_recovery_results = []
-            general_result_count += len(raw_recovery_results)
-            _merge_search_results(raw_recovery_results, "soft-gate")
-
-            try:
-                if cycle_budget is not None:
-                    cycle_budget.consume_tavily(
-                        outcome="budget_exhausted_pre_stage1",
-                        callsite="stage1_soft_gate_academic_search",
-                    )
-                recovery_academic_results = _tavily.search(
-                    query=recovery_query,
-                    max_results=5,
-                    include_answer=False,
-                    search_depth="basic",
-                    include_domains=list(ACADEMIC_JUMP_INCLUDE_DOMAINS),
-                )
-                increment_tavily_calls(1)
-            except CycleBudgetExhausted as exhausted:
-                return _apply_budget_exhausted(exhausted, "budget_exhausted_pre_stage1")
-            except Exception as e:
-                print(
+            recovery_result = augment_pre_stage1_with_query(
+                pre_stage1_state,
+                pre_stage1_result.diagnostics,
+                query=recovery_query,
+                general_query_label="soft-gate",
+                academic_query_label="soft-gate-academic",
+                general_callsite="stage1_soft_gate_search",
+                academic_callsite="stage1_soft_gate_academic_search",
+                general_failure_message=(
+                    "  [!] Tavily soft-gate search failed for jump query "
+                    f"'{recovery_query}': {{error}}"
+                ),
+                academic_failure_message=(
                     "[!] Tavily academic soft-gate search failed for jump query "
-                    f"'{recovery_query}': {e}"
-                )
-                recovery_academic_results = {"results": []}
-            raw_recovery_academic_results = recovery_academic_results.get("results", [])
-            if not isinstance(raw_recovery_academic_results, list):
-                raw_recovery_academic_results = []
-            academic_result_count += len(raw_recovery_academic_results)
-            _merge_search_results(
-                raw_recovery_academic_results,
-                "soft-gate-academic",
-                include_domains=ACADEMIC_JUMP_INCLUDE_DOMAINS,
+                    f"'{recovery_query}': {{error}}"
+                ),
+                cycle_budget=cycle_budget,
+                deps=pre_stage1_dependencies,
             )
-
-        diagnostic["general_result_count"] = general_result_count
-        diagnostic["academic_result_count"] = academic_result_count
-        diagnostic["intervention_promoted_result_count"] = sum(
-            1 for result in merged_results if result.get("intervention_evidence")
-        )
-        combined, raw_target_candidates, top_titles, clustered_results, enriched_packet, packet_observability = _build_jump_search_content(
-            merged_results,
-            blocked_cluster_tokens,
-            strong_anchor_tokens,
-        )
-        _apply_packet_observability(packet_observability)
-        diagnostic["result_count"] = len(merged_results)
-        diagnostic["cluster_count"] = len(clustered_results)
-        diagnostic["top_cluster_hints"] = [
-            str(cluster.get("cluster_hint", "") or "").strip()
-            for cluster in clustered_results[:3]
-            if str(cluster.get("cluster_hint", "") or "").strip()
-        ]
-        diagnostic["top_cluster_intervention_scores"] = [
-            int(cluster.get("intervention_score") or 0)
-            for cluster in clustered_results[:3]
-        ]
-        diagnostic["top_result_titles"] = top_titles
-        diagnostic["enriched_packet"] = enriched_packet
-        if isinstance(diagnostic.get("benchmark_snapshot"), dict):
-            diagnostic["benchmark_snapshot"]["search_results"] = combined
+            _apply_pre_stage1_diagnostics(diagnostic, recovery_result.diagnostics)
+            if recovery_result.stage1_outcome is not None:
+                return _apply_pre_stage1_terminal_result(recovery_result)
+            if recovery_result.state is not None and recovery_result.state.packet is not None:
+                pre_stage1_state = recovery_result.state
+                combined = pre_stage1_state.packet.search_content
+                raw_target_candidates = pre_stage1_state.packet.raw_target_candidates
+                if isinstance(diagnostic.get("benchmark_snapshot"), dict):
+                    diagnostic["benchmark_snapshot"]["search_results"] = combined
 
         try:
             recovered_stage_one, recovered_stage_one_failure_hint = _stage_one_detect_with_diagnostics(
