@@ -11,6 +11,7 @@ import re
 from urllib.parse import urlparse
 from tavily import TavilyClient
 from config import TAVILY_API_KEY
+from cycle_budget import CycleBudget, CycleBudgetExhausted
 from hypothesis_validation import (
     CORE_TARGET_BROAD_PAGE_MARKERS,
     CORE_TARGET_WEAK_SOURCE_MARKERS,
@@ -3953,7 +3954,13 @@ def _extract_json_substring(text: str) -> str | None:
         return None
 
 
-def _generate_json_with_retry(full_prompt: str, stage: str, max_output_tokens: int) -> str | None:
+def _generate_json_with_retry(
+    full_prompt: str,
+    stage: str,
+    max_output_tokens: int,
+    cycle_budget: CycleBudget | None = None,
+    budget_outcome: str | None = None,
+) -> str | None:
     """Generate JSON with one retry if parsing fails."""
     env_key = {
         "stage1_detect": "BLACKCLAW_JUMP_STAGE1_MAX_OUTPUT_TOKENS",
@@ -3977,6 +3984,11 @@ def _generate_json_with_retry(full_prompt: str, stage: str, max_output_tokens: i
         os.getenv("BLACKCLAW_JUMP_DISABLE_JSON_RETRY", "")
     ).strip().lower() in {"1", "true", "yes", "on"}
     try:
+        if cycle_budget is not None and budget_outcome:
+            cycle_budget.consume_llm(
+                outcome=budget_outcome,
+                callsite=str(stage or "").strip() or "stage1_detect",
+            )
         response = _llm_client.generate_content(
             full_prompt,
             generation_config={
@@ -3998,6 +4010,11 @@ def _generate_json_with_retry(full_prompt: str, stage: str, max_output_tokens: i
             return None
 
         retry_prompt = f"{JSON_RETRY_PROMPT}\n\n{full_prompt}"
+        if cycle_budget is not None and budget_outcome:
+            cycle_budget.consume_llm(
+                outcome=budget_outcome,
+                callsite=str(stage or "").strip() or "stage1_detect",
+            )
         retry_response = _llm_client.generate_content(
             retry_prompt,
             generation_config={
@@ -4013,6 +4030,8 @@ def _generate_json_with_retry(full_prompt: str, stage: str, max_output_tokens: i
             print(f"  [!] Jump {stage} retry output failed safety check")
             return None
         return _extract_json_substring(retry_checked)
+    except CycleBudgetExhausted:
+        raise
     except Exception as e:
         print(f"  [!] Jump {stage} LLM call failed: {e}")
         return None
@@ -6522,13 +6541,23 @@ def _stage_one_detect_with_diagnostics(
     source_domain: str,
     abstract_structure: str,
     search_results: str,
+    cycle_budget: CycleBudget | None = None,
 ) -> tuple[dict | None, str | None]:
     prompt = DETECT_PROMPT.format(
         source_domain=source_domain,
         abstract_structure=abstract_structure,
         search_results=search_results,
     )
-    extracted_json = _generate_json_with_retry(prompt, "stage1_detect", 2048)
+    if cycle_budget is None:
+        extracted_json = _generate_json_with_retry(prompt, "stage1_detect", 2048)
+    else:
+        extracted_json = _generate_json_with_retry(
+            prompt,
+            "stage1_detect",
+            2048,
+            cycle_budget=cycle_budget,
+            budget_outcome="budget_exhausted_stage1",
+        )
     if extracted_json is None:
         return None, "generation_failed"
     try:
@@ -7618,6 +7647,7 @@ def lateral_jump_with_diagnostics(
     pattern: dict,
     source_domain: str,
     source_category: str,
+    cycle_budget: CycleBudget | None = None,
 ) -> tuple[dict | None, dict]:
     """
     Attempt a lateral jump and return lightweight diagnostics describing where it died.
@@ -7888,8 +7918,22 @@ def lateral_jump_with_diagnostics(
             or "focused"
         )
 
+    def _apply_budget_exhausted(
+        exhausted: CycleBudgetExhausted,
+        outcome: str,
+    ) -> tuple[None, dict]:
+        diagnostic["stage1_outcome"] = str(outcome or "").strip() or "budget_exhausted_pre_stage1"
+        diagnostic["stage1_failure_hint"] = "cycle_budget_exhausted"
+        diagnostic["budget_stop"] = exhausted.to_diagnostic()
+        return None, diagnostic
+
     for index, current_query in enumerate(queries):
         try:
+            if cycle_budget is not None:
+                cycle_budget.consume_tavily(
+                    outcome="budget_exhausted_pre_stage1",
+                    callsite="stage1_search",
+                )
             results = _tavily.search(
                 query=current_query,
                 max_results=5,
@@ -7897,6 +7941,8 @@ def lateral_jump_with_diagnostics(
                 search_depth="basic",
             )
             increment_tavily_calls(1)
+        except CycleBudgetExhausted as exhausted:
+            return _apply_budget_exhausted(exhausted, "budget_exhausted_pre_stage1")
         except Exception as e:
             print(f"  [!] Tavily search failed for jump query '{current_query}': {e}")
             query_error_count += 1
@@ -7911,6 +7957,11 @@ def lateral_jump_with_diagnostics(
         _merge_search_results(raw_results, query_label)
 
     try:
+        if cycle_budget is not None:
+            cycle_budget.consume_tavily(
+                outcome="budget_exhausted_pre_stage1",
+                callsite="stage1_academic_search",
+            )
         academic_results = _tavily.search(
             query=query,
             max_results=5,
@@ -7919,6 +7970,8 @@ def lateral_jump_with_diagnostics(
             include_domains=list(ACADEMIC_JUMP_INCLUDE_DOMAINS),
         )
         increment_tavily_calls(1)
+    except CycleBudgetExhausted as exhausted:
+        return _apply_budget_exhausted(exhausted, "budget_exhausted_pre_stage1")
     except Exception as e:
         print(f"  [!] Tavily academic jump search failed for query '{query}': {e}")
         query_error_count += 1
@@ -7965,6 +8018,11 @@ def lateral_jump_with_diagnostics(
             diagnostic["alternate_retrieval_attempted"] = True
             diagnostic["alternate_jump_query"] = alternate_query
             try:
+                if cycle_budget is not None:
+                    cycle_budget.consume_tavily(
+                        outcome="budget_exhausted_pre_stage1",
+                        callsite="stage1_alternate_search",
+                    )
                 alternate_results = _tavily.search(
                     query=alternate_query,
                     max_results=5,
@@ -7972,6 +8030,8 @@ def lateral_jump_with_diagnostics(
                     search_depth="basic",
                 )
                 increment_tavily_calls(1)
+            except CycleBudgetExhausted as exhausted:
+                return _apply_budget_exhausted(exhausted, "budget_exhausted_pre_stage1")
             except Exception as e:
                 print(f"  [!] Tavily alternate jump search failed for query '{alternate_query}': {e}")
                 alternate_results = {"results": []}
@@ -8025,11 +8085,15 @@ def lateral_jump_with_diagnostics(
         "search_results": combined,
     }
 
-    stage_one, stage_one_failure_hint = _stage_one_detect_with_diagnostics(
-        source_domain=source_domain,
-        abstract_structure=pattern.get("abstract_structure", ""),
-        search_results=combined,
-    )
+    try:
+        stage_one, stage_one_failure_hint = _stage_one_detect_with_diagnostics(
+            source_domain=source_domain,
+            abstract_structure=pattern.get("abstract_structure", ""),
+            search_results=combined,
+            cycle_budget=cycle_budget,
+        )
+    except CycleBudgetExhausted as exhausted:
+        return _apply_budget_exhausted(exhausted, "budget_exhausted_stage1")
     stage_one_outcome = _classify_stage_one_outcome(stage_one, stage_one_failure_hint)
     initial_stage_one = stage_one
     initial_stage_one_failure_hint = stage_one_failure_hint
@@ -8042,6 +8106,11 @@ def lateral_jump_with_diagnostics(
         )
         if recovery_query:
             try:
+                if cycle_budget is not None:
+                    cycle_budget.consume_tavily(
+                        outcome="budget_exhausted_pre_stage1",
+                        callsite="stage1_soft_gate_search",
+                    )
                 recovery_results = _tavily.search(
                     query=recovery_query,
                     max_results=5,
@@ -8049,6 +8118,8 @@ def lateral_jump_with_diagnostics(
                     search_depth="basic",
                 )
                 increment_tavily_calls(1)
+            except CycleBudgetExhausted as exhausted:
+                return _apply_budget_exhausted(exhausted, "budget_exhausted_pre_stage1")
             except Exception as e:
                 print(
                     f"  [!] Tavily soft-gate search failed for jump query '{recovery_query}': {e}"
@@ -8061,6 +8132,11 @@ def lateral_jump_with_diagnostics(
             _merge_search_results(raw_recovery_results, "soft-gate")
 
             try:
+                if cycle_budget is not None:
+                    cycle_budget.consume_tavily(
+                        outcome="budget_exhausted_pre_stage1",
+                        callsite="stage1_soft_gate_academic_search",
+                    )
                 recovery_academic_results = _tavily.search(
                     query=recovery_query,
                     max_results=5,
@@ -8069,6 +8145,8 @@ def lateral_jump_with_diagnostics(
                     include_domains=list(ACADEMIC_JUMP_INCLUDE_DOMAINS),
                 )
                 increment_tavily_calls(1)
+            except CycleBudgetExhausted as exhausted:
+                return _apply_budget_exhausted(exhausted, "budget_exhausted_pre_stage1")
             except Exception as e:
                 print(
                     "[!] Tavily academic soft-gate search failed for jump query "
@@ -8112,11 +8190,15 @@ def lateral_jump_with_diagnostics(
         if isinstance(diagnostic.get("benchmark_snapshot"), dict):
             diagnostic["benchmark_snapshot"]["search_results"] = combined
 
-        recovered_stage_one, recovered_stage_one_failure_hint = _stage_one_detect_with_diagnostics(
-            source_domain=source_domain,
-            abstract_structure=pattern.get("abstract_structure", ""),
-            search_results=combined,
-        )
+        try:
+            recovered_stage_one, recovered_stage_one_failure_hint = _stage_one_detect_with_diagnostics(
+                source_domain=source_domain,
+                abstract_structure=pattern.get("abstract_structure", ""),
+                search_results=combined,
+                cycle_budget=cycle_budget,
+            )
+        except CycleBudgetExhausted as exhausted:
+            return _apply_budget_exhausted(exhausted, "budget_exhausted_stage1")
         recovered_stage_one_outcome = _classify_stage_one_outcome(
             recovered_stage_one,
             recovered_stage_one_failure_hint,

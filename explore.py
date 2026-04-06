@@ -7,6 +7,7 @@ import re
 from urllib.parse import urlparse
 from tavily import TavilyClient
 from config import MODEL, TAVILY_API_KEY
+from cycle_budget import CycleBudget, CycleBudgetExhausted
 from llm_client import get_llm_client
 from sanitize import sanitize, check_llm_output
 from store import increment_tavily_calls, increment_llm_calls
@@ -1203,11 +1204,30 @@ def finalize_pattern_diagnostics(seed: dict, connections_found: int) -> dict | N
         return None
 
     final = dict(diagnostics)
-    if isinstance(diagnostics.get("jump_attempts"), list):
-        final["jump_attempts"] = list(diagnostics.get("jump_attempts") or [])
+    jump_attempts = (
+        list(diagnostics.get("jump_attempts") or [])
+        if isinstance(diagnostics.get("jump_attempts"), list)
+        else []
+    )
+    if jump_attempts:
+        final["jump_attempts"] = jump_attempts
     final["connections_found"] = int(connections_found)
     if connections_found > 0:
         final["jump_outcome"] = "connection_found"
+    elif any(
+        str(attempt.get("stage1_outcome") or "").strip() == "budget_exhausted_stage1"
+        for attempt in jump_attempts
+        if isinstance(attempt, dict)
+    ):
+        final["jump_outcome"] = "budget_exhausted_stage1"
+    elif any(
+        str(attempt.get("stage1_outcome") or "").strip() == "budget_exhausted_pre_stage1"
+        for attempt in jump_attempts
+        if isinstance(attempt, dict)
+    ):
+        final["jump_outcome"] = "budget_exhausted_pre_stage1"
+    elif str(final.get("outcome") or "").strip().startswith("budget_exhausted_"):
+        final["jump_outcome"] = "budget_exhausted_pre_stage1"
     elif int(final.get("retained_pattern_count", 0) or 0) <= 0:
         final["jump_outcome"] = str(final.get("outcome") or "no_patterns_returned")
     elif int(final.get("high_quality_count", 0) or 0) <= 0:
@@ -1368,7 +1388,10 @@ def _classify_seed_search_result(
     }
 
 
-def _search_seed(seed: dict) -> tuple[str, dict]:
+def _search_seed(
+    seed: dict,
+    cycle_budget: CycleBudget | None = None,
+) -> tuple[str, dict]:
     """Run Tavily searches for the seed domain and return combined content + provenance."""
     combined = []
     provenance = {"seed_url": None, "seed_excerpt": None}
@@ -1378,6 +1401,11 @@ def _search_seed(seed: dict) -> tuple[str, dict]:
         if not query:
             continue
         try:
+            if cycle_budget is not None:
+                cycle_budget.consume_tavily(
+                    outcome="budget_exhausted_seed_search",
+                    callsite="seed_search",
+                )
             results = _tavily.search(
                 query=query,
                 max_results=SEED_SEARCH_MAX_RESULTS,
@@ -1415,6 +1443,8 @@ def _search_seed(seed: dict) -> tuple[str, dict]:
                             existing["specificity_score"],
                         ):
                             ranked_results[dedupe_key] = ranked_result
+        except CycleBudgetExhausted:
+            raise
         except Exception as e:
             print(f"  [!] Tavily search failed for '{query}': {e}")
             continue
@@ -1504,11 +1534,21 @@ def _extract_json_substring(text: str) -> str | None:
         return candidate
     except Exception:
         return None
-def _generate_json_with_retry(full_prompt: str, max_output_tokens: int) -> str | None:
+def _generate_json_with_retry(
+    full_prompt: str,
+    max_output_tokens: int,
+    cycle_budget: CycleBudget | None = None,
+    budget_outcome: str = "budget_exhausted_pattern_extraction",
+) -> str | None:
     """Generate JSON with up to two correction retries if parsing fails."""
     raw_responses = []
     prompt = full_prompt
     for attempt in range(3):
+        if cycle_budget is not None:
+            cycle_budget.consume_llm(
+                outcome=budget_outcome,
+                callsite="pattern_extraction",
+            )
         response = get_llm_client().generate_content(
             prompt,
             generation_config={
@@ -1540,7 +1580,38 @@ def _generate_json_with_retry(full_prompt: str, max_output_tokens: int) -> str |
         "Failed to parse Ollama response as JSON after 3 attempts. "
         f"Raw response: {raw_responses[-1] if raw_responses else '<empty>'}"
     )
-def dive(seed: dict) -> list[dict]:
+
+
+def _budget_exhausted_pattern_diagnostics(
+    seed: dict,
+    exhausted: CycleBudgetExhausted,
+) -> dict[str, object]:
+    outcome = str(exhausted.outcome or "").strip() or "budget_exhausted_pre_stage1"
+    budget_stop = exhausted.to_diagnostic()
+    return {
+        "seed_name": str(seed.get("name", "") or "").strip(),
+        "raw_pattern_count": 0,
+        "retained_pattern_count": 0,
+        "high_quality_count": 0,
+        "medium_quality_count": 0,
+        "weak_quality_count": 0,
+        "jump_ready_count": 0,
+        "drop_counts": {
+            "missing_required_fields": 0,
+            "low_signal": 0,
+            "weak_quality": 0,
+        },
+        "top_rejection_reasons": [budget_stop["summary"]],
+        "outcome": outcome,
+        "budget_stop": budget_stop,
+        "summary": f"{outcome}: {budget_stop['summary']}",
+    }
+
+
+def dive(
+    seed: dict,
+    cycle_budget: CycleBudget | None = None,
+) -> list[dict]:
     """
     Dive into a seed domain:
     1. Search the web for information
@@ -1549,7 +1620,18 @@ def dive(seed: dict) -> list[dict]:
     Returns empty list on failure.
     """
     # Step 1: Search
-    research, provenance = _search_seed(seed)
+    try:
+        if cycle_budget is None:
+            research, provenance = _search_seed(seed)
+        else:
+            research, provenance = _search_seed(seed, cycle_budget=cycle_budget)
+    except CycleBudgetExhausted as exhausted:
+        _store_pattern_diagnostics(
+            seed,
+            _budget_exhausted_pattern_diagnostics(seed, exhausted),
+        )
+        print(f"  [!] {exhausted.summary}")
+        return []
     if not research.strip():
         _store_pattern_diagnostics(
             seed,
@@ -1577,7 +1659,22 @@ def dive(seed: dict) -> list[dict]:
     prompt = EXTRACT_PROMPT.format(domain=seed["name"])
     full_prompt = f"{prompt}\n\n--- RESEARCH MATERIAL ---\n\n{research}"
     try:
-        extracted_json = _generate_json_with_retry(full_prompt, 4096)
+        if cycle_budget is None:
+            extracted_json = _generate_json_with_retry(full_prompt, 4096)
+        else:
+            extracted_json = _generate_json_with_retry(
+                full_prompt,
+                4096,
+                cycle_budget=cycle_budget,
+                budget_outcome="budget_exhausted_pattern_extraction",
+            )
+    except CycleBudgetExhausted as exhausted:
+        _store_pattern_diagnostics(
+            seed,
+            _budget_exhausted_pattern_diagnostics(seed, exhausted),
+        )
+        print(f"  [!] {exhausted.summary}")
+        return []
     except Exception as e:
         _store_pattern_diagnostics(
             seed,

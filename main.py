@@ -4,6 +4,7 @@ Entry point. Runs the exploration loop.
 """
 import argparse
 from datetime import datetime, timezone
+import inspect
 import json
 import os
 from pathlib import Path
@@ -5657,7 +5658,10 @@ from config import (
     INVARIANCE_KILL_THRESHOLD,
     CYCLE_COOLDOWN,
     MAX_PATTERNS_PER_CYCLE,
+    MAX_TAVILY_CALLS_PER_CYCLE,
+    MAX_LLM_CALLS_PER_CYCLE,
 )
+from cycle_budget import CycleBudget
 from explore import append_jump_attempt_diagnostic, dive, finalize_pattern_diagnostics
 import jump as jump_module
 from jump import lateral_jump, lateral_jump_with_diagnostics, salvage_high_value_candidate
@@ -9673,6 +9677,53 @@ def _pattern_diagnostic_text(seed: dict) -> str | None:
     )
 
 
+def _supports_cycle_budget(func: object) -> bool:
+    """Return True when one callable can accept `cycle_budget=`."""
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return False
+    if "cycle_budget" in signature.parameters:
+        return True
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+
+
+def _call_with_cycle_budget(func: object, *args, cycle_budget: CycleBudget):
+    """Call one function with cycle budget only when its signature supports it."""
+    if not _supports_cycle_budget(func):
+        return func(*args)
+    return func(*args, cycle_budget=cycle_budget)
+
+
+def _pattern_budget_exhausted(seed: dict) -> bool:
+    diagnostics = seed.get("pattern_diagnostics")
+    if not isinstance(diagnostics, dict) or not diagnostics:
+        return False
+    return str(diagnostics.get("outcome") or "").strip().startswith("budget_exhausted_")
+
+
+def _jump_budget_exhausted(jump_attempt: dict | None) -> bool:
+    if not isinstance(jump_attempt, dict):
+        return False
+    return str(jump_attempt.get("stage1_outcome") or "").strip() in {
+        "budget_exhausted_pre_stage1",
+        "budget_exhausted_stage1",
+    }
+
+
+def _budget_stop_text(payload: dict | None) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    budget_stop = payload.get("budget_stop")
+    if not isinstance(budget_stop, dict):
+        return None
+    text = str(budget_stop.get("summary") or "").strip()
+    return text or None
+
+
 def run_cycle(
     cycle_num: int,
     threshold: float,
@@ -9687,6 +9738,11 @@ def run_cycle(
     connections_found = 0
     max_hops_per_cycle = 2
     hops_completed = 0
+    cycle_budget = CycleBudget(
+        max_tavily_calls=MAX_TAVILY_CALLS_PER_CYCLE,
+        max_llm_calls=MAX_LLM_CALLS_PER_CYCLE,
+    )
+    cycle_stopped_by_budget = False
 
     if manual_seed is not None:
         seed = dict(manual_seed)
@@ -9714,11 +9770,16 @@ def run_cycle(
     update_domain_visited(seed["name"], seed["category"])
 
     print("  [Dive] Searching and extracting patterns...")
-    patterns = dive(seed)
+    patterns = _call_with_cycle_budget(dive, seed, cycle_budget=cycle_budget)
     print(f"  [Dive] Found {len(patterns)} patterns")
     pattern_diag_text = _pattern_diagnostic_text(seed)
     if pattern_diag_text:
         print(f"  [Dive] Pattern quality: {pattern_diag_text}")
+    if _pattern_budget_exhausted(seed):
+        cycle_stopped_by_budget = True
+        budget_text = _budget_stop_text(seed.get("pattern_diagnostics"))
+        if budget_text:
+            print(f"  [Budget] {budget_text}")
 
     if not patterns:
         finalize_pattern_diagnostics(seed, connections_found=0)
@@ -9751,12 +9812,20 @@ def run_cycle(
             break
 
         print(f"  [Jump] Pattern {i+1}: {pattern['pattern_name']} → searching...")
-        connection, jump_attempt = lateral_jump_with_diagnostics(
+        connection, jump_attempt = _call_with_cycle_budget(
+            lateral_jump_with_diagnostics,
             pattern,
             seed["name"],
             seed["category"],
+            cycle_budget=cycle_budget,
         )
         append_jump_attempt_diagnostic(seed, jump_attempt)
+        if _jump_budget_exhausted(jump_attempt):
+            cycle_stopped_by_budget = True
+            budget_text = _budget_stop_text(jump_attempt)
+            if budget_text:
+                print(f"  [Budget] {budget_text}")
+            break
         if connection is None:
             print("  [Jump] No connection found")
             consecutive_misses += 1
@@ -9801,11 +9870,17 @@ def run_cycle(
         update_domain_visited(hop_seed["name"], hop_seed["category"])
 
         print("  [Hop-2 Dive] Searching and extracting patterns...")
-        hop_patterns = dive(hop_seed)
+        hop_patterns = _call_with_cycle_budget(dive, hop_seed, cycle_budget=cycle_budget)
         print(f"  [Hop-2 Dive] Found {len(hop_patterns)} patterns")
         hop_pattern_diag_text = _pattern_diagnostic_text(hop_seed)
         if hop_pattern_diag_text:
             print(f"  [Hop-2 Dive] Pattern quality: {hop_pattern_diag_text}")
+        if _pattern_budget_exhausted(hop_seed):
+            cycle_stopped_by_budget = True
+            budget_text = _budget_stop_text(hop_seed.get("pattern_diagnostics"))
+            if budget_text:
+                print(f"  [Budget] {budget_text}")
+            break
         if not hop_patterns:
             continue
 
@@ -9835,12 +9910,20 @@ def run_cycle(
                 f"  [Hop-2 Jump] Pattern {j+1}: "
                 f"{hop_pattern['pattern_name']} → searching..."
             )
-            second_connection, hop_jump_attempt = lateral_jump_with_diagnostics(
+            second_connection, hop_jump_attempt = _call_with_cycle_budget(
+                lateral_jump_with_diagnostics,
                 hop_pattern,
                 hop_seed["name"],
                 hop_seed["category"],
+                cycle_budget=cycle_budget,
             )
             append_jump_attempt_diagnostic(hop_seed, hop_jump_attempt)
+            if _jump_budget_exhausted(hop_jump_attempt):
+                cycle_stopped_by_budget = True
+                budget_text = _budget_stop_text(hop_jump_attempt)
+                if budget_text:
+                    print(f"  [Budget] {budget_text}")
+                break
             if second_connection is None:
                 print("  [Hop-2 Jump] No connection found")
                 hop_consecutive_misses += 1
@@ -9872,6 +9955,9 @@ def run_cycle(
             )
             if tx_sent_2:
                 transmitted = True
+            break
+
+        if cycle_stopped_by_budget:
             break
 
     if connections_found == 0:
