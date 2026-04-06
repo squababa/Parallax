@@ -9242,13 +9242,69 @@ def _build_eval_notes(
     return "\n".join(line for line in lines if line)
 
 
+def _build_eval_budget_result(
+    pair: dict,
+    seed_topic: str,
+    expectation_type: str,
+    budget_outcome: str,
+    budget_text: str | None,
+    candidate: dict | None = None,
+) -> dict:
+    """Build one eval row describing a budget-exhausted partial or empty run."""
+    matched_expected_target = bool(candidate and candidate.get("target_match"))
+    extra_note = (
+        f"{budget_outcome}: {budget_text}"
+        if isinstance(budget_text, str) and budget_text.strip()
+        else budget_outcome
+    )
+    return {
+        "pair_id": pair.get("id"),
+        "category": pair.get("category"),
+        "seed": seed_topic,
+        "expected_target": pair.get("expected_target"),
+        "expectation_type": expectation_type,
+        "actual_target": candidate.get("actual_target") if candidate else None,
+        "transmitted": bool(candidate.get("should_transmit") if candidate else False),
+        "total_score": candidate.get("total_score") if candidate else None,
+        "depth_score": candidate.get("depth_score") if candidate else None,
+        "distance_score": candidate.get("distance_score") if candidate else None,
+        "novelty_score": candidate.get("novelty_score") if candidate else None,
+        "provenance_complete": candidate.get("provenance_ok") if candidate else None,
+        "result_label": "manual_review",
+        "notes": _build_eval_notes(
+            pair,
+            candidate,
+            matched_expected_target=matched_expected_target,
+            extra_note=extra_note,
+        ),
+    }
+
+
 def _run_eval_pair(pair: dict, threshold: float, max_patterns: int) -> dict:
     """Run one golden pair through the direct-hop pipeline and return the stored row payload."""
     seed_topic = _build_eval_seed_topic(pair)
     seed = build_custom_seed(seed_topic)
-    patterns = dive(seed)
+    expectation_type = str(pair.get("expectation_type") or "").strip()
+    cycle_budget = CycleBudget(
+        max_tavily_calls=MAX_TAVILY_CALLS_PER_CYCLE,
+        max_llm_calls=MAX_LLM_CALLS_PER_CYCLE,
+    )
+    patterns = _call_with_cycle_budget(dive, seed, cycle_budget=cycle_budget)
+    if _pattern_budget_exhausted(seed):
+        diagnostics = seed.get("pattern_diagnostics")
+        budget_outcome = (
+            str(diagnostics.get("outcome") or "").strip()
+            if isinstance(diagnostics, dict)
+            else "budget_exhausted_pre_stage1"
+        ) or "budget_exhausted_pre_stage1"
+        return _build_eval_budget_result(
+            pair,
+            seed_topic,
+            expectation_type,
+            budget_outcome,
+            _budget_stop_text(diagnostics if isinstance(diagnostics, dict) else None),
+        )
     if not patterns:
-        expectation_type = str(pair.get("expectation_type") or "").strip()
         if expectation_type == "manual_judge":
             result_label = "manual_review"
         elif expectation_type == "should_find":
@@ -9278,13 +9334,27 @@ def _run_eval_pair(pair: dict, threshold: float, max_patterns: int) -> dict:
         }
 
     candidates: list[dict] = []
+    eval_budget_stop: tuple[str, str | None] | None = None
     effective_max = _effective_pattern_budget(len(patterns), max_patterns)
     for pattern in patterns[:effective_max]:
         print(
             f"  [Eval Jump] {pair.get('id', '')} pattern "
             f"{pattern.get('pattern_name', 'Pattern')} -> searching..."
         )
-        connection = lateral_jump(pattern, seed["name"], seed["category"])
+        connection, jump_diagnostic = _call_with_cycle_budget(
+            lateral_jump_with_diagnostics,
+            pattern,
+            seed["name"],
+            seed["category"],
+            cycle_budget=cycle_budget,
+        )
+        if _jump_budget_exhausted(jump_diagnostic):
+            eval_budget_stop = (
+                str(jump_diagnostic.get("stage1_outcome") or "").strip()
+                or "budget_exhausted_pre_stage1",
+                _budget_stop_text(jump_diagnostic),
+            )
+            break
         if connection is None:
             print("  [Eval Jump] No connection found")
             continue
@@ -9302,7 +9372,17 @@ def _run_eval_pair(pair: dict, threshold: float, max_patterns: int) -> dict:
         candidate["target_match"] = _target_matches_expected(target, pair)
         candidates.append(candidate)
 
-    expectation_type = str(pair.get("expectation_type") or "").strip()
+    if eval_budget_stop is not None:
+        best_partial = max(candidates, key=_candidate_sort_key) if candidates else None
+        return _build_eval_budget_result(
+            pair,
+            seed_topic,
+            expectation_type,
+            eval_budget_stop[0],
+            eval_budget_stop[1],
+            candidate=best_partial,
+        )
+
     matching_candidates = [item for item in candidates if item.get("target_match")]
     matching_transmitted = [
         item for item in matching_candidates if item.get("should_transmit")

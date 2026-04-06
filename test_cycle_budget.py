@@ -346,3 +346,69 @@ def test_run_cycle_treats_pre_stage1_jump_budget_stop_as_terminal_not_miss(
     assert diagnostics["jump_outcome"] == "budget_exhausted_pre_stage1"
     assert len(diagnostics["jump_attempts"]) == 1
     assert diagnostics["jump_attempts"][0]["stage1_outcome"] == "budget_exhausted_pre_stage1"
+
+
+def _eval_pair(expectation_type: str = "should_find") -> dict:
+    return {
+        "id": "eval-1",
+        "category": "Testing",
+        "pair_label": "Budget Eval",
+        "expected_target": "Expected Target",
+        "expectation_type": expectation_type,
+        "notes": "eval fixture",
+    }
+
+
+def test_run_eval_pair_respects_tavily_budget(monkeypatch, temp_db) -> None:
+    tavily_client = FakeTavilyClient()
+
+    monkeypatch.setattr(main, "_build_eval_seed_topic", lambda _pair: "eval topic")
+    monkeypatch.setattr(
+        main,
+        "build_custom_seed",
+        lambda _topic: _manual_seed("first query", "second query"),
+    )
+    monkeypatch.setattr(explore, "_tavily", tavily_client)
+    monkeypatch.setattr(main, "MAX_TAVILY_CALLS_PER_CYCLE", 1)
+    monkeypatch.setattr(main, "MAX_LLM_CALLS_PER_CYCLE", 5)
+
+    result = main._run_eval_pair(_eval_pair(), threshold=0.75, max_patterns=2)
+
+    assert len(tavily_client.calls) == 1
+    assert result["result_label"] == "manual_review"
+    assert result["transmitted"] is False
+    assert "budget_exhausted_seed_search" in result["notes"]
+    assert "seed_search" in result["notes"]
+
+
+def test_run_eval_pair_respects_llm_budget(monkeypatch, temp_db) -> None:
+    _stabilize_pattern_extraction(monkeypatch)
+    tavily_client = FakeTavilyClient()
+    llm_client = FakeLLMClient([_pattern_payload()])
+
+    monkeypatch.setattr(main, "_build_eval_seed_topic", lambda _pair: "eval topic")
+    monkeypatch.setattr(
+        main,
+        "build_custom_seed",
+        lambda _topic: _manual_seed("single query"),
+    )
+    monkeypatch.setattr(explore, "_tavily", tavily_client)
+    monkeypatch.setattr(jump, "_tavily", tavily_client)
+    monkeypatch.setattr(explore, "get_llm_client", lambda: llm_client)
+    monkeypatch.setattr(jump, "_llm_client", llm_client)
+    monkeypatch.setattr(
+        jump,
+        "_build_jump_search_queries",
+        lambda *_args, **_kwargs: ["stage1 transfer query"],
+    )
+    monkeypatch.setattr(main, "MAX_TAVILY_CALLS_PER_CYCLE", 5)
+    monkeypatch.setattr(main, "MAX_LLM_CALLS_PER_CYCLE", 1)
+
+    result = main._run_eval_pair(_eval_pair(), threshold=0.75, max_patterns=2)
+
+    assert len(tavily_client.calls) == 3
+    assert llm_client.calls == 1
+    assert result["result_label"] == "manual_review"
+    assert result["transmitted"] is False
+    assert "budget_exhausted_stage1" in result["notes"]
+    assert "stage1_detect" in result["notes"]
