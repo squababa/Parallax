@@ -1,26 +1,42 @@
 import copy
-import re
-from urllib.parse import urlparse
 
 from jump_pre_stage1 import (
     PreStage1Dependencies,
     augment_pre_stage1_with_query,
     run_pre_stage1,
 )
+from jump_types import JumpQueryBuildResult
 
 
 ACADEMIC_DOMAINS = ("academic.test",)
+PRIMARY_QUERY = "relay gating mismatch"
+BACKUP_QUERY = "backup relay query"
 
 
-def _tokenize(text: str) -> list[str]:
-    return re.findall(r"[a-z0-9]+", str(text or "").lower())
-
-
-def _has_intervention_query_label(labels: list[str] | tuple[str, ...]) -> bool:
-    return any(
-        str(label).strip() in {"solution-biased", "intervention-family"}
-        for label in labels
-        if str(label).strip()
+def _make_jump_query_build_result(
+    queries: list[str] | tuple[str, ...],
+    *,
+    labels: list[str] | tuple[str, ...] | None = None,
+    legacy_built_jump_query: str | None = None,
+    transferable_query_profile: dict[str, object] | None = None,
+    query_collision_guard_applied: bool = False,
+) -> JumpQueryBuildResult:
+    clean_queries = [str(query).strip() for query in queries if str(query).strip()]
+    return JumpQueryBuildResult(
+        built_jump_query=clean_queries[0] if clean_queries else "",
+        built_jump_queries=clean_queries,
+        built_jump_query_labels=[
+            str(label).strip()
+            for label in (labels or [])
+            if str(label).strip()
+        ],
+        legacy_built_jump_query=(
+            str(legacy_built_jump_query).strip()
+            if legacy_built_jump_query is not None
+            else (clean_queries[0] if clean_queries else "")
+        ),
+        transferable_query_profile=dict(transferable_query_profile or {}),
+        query_collision_guard_applied=query_collision_guard_applied,
     )
 
 
@@ -28,107 +44,14 @@ def _make_deps(
     search_responses: dict[tuple[str, tuple[str, ...]], list[dict]],
     search_calls: list[tuple[str, tuple[str, ...]]],
 ) -> PreStage1Dependencies:
-    def build_jump_search_queries(*_args, **_kwargs) -> list[str]:
-        return ["primary query", "backup query"]
-
-    build_jump_search_queries.last_query_labels = ["mechanism-family"]
-    build_jump_search_queries.last_collision_guard_applied = True
-    build_jump_search_queries.last_legacy_query = "legacy primary query"
-    build_jump_search_queries.last_transferable_query_profile = {"usable": True}
-
-    def jump_source_shaped_terms(*_args, **_kwargs) -> list[str]:
-        return ["relay", "gating", "mismatch"]
-
-    def jump_result_anchor_context(*_args, **_kwargs):
-        return set(), ["relay gating"], {"relay", "gating"}
-
-    def sanitize(text: object) -> str:
-        return " ".join(str(text or "").split()).strip()
-
-    def normalize_jump_result_host(url: str) -> str:
-        return urlparse(url).netloc.lower()
-
-    def jump_result_mentions_source_domain(*_args, **_kwargs) -> bool:
-        return False
-
-    def host_matches_jump_include_domains(
-        normalized_host: str,
-        include_domains: tuple[str, ...],
-    ) -> bool:
-        return normalized_host in include_domains
-
-    def classify_weak_jump_result(
-        title_text: str,
-        _url: str,
-        clean: str,
-        _preferred_anchor_phrases: list[str],
-        _strong_anchor_tokens: set[str],
-    ) -> tuple[bool, dict[str, object]]:
-        title_lower = title_text.lower()
-        clean_lower = clean.lower()
-        if "broad" in title_lower:
-            return True, {
-                "reason_codes": ["broad_page"],
-            }
-        adjacent = "adjacent" in title_lower
-        intervention_evidence = "workaround" in clean_lower or "operator" in clean_lower
-        solution_marker_count = int(intervention_evidence)
-        return False, {
-            "anchor_overlap": 3 if "anchored" in title_lower else 1,
-            "preferred_phrase_match": "anchored" in title_lower,
-            "solution_marker_count": solution_marker_count,
-            "adjacent_strength": 6 if adjacent else 2,
-            "intervention_marker_count": solution_marker_count,
-            "intervention_evidence": intervention_evidence,
-            "intervention_signal": "operator response" if "operator" in clean_lower else "",
-            "triage_class": "adjacent" if adjacent else "keep",
-        }
-
-    def build_jump_search_content(
-        merged_results: list[dict],
-        _blocked_cluster_tokens: set[str],
-        _strong_anchor_tokens: set[str],
-    ):
-        titles = [
-            str(result.get("title_text", "") or "").strip()
-            for result in merged_results
-            if str(result.get("title_text", "") or "").strip()
-        ]
-        adjacent_count = sum(
-            1 for result in merged_results if result.get("triage_class") == "adjacent"
+    def build_jump_search_queries(*_args, **_kwargs) -> JumpQueryBuildResult:
+        return _make_jump_query_build_result(
+            [PRIMARY_QUERY, BACKUP_QUERY],
+            labels=["mechanism-family"],
+            legacy_built_jump_query="legacy primary query",
+            transferable_query_profile={"usable": True},
+            query_collision_guard_applied=True,
         )
-        intervention_count = sum(
-            1 for result in merged_results if result.get("intervention_evidence")
-        )
-        return (
-            "\n".join(f"Title: {title}" for title in titles),
-            [
-                {"url": str(result.get("url", "") or "").strip()}
-                for result in merged_results
-            ],
-            titles,
-            [
-                {
-                    "cluster_hint": titles[0] if titles else "",
-                    "intervention_score": intervention_count,
-                }
-            ]
-            if titles
-            else [],
-            adjacent_count > 0,
-            {
-                "packet_quality": "adjacent_compressed" if adjacent_count else "focused",
-                "highlighted_evidence_count": len(merged_results),
-                "adjacent_highlighted_count": adjacent_count,
-                "adjacent_suppressed_count": 0,
-            },
-        )
-
-    def should_attempt_alternate_jump_retrieval(*_args, **_kwargs) -> bool:
-        return False
-
-    def build_alternate_jump_search_query(*_args, **_kwargs) -> str | None:
-        return None
 
     def tavily_search(**kwargs):
         query = str(kwargs.get("query") or "").strip()
@@ -141,25 +64,8 @@ def _make_deps(
     def increment_tavily_calls(_count: int = 1) -> None:
         return None
 
-    def jump_solution_marker_count(text: str) -> int:
-        text_lower = str(text or "").lower()
-        return int("workaround" in text_lower or "operator" in text_lower)
-
     return PreStage1Dependencies(
         build_jump_search_queries=build_jump_search_queries,
-        jump_source_shaped_terms=jump_source_shaped_terms,
-        tokenize_query_terms=_tokenize,
-        jump_solution_marker_count=jump_solution_marker_count,
-        has_intervention_query_label=_has_intervention_query_label,
-        jump_result_anchor_context=jump_result_anchor_context,
-        sanitize=sanitize,
-        normalize_jump_result_host=normalize_jump_result_host,
-        jump_result_mentions_source_domain=jump_result_mentions_source_domain,
-        host_matches_jump_include_domains=host_matches_jump_include_domains,
-        classify_weak_jump_result=classify_weak_jump_result,
-        build_jump_search_content=build_jump_search_content,
-        should_attempt_alternate_jump_retrieval=should_attempt_alternate_jump_retrieval,
-        build_alternate_jump_search_query=build_alternate_jump_search_query,
         tavily_search=tavily_search,
         increment_tavily_calls=increment_tavily_calls,
         academic_jump_include_domains=ACADEMIC_DOMAINS,
@@ -170,7 +76,7 @@ def test_run_pre_stage1_builds_query_plan_merges_results_and_populates_diagnosti
     search_calls: list[tuple[str, tuple[str, ...]]] = []
     deps = _make_deps(
         {
-            ("primary query", ()): [
+            (PRIMARY_QUERY, ()): [
                 {
                     "title": "Anchored relay result",
                     "content": "relay gating evidence",
@@ -182,14 +88,14 @@ def test_run_pre_stage1_builds_query_plan_merges_results_and_populates_diagnosti
                     "url": "https://target.test/background",
                 },
             ],
-            ("backup query", ()): [
+            (BACKUP_QUERY, ()): [
                 {
                     "title": "Anchored relay result",
                     "content": "relay gating workaround evidence",
                     "url": "https://target.test/relay",
                 }
             ],
-            ("primary query", ACADEMIC_DOMAINS): [
+            (PRIMARY_QUERY, ACADEMIC_DOMAINS): [
                 {
                     "title": "Adjacent academic operator note",
                     "content": "operator workaround from academic lane",
@@ -205,6 +111,10 @@ def test_run_pre_stage1_builds_query_plan_merges_results_and_populates_diagnosti
             "pattern_name": "Relay-gated mismatch suppression",
             "abstract_structure": "relay gating suppresses mismatch faults",
             "search_query": "relay gating mismatch suppression",
+            "grounded": {
+                "source_control": "relay gating",
+                "source_metric": "mismatch faults",
+            },
         },
         "Network Protocols",
         "Technology",
@@ -214,7 +124,7 @@ def test_run_pre_stage1_builds_query_plan_merges_results_and_populates_diagnosti
     assert result.stage1_outcome is None
     assert result.state is not None
     assert result.state.packet is not None
-    assert result.diagnostics.built_jump_query == "primary query"
+    assert result.diagnostics.built_jump_query == PRIMARY_QUERY
     assert result.diagnostics.built_jump_query_labels == [
         "mechanism-family",
         "solution-biased",
@@ -223,28 +133,45 @@ def test_run_pre_stage1_builds_query_plan_merges_results_and_populates_diagnosti
     assert result.diagnostics.transferable_used_but_source_shaped is True
     assert result.diagnostics.general_result_count == 3
     assert result.diagnostics.academic_result_count == 1
-    assert result.diagnostics.filtered_result_count == 1
-    assert result.diagnostics.filtered_result_reason_counts == {"broad_page": 1}
-    assert result.diagnostics.result_count == 2
-    assert result.diagnostics.adjacent_result_count == 1
-    assert result.diagnostics.intervention_promoted_result_count == 2
-    assert result.diagnostics.packet_quality == "adjacent_compressed"
-    assert result.diagnostics.top_cluster_hints == ["Anchored relay result"]
-    assert result.diagnostics.benchmark_snapshot == {
-        "source_domain": "Network Protocols",
-        "source_category": "Technology",
-        "pattern_name": "Relay-gated mismatch suppression",
-        "abstract_structure": "relay gating suppresses mismatch faults",
-        "built_jump_query": "primary query",
-        "search_results": (
-            "Title: Anchored relay result\n"
-            "Title: Adjacent academic operator note"
-        ),
-    }
+    assert result.diagnostics.filtered_result_count == 0
+    assert result.diagnostics.filtered_result_reason_counts == {}
+    assert result.diagnostics.result_count == 3
+    assert result.diagnostics.adjacent_result_count == 0
+    assert result.diagnostics.intervention_promoted_result_count == 0
+    assert result.diagnostics.packet_quality == "focused"
+    assert result.diagnostics.top_cluster_hints == [
+        "Anchored relay result",
+        "adjacent academic operator",
+        "Broad background result",
+    ]
+    assert result.diagnostics.benchmark_snapshot is not None
+    assert result.diagnostics.benchmark_snapshot["source_domain"] == "Network Protocols"
+    assert result.diagnostics.benchmark_snapshot["source_category"] == "Technology"
+    assert result.diagnostics.benchmark_snapshot["pattern_name"] == (
+        "Relay-gated mismatch suppression"
+    )
+    assert result.diagnostics.benchmark_snapshot["abstract_structure"] == (
+        "relay gating suppresses mismatch faults"
+    )
+    assert result.diagnostics.benchmark_snapshot["built_jump_query"] == PRIMARY_QUERY
+    assert "Anchored relay result" in result.diagnostics.benchmark_snapshot["search_results"]
+    assert (
+        "Adjacent academic operator note"
+        in result.diagnostics.benchmark_snapshot["search_results"]
+    )
+    assert (
+        "Broad background result"
+        in result.diagnostics.benchmark_snapshot["search_results"]
+    )
+    assert (
+        "Retrieved via: mechanism-family, solution-biased"
+        in result.diagnostics.benchmark_snapshot["search_results"]
+    )
+    assert "Retrieved via: academic" in result.diagnostics.benchmark_snapshot["search_results"]
     assert search_calls == [
-        ("primary query", ()),
-        ("backup query", ()),
-        ("primary query", ACADEMIC_DOMAINS),
+        (PRIMARY_QUERY, ()),
+        (BACKUP_QUERY, ()),
+        (PRIMARY_QUERY, ACADEMIC_DOMAINS),
     ]
     assert result.state.merged_results[0]["query_labels"] == [
         "mechanism-family",
@@ -252,19 +179,96 @@ def test_run_pre_stage1_builds_query_plan_merges_results_and_populates_diagnosti
     ]
 
 
-def test_augment_pre_stage1_with_query_accumulates_counts_and_refreshes_packet() -> None:
+def test_run_pre_stage1_consumes_typed_query_build_result_directly() -> None:
     search_calls: list[tuple[str, tuple[str, ...]]] = []
     deps = _make_deps(
         {
-            ("primary query", ()): [
+            (PRIMARY_QUERY, ()): [
                 {
                     "title": "Anchored relay result",
                     "content": "relay gating evidence",
                     "url": "https://target.test/relay",
                 }
             ],
-            ("backup query", ()): [],
-            ("primary query", ACADEMIC_DOMAINS): [],
+            (BACKUP_QUERY, ()): [],
+            (PRIMARY_QUERY, ACADEMIC_DOMAINS): [],
+        },
+        search_calls,
+    )
+
+    result = run_pre_stage1(
+        {
+            "pattern_name": "Relay-gated mismatch suppression",
+            "abstract_structure": "relay gating suppresses mismatch faults",
+            "search_query": "relay gating mismatch suppression",
+            "grounded": {
+                "source_control": "relay gating",
+                "source_metric": "mismatch faults",
+            },
+        },
+        "Network Protocols",
+        "Technology",
+        deps=deps,
+    )
+
+    assert result.stage1_outcome is None
+    assert result.diagnostics.built_jump_query == PRIMARY_QUERY
+    assert result.diagnostics.built_jump_queries == [PRIMARY_QUERY, BACKUP_QUERY]
+    assert result.diagnostics.built_jump_query_labels == [
+        "mechanism-family",
+        "solution-biased",
+    ]
+    assert result.diagnostics.legacy_built_jump_query == "legacy primary query"
+    assert result.diagnostics.query_collision_guard_applied is True
+
+
+def test_run_pre_stage1_rejects_legacy_query_builder_format() -> None:
+    search_calls: list[tuple[str, tuple[str, ...]]] = []
+    deps = _make_deps({}, search_calls)
+
+    def legacy_build_jump_search_queries(*_args, **_kwargs) -> list[str]:
+        return ["primary query", "backup query"]
+
+    object.__setattr__(
+        deps,
+        "build_jump_search_queries",
+        legacy_build_jump_search_queries,
+    )
+
+    try:
+        run_pre_stage1(
+            {
+                "pattern_name": "Relay-gated mismatch suppression",
+                "abstract_structure": "relay gating suppresses mismatch faults",
+                "search_query": "relay gating mismatch suppression",
+                "grounded": {
+                    "source_control": "relay gating",
+                    "source_metric": "mismatch faults",
+                },
+            },
+            "Network Protocols",
+            "Technology",
+            deps=deps,
+        )
+    except TypeError as exc:
+        assert "JumpQueryBuildResult" in str(exc)
+    else:
+        raise AssertionError("Expected TypeError for legacy query builder format.")
+
+
+def test_augment_pre_stage1_with_query_accumulates_counts_and_refreshes_packet() -> None:
+    search_calls: list[tuple[str, tuple[str, ...]]] = []
+    deps = _make_deps(
+        {
+            (PRIMARY_QUERY, ()): [
+                {
+                    "title": "Anchored relay result",
+                    "content": "relay gating evidence",
+                    "url": "https://target.test/relay",
+                }
+            ],
+            (BACKUP_QUERY, ()): [],
+            (PRIMARY_QUERY, ACADEMIC_DOMAINS): [],
             ("recovery query", ()): [
                 {
                     "title": "Adjacent recovery result",
@@ -288,6 +292,10 @@ def test_augment_pre_stage1_with_query_accumulates_counts_and_refreshes_packet()
             "pattern_name": "Relay-gated mismatch suppression",
             "abstract_structure": "relay gating suppresses mismatch faults",
             "search_query": "relay gating mismatch suppression",
+            "grounded": {
+                "source_control": "relay gating",
+                "source_metric": "mismatch faults",
+            },
         },
         "Network Protocols",
         "Technology",
@@ -314,22 +322,23 @@ def test_augment_pre_stage1_with_query_accumulates_counts_and_refreshes_packet()
     assert augmented.diagnostics.general_result_count == 2
     assert augmented.diagnostics.academic_result_count == 1
     assert augmented.diagnostics.result_count == 3
-    assert augmented.diagnostics.adjacent_result_count == 1
-    assert augmented.diagnostics.intervention_promoted_result_count == 2
-    assert augmented.diagnostics.top_result_titles == [
+    assert augmented.diagnostics.adjacent_result_count == 0
+    assert augmented.diagnostics.intervention_promoted_result_count == 0
+    assert set(augmented.diagnostics.top_result_titles) == {
         "Anchored relay result",
         "Adjacent recovery result",
         "Recovery academic note",
-    ]
-    assert augmented.state.packet.search_content == (
-        "Title: Anchored relay result\n"
-        "Title: Adjacent recovery result\n"
-        "Title: Recovery academic note"
-    )
+    }
+    assert augmented.diagnostics.packet_quality == "focused"
+    assert "Recovery academic note" in augmented.state.packet.search_content
+    assert "Anchored relay result" in augmented.state.packet.search_content
+    assert "Adjacent recovery result" in augmented.state.packet.search_content
+    assert "Retrieved via: soft-gate-academic" in augmented.state.packet.search_content
+    assert "Retrieved via: soft-gate" in augmented.state.packet.search_content
     assert search_calls == [
-        ("primary query", ()),
-        ("backup query", ()),
-        ("primary query", ACADEMIC_DOMAINS),
+        (PRIMARY_QUERY, ()),
+        (BACKUP_QUERY, ()),
+        (PRIMARY_QUERY, ACADEMIC_DOMAINS),
         ("recovery query", ()),
         ("recovery query", ACADEMIC_DOMAINS),
     ]

@@ -43,6 +43,7 @@ import explore
 import jump
 import main
 import store
+from jump_types import JumpQueryBuildResult
 
 
 @pytest.fixture()
@@ -51,6 +52,65 @@ def temp_db(monkeypatch, tmp_path):
     monkeypatch.setattr(store, "DB_PATH", str(db_path))
     store.init_db()
     return db_path
+
+
+def _make_jump_query_build_result(
+    queries: list[str] | tuple[str, ...],
+    *,
+    labels: list[str] | tuple[str, ...] | None = None,
+    legacy_built_jump_query: str | None = None,
+    transferable_query_profile: dict[str, object] | None = None,
+    query_collision_guard_applied: bool = False,
+) -> JumpQueryBuildResult:
+    clean_queries = [str(query).strip() for query in queries if str(query).strip()]
+    return JumpQueryBuildResult(
+        built_jump_query=clean_queries[0] if clean_queries else "",
+        built_jump_queries=clean_queries,
+        built_jump_query_labels=[
+            str(label).strip()
+            for label in (labels or [])
+            if str(label).strip()
+        ],
+        legacy_built_jump_query=(
+            str(legacy_built_jump_query).strip()
+            if legacy_built_jump_query is not None
+            else (clean_queries[0] if clean_queries else "")
+        ),
+        transferable_query_profile=dict(transferable_query_profile or {}),
+        query_collision_guard_applied=query_collision_guard_applied,
+    )
+
+
+def _make_fake_build_jump_search_queries(
+    queries: list[str] | tuple[str, ...],
+    *,
+    labels: list[str] | tuple[str, ...] | None = None,
+    legacy_built_jump_query: str | None = None,
+    transferable_query_profile: dict[str, object] | None = None,
+    query_collision_guard_applied: bool = False,
+):
+    def fake_build_jump_search_queries(*_args, **_kwargs):
+        return _make_jump_query_build_result(
+            queries,
+            labels=labels,
+            legacy_built_jump_query=legacy_built_jump_query,
+            transferable_query_profile=transferable_query_profile,
+            query_collision_guard_applied=query_collision_guard_applied,
+        )
+
+    return fake_build_jump_search_queries
+
+
+def _run_jump_query_build_result(
+    pattern: dict,
+    source_domain: str,
+    source_category: str,
+) -> JumpQueryBuildResult:
+    return jump._build_jump_query_build_result(
+        pattern,
+        source_domain,
+        source_category,
+    )
 
 
 def test_extract_prompt_requires_domain_neutral_transferable_rewrites() -> None:
@@ -750,35 +810,28 @@ def test_build_jump_search_queries_returns_bounded_query_families(
         lambda *_args, **_kwargs: "allocation regimes where threshold gating trades efficiency for overload prevention",
     )
 
-    queries = jump._build_jump_search_queries(
-        {
-            "search_query": "allocation threshold rate efficiency overload routing",
-            "pattern_name": "Threshold-gated overload prevention",
-            "abstract_structure": (
-                "threshold gating slows allocation when overload risk rises above the "
-                "safe operating band"
-            ),
-            "measurable_signal": "allocation efficiency and overload incidents",
-            "control_lever": "change threshold gating and overflow routing",
-        },
+    pattern = {
+        "search_query": "allocation threshold rate efficiency overload routing",
+        "pattern_name": "Threshold-gated overload prevention",
+        "abstract_structure": (
+            "threshold gating slows allocation when overload risk rises above the "
+            "safe operating band"
+        ),
+        "measurable_signal": "allocation efficiency and overload incidents",
+        "control_lever": "change threshold gating and overflow routing",
+    }
+    query_build_result = _run_jump_query_build_result(
+        pattern,
         "Network Protocols",
         "Technology",
     )
+    queries = query_build_result.built_jump_queries
 
-    assert queries == jump._build_jump_search_queries(
-        {
-            "search_query": "allocation threshold rate efficiency overload routing",
-            "pattern_name": "Threshold-gated overload prevention",
-            "abstract_structure": (
-                "threshold gating slows allocation when overload risk rises above the "
-                "safe operating band"
-            ),
-            "measurable_signal": "allocation efficiency and overload incidents",
-            "control_lever": "change threshold gating and overflow routing",
-        },
+    assert queries == _run_jump_query_build_result(
+        pattern,
         "Network Protocols",
         "Technology",
-    )
+    ).built_jump_queries
     assert len(queries) == 3
     assert queries[0] == (
         "allocation regimes where threshold gating trades efficiency for overload prevention"
@@ -788,7 +841,7 @@ def test_build_jump_search_queries_returns_bounded_query_families(
     assert "overflow routing" in queries[1]
     assert "incidents" in queries[2]
     assert queries[2].endswith("failure")
-    assert jump._build_jump_search_queries.last_query_labels == [
+    assert query_build_result.built_jump_query_labels == [
         "mechanism-family",
         "intervention-family",
         "operator-family",
@@ -804,18 +857,20 @@ def test_build_jump_search_queries_uses_next_unused_solution_variant(
         lambda *_args, **_kwargs: "queue threshold throttling latency workaround",
     )
 
-    queries = jump._build_jump_search_queries(
-        {"search_query": "queue threshold throttling latency"},
+    pattern = {"search_query": "queue threshold throttling latency"}
+    query_build_result = _run_jump_query_build_result(
+        pattern,
         "Network Protocols",
         "Technology",
     )
+    queries = query_build_result.built_jump_queries
 
     assert queries == [
         "queue threshold throttling latency workaround",
         "queue threshold throttling latency workaround mitigation",
         "queue threshold throttling latency workaround failure",
     ]
-    assert jump._build_jump_search_queries.last_query_labels == [
+    assert query_build_result.built_jump_query_labels == [
         "mechanism-family",
         "intervention-family",
         "operator-family",
@@ -1002,15 +1057,17 @@ def test_build_jump_search_queries_keeps_family_labels_and_bounded_keyword_queri
 ) -> None:
     monkeypatch.setattr(jump, "_generate_llm_jump_search_query", lambda *_args, **_kwargs: None)
 
-    queries = jump._build_jump_search_queries(
-        _glassblowing_relative_reset_pattern(),
+    pattern = _glassblowing_relative_reset_pattern()
+    query_build_result = _run_jump_query_build_result(
+        pattern,
         "Glassblowing",
         "Manufacturing",
     )
+    queries = query_build_result.built_jump_queries
 
     assert len(queries) == 3
     assert all(4 <= len(query.split()) <= 8 for query in queries)
-    assert jump._build_jump_search_queries.last_query_labels == [
+    assert query_build_result.built_jump_query_labels == [
         "mechanism-family",
         "intervention-family",
         "operator-family",
@@ -1463,40 +1520,33 @@ def test_build_jump_search_queries_strengthens_thin_mechanism_family_spine(
         lambda *_args, **_kwargs: ("finer types gate them earlier", False),
     )
 
-    queries = jump._build_jump_search_queries(
-        {
-            "search_query": "finer types gate them earlier",
-            "pattern_name": "Fine-grained validation gating",
-            "abstract_structure": (
-                "fine-grained validation gating rejects invalid payloads before "
-                "downstream execution"
-            ),
-            "measurable_signal": "invalid payload rate and downstream rejection count",
-            "control_lever": "tighten validation gating granularity before execution",
-        },
+    pattern = {
+        "search_query": "finer types gate them earlier",
+        "pattern_name": "Fine-grained validation gating",
+        "abstract_structure": (
+            "fine-grained validation gating rejects invalid payloads before "
+            "downstream execution"
+        ),
+        "measurable_signal": "invalid payload rate and downstream rejection count",
+        "control_lever": "tighten validation gating granularity before execution",
+    }
+    query_build_result = _run_jump_query_build_result(
+        pattern,
         "Programming Languages",
         "Technology",
     )
+    queries = query_build_result.built_jump_queries
 
-    assert queries == jump._build_jump_search_queries(
-        {
-            "search_query": "finer types gate them earlier",
-            "pattern_name": "Fine-grained validation gating",
-            "abstract_structure": (
-                "fine-grained validation gating rejects invalid payloads before "
-                "downstream execution"
-            ),
-            "measurable_signal": "invalid payload rate and downstream rejection count",
-            "control_lever": "tighten validation gating granularity before execution",
-        },
+    assert queries == _run_jump_query_build_result(
+        pattern,
         "Programming Languages",
         "Technology",
-    )
+    ).built_jump_queries
     assert 1 <= len(queries) <= 3
     assert queries[0] != "finer types gate them earlier"
     assert queries[0].startswith("finer types gate them earlier")
     assert "fine-grained" in queries[0] or "validation" in queries[0]
-    assert jump._build_jump_search_queries.last_query_labels[0] == "mechanism-family"
+    assert query_build_result.built_jump_query_labels[0] == "mechanism-family"
 
 
 def test_build_jump_search_queries_falls_back_from_supplier_drift_but_keeps_family_labels(
@@ -1520,22 +1570,23 @@ def test_build_jump_search_queries_falls_back_from_supplier_drift_but_keeps_fami
         ),
     )
 
-    queries = jump._build_jump_search_queries(
+    query_build_result = _run_jump_query_build_result(
         pattern,
         "Robotics",
         "Technology",
     )
+    queries = query_build_result.built_jump_queries
 
-    assert queries == jump._build_jump_search_queries(
+    assert queries == _run_jump_query_build_result(
         pattern,
         "Robotics",
         "Technology",
-    )
+    ).built_jump_queries
     assert 1 <= len(queries) <= 3
     assert all("supplier" not in query for query in queries)
     assert "ejection decision" in queries[0]
     assert "blocked-unit" in queries[0] or "throughput" in queries[0]
-    assert jump._build_jump_search_queries.last_query_labels == [
+    assert query_build_result.built_jump_query_labels == [
         "mechanism-family",
         "intervention-family",
         "operator-family",
@@ -1547,34 +1598,36 @@ def test_build_jump_search_queries_prefers_transferable_fields_over_grounded_sou
 ) -> None:
     monkeypatch.setattr(jump, "_generate_llm_jump_search_query", lambda *_args, **_kwargs: None)
 
-    queries = jump._build_jump_search_queries(
-        {
-            "pattern_name": "Supply-boundary throttling",
-            "description": "Permeability boundary placement changes source flow.",
-            "abstract_structure": "Location and permeability of the supply boundary shape source flow.",
-            "search_query": "location permeability supply boundary",
-            "measurable_signal": "reservoir permeability and coal flow rate",
-            "control_lever": "change supply boundary location and permeability",
-            "transfer_rationale": "Transfers to systems that gate flow under rising load.",
-            "transferable": {
-                "mechanism": "accumulated load crosses a gating limit and triggers demand rerouting",
-                "control_logic": "move the gating limit or raise the release threshold",
-                "signal_shape": "monotonic load rise to a release threshold",
-            },
-            "grounded": {
-                "source_control": "change supply boundary location and permeability",
-                "source_metric": "reservoir permeability and coal flow rate",
-            },
+    pattern = {
+        "pattern_name": "Supply-boundary throttling",
+        "description": "Permeability boundary placement changes source flow.",
+        "abstract_structure": "Location and permeability of the supply boundary shape source flow.",
+        "search_query": "location permeability supply boundary",
+        "measurable_signal": "reservoir permeability and coal flow rate",
+        "control_lever": "change supply boundary location and permeability",
+        "transfer_rationale": "Transfers to systems that gate flow under rising load.",
+        "transferable": {
+            "mechanism": "accumulated load crosses a gating limit and triggers demand rerouting",
+            "control_logic": "move the gating limit or raise the release threshold",
+            "signal_shape": "monotonic load rise to a release threshold",
         },
+        "grounded": {
+            "source_control": "change supply boundary location and permeability",
+            "source_metric": "reservoir permeability and coal flow rate",
+        },
+    }
+    query_build_result = _run_jump_query_build_result(
+        pattern,
         "Reservoir Engineering",
         "Energy",
     )
+    queries = query_build_result.built_jump_queries
 
     assert 1 <= len(queries) <= 3
     assert "location" not in queries[0]
     assert "permeability" not in queries[0]
     assert "gating" in queries[0] or "rerouting" in queries[0]
-    assert jump._build_jump_search_queries.last_query_labels[0] == "mechanism-family"
+    assert query_build_result.built_jump_query_labels[0] == "mechanism-family"
 
 
 def test_build_jump_search_queries_falls_back_when_transferable_fields_are_low_quality(
@@ -1597,11 +1650,12 @@ def test_build_jump_search_queries_falls_back_when_transferable_fields_are_low_q
         },
     }
 
-    queries = jump._build_jump_search_queries(
+    query_build_result = _run_jump_query_build_result(
         pattern,
         "Network Protocols",
         "Technology",
     )
+    queries = query_build_result.built_jump_queries
 
     assert queries[0] == jump._build_jump_search_query(
         {
@@ -1615,7 +1669,7 @@ def test_build_jump_search_queries_falls_back_when_transferable_fields_are_low_q
         "Network Protocols",
         "Technology",
     )
-    assert jump._build_jump_search_queries.last_transferable_query_profile["usable"] is False
+    assert query_build_result.transferable_query_profile["usable"] is False
 
 
 def test_jump_transferable_query_profile_rejects_backfilled_transferable_fields() -> None:
@@ -1657,11 +1711,12 @@ def test_build_jump_search_queries_exposes_backfilled_transferable_profile_and_f
         }
     )
 
-    queries = jump._build_jump_search_queries(
+    query_build_result = _run_jump_query_build_result(
         pattern,
         "Network Protocols",
         "Technology",
     )
+    queries = query_build_result.built_jump_queries
 
     assert queries[0] == jump._build_jump_search_query(
         {
@@ -1675,13 +1730,13 @@ def test_build_jump_search_queries_exposes_backfilled_transferable_profile_and_f
         "Network Protocols",
         "Technology",
     )
-    assert jump._build_jump_search_queries.last_transferable_query_profile["backfilled"] is True
-    assert jump._build_jump_search_queries.last_transferable_query_profile["backfilled_fields"] == [
+    assert query_build_result.transferable_query_profile["backfilled"] is True
+    assert query_build_result.transferable_query_profile["backfilled_fields"] == [
         "mechanism",
         "control_logic",
         "signal_shape",
     ]
-    assert jump._build_jump_search_queries.last_transferable_query_profile["usable"] is False
+    assert query_build_result.transferable_query_profile["usable"] is False
 
 
 def test_build_jump_search_queries_uses_native_transferable_fields_when_one_field_is_backfilled(
@@ -1719,6 +1774,11 @@ def test_build_jump_search_queries_uses_native_transferable_fields_when_one_fiel
         "Reservoir Engineering",
         "Energy",
     )
+    query_build_result = _run_jump_query_build_result(
+        pattern,
+        "Reservoir Engineering",
+        "Energy",
+    )
 
     assert profile["usable"] is True
     assert profile["backfilled"] is False
@@ -1731,7 +1791,7 @@ def test_build_jump_search_queries_uses_native_transferable_fields_when_one_fiel
     )
     assert query_pattern["measurable_signal"] == "reservoir permeability and coal flow rate"
     assert "permeability" not in queries[0]
-    assert jump._build_jump_search_queries.last_transferable_query_profile["backfilled_fields"] == [
+    assert query_build_result.transferable_query_profile["backfilled_fields"] == [
         "signal_shape"
     ]
 
@@ -1972,23 +2032,20 @@ def test_build_jump_search_queries_falls_back_on_true_source_specific_transferab
         },
     }
 
-    queries = jump._build_jump_search_queries(
+    query_build_result = _run_jump_query_build_result(
         pattern,
         "Dorsal Horn",
         "Neuroscience",
     )
+    queries = query_build_result.built_jump_queries
 
-    assert jump._build_jump_search_queries.last_transferable_query_profile["usable"] is False
+    assert query_build_result.transferable_query_profile["usable"] is False
     assert (
         "transferable_source_leakage"
-        in jump._build_jump_search_queries.last_transferable_query_profile["concerns"]
+        in query_build_result.transferable_query_profile["concerns"]
     )
-    assert "c-fiber" in jump._build_jump_search_queries.last_transferable_query_profile[
-        "source_leakage_terms"
-    ]
-    assert "nociceptor" in jump._build_jump_search_queries.last_transferable_query_profile[
-        "source_leakage_terms"
-    ]
+    assert "c-fiber" in query_build_result.transferable_query_profile["source_leakage_terms"]
+    assert "nociceptor" in query_build_result.transferable_query_profile["source_leakage_terms"]
     assert queries[0] == jump._build_jump_search_query(
         {
             "pattern_name": "Inhibitory gate stabilization",
@@ -2281,16 +2338,15 @@ def test_lateral_jump_with_diagnostics_reports_preserved_natural_language_built_
 def test_lateral_jump_with_diagnostics_distinguishes_transferable_fallback_gate_blocked(
     monkeypatch,
 ) -> None:
-    def fake_build_jump_search_queries(*_args, **_kwargs):
-        return ["threshold cascade fallback query"]
-
-    fake_build_jump_search_queries.last_collision_guard_applied = False
-    fake_build_jump_search_queries.last_legacy_query = "threshold cascade fallback query"
-    fake_build_jump_search_queries.last_transferable_query_profile = {
-        "usable": False,
-        "concerns": ["transferable_source_leakage"],
-    }
-    fake_build_jump_search_queries.last_query_labels = ["base"]
+    fake_build_jump_search_queries = _make_fake_build_jump_search_queries(
+        ["threshold cascade fallback query"],
+        labels=["base"],
+        legacy_built_jump_query="threshold cascade fallback query",
+        transferable_query_profile={
+            "usable": False,
+            "concerns": ["transferable_source_leakage"],
+        },
+    )
 
     monkeypatch.setattr(jump, "_build_jump_search_queries", fake_build_jump_search_queries)
     monkeypatch.setattr(jump._tavily, "search", lambda **_kwargs: {"results": []})
@@ -2312,16 +2368,15 @@ def test_lateral_jump_with_diagnostics_distinguishes_transferable_fallback_gate_
 def test_lateral_jump_with_diagnostics_marks_transferable_used_but_source_shaped(
     monkeypatch,
 ) -> None:
-    def fake_build_jump_search_queries(*_args, **_kwargs):
-        return ["additive increase multiplicative decrease rollback"]
-
-    fake_build_jump_search_queries.last_collision_guard_applied = False
-    fake_build_jump_search_queries.last_legacy_query = "additive increase multiplicative decrease"
-    fake_build_jump_search_queries.last_transferable_query_profile = {
-        "usable": True,
-        "concerns": ["transferable_source_shaped"],
-    }
-    fake_build_jump_search_queries.last_query_labels = ["mechanism-family"]
+    fake_build_jump_search_queries = _make_fake_build_jump_search_queries(
+        ["additive increase multiplicative decrease rollback"],
+        labels=["mechanism-family"],
+        legacy_built_jump_query="additive increase multiplicative decrease",
+        transferable_query_profile={
+            "usable": True,
+            "concerns": ["transferable_source_shaped"],
+        },
+    )
 
     monkeypatch.setattr(jump, "_build_jump_search_queries", fake_build_jump_search_queries)
     monkeypatch.setattr(jump._tavily, "search", lambda **_kwargs: {"results": []})
@@ -2390,20 +2445,29 @@ def test_lateral_jump_with_diagnostics_attempts_one_alternate_retrieval_for_adja
     seen_calls: list[tuple[str, tuple[str, ...] | None]] = []
     tavily_call_counts: list[int] = []
     stage_inputs: dict[str, object] = {}
-    alternate_query = "relay gating control mechanism workaround"
+    pattern = {
+        "pattern_name": "Relay-gated mismatch suppression",
+        "abstract_structure": (
+            "relay gating suppresses mismatch faults before actuator switching"
+        ),
+        "search_query": "relay gating mismatch suppression",
+    }
+    alternate_query = jump._build_alternate_jump_search_query(
+        pattern,
+        "Network Protocols",
+        "Technology",
+        "relay gating mismatch suppression",
+    )
 
     monkeypatch.setattr(
         jump,
         "_build_jump_search_queries",
-        lambda *_args, **_kwargs: [
-            "relay gating mismatch suppression",
-            "relay gating mismatch suppression workaround",
-        ],
-    )
-    monkeypatch.setattr(
-        jump,
-        "_build_alternate_jump_search_query",
-        lambda *_args, **_kwargs: alternate_query,
+        _make_fake_build_jump_search_queries(
+            [
+                "relay gating mismatch suppression",
+                "relay gating mismatch suppression workaround",
+            ]
+        ),
     )
 
     def fake_search(**kwargs):
@@ -2478,11 +2542,7 @@ def test_lateral_jump_with_diagnostics_attempts_one_alternate_retrieval_for_adja
     monkeypatch.setattr(jump, "_stage_two_hypothesize_with_diagnostics", fake_stage_two)
 
     connection, diagnostic = jump.lateral_jump_with_diagnostics(
-        {
-            "pattern_name": "Relay-gated mismatch suppression",
-            "abstract_structure": "relay gating suppresses mismatch faults before actuator switching",
-            "search_query": "relay gating mismatch suppression",
-        },
+        pattern,
         "Network Protocols",
         "Technology",
     )
@@ -3437,24 +3497,11 @@ def test_lateral_jump_with_diagnostics_runs_one_bounded_stage1_soft_gate_recover
     monkeypatch.setattr(
         jump,
         "_build_jump_search_queries",
-        lambda *_args, **_kwargs: [
-            "queue threshold throttling latency",
-            "queue threshold throttling latency workaround",
-        ],
-    )
-    monkeypatch.setattr(
-        jump,
-        "_classify_weak_jump_result",
-        lambda *_args, **_kwargs: (
-            False,
-            {
-                "anchor_overlap": 2,
-                "preferred_phrase_match": True,
-                "solution_marker_count": 0,
-                "intervention_marker_count": 0,
-                "intervention_evidence": False,
-                "intervention_signal": "",
-            },
+        _make_fake_build_jump_search_queries(
+            [
+                "queue threshold throttling latency",
+                "queue threshold throttling latency workaround",
+            ]
         ),
     )
     monkeypatch.setattr(jump, "_stage_one_detect_with_diagnostics", fake_stage_one)
@@ -3517,22 +3564,6 @@ def test_lateral_jump_with_diagnostics_upgrades_weak_signal_after_soft_gate_reco
             ]
         },
     )
-    monkeypatch.setattr(
-        jump,
-        "_classify_weak_jump_result",
-        lambda *_args, **_kwargs: (
-            False,
-            {
-                "anchor_overlap": 2,
-                "preferred_phrase_match": True,
-                "solution_marker_count": 1,
-                "intervention_marker_count": 1,
-                "intervention_evidence": True,
-                "intervention_signal": "operator intervention present",
-            },
-        ),
-    )
-
     def fake_stage_one(**kwargs):
         stage_one_calls.append(kwargs["search_results"])
         if len(stage_one_calls) == 1:
@@ -3972,10 +4003,12 @@ def test_lateral_jump_with_diagnostics_merges_multi_query_results_for_both_stage
     monkeypatch.setattr(
         jump,
         "_build_jump_search_queries",
-        lambda *_args, **_kwargs: [
-            "queue threshold throttling latency",
-            "queue threshold throttling latency workaround",
-        ],
+        _make_fake_build_jump_search_queries(
+            [
+                "queue threshold throttling latency",
+                "queue threshold throttling latency workaround",
+            ]
+        ),
     )
 
     def fake_search(**kwargs):
@@ -4119,10 +4152,12 @@ def test_lateral_jump_with_diagnostics_reports_general_and_academic_result_count
     monkeypatch.setattr(
         jump,
         "_build_jump_search_queries",
-        lambda *_args, **_kwargs: [
-            "queue threshold throttling latency",
-            "queue threshold throttling latency workaround",
-        ],
+        _make_fake_build_jump_search_queries(
+            [
+                "queue threshold throttling latency",
+                "queue threshold throttling latency workaround",
+            ]
+        ),
     )
 
     def fake_search(**kwargs):
@@ -4197,13 +4232,12 @@ def test_lateral_jump_with_diagnostics_reports_general_and_academic_result_count
 def test_lateral_jump_with_diagnostics_drops_same_source_domain_hits_from_snippet_and_url(
     monkeypatch,
 ) -> None:
-    def fake_build_jump_search_queries(*_args, **_kwargs):
-        return ["threshold runaway control"]
-
-    fake_build_jump_search_queries.last_collision_guard_applied = False
-    fake_build_jump_search_queries.last_query_labels = ["mechanism-family"]
-    fake_build_jump_search_queries.last_legacy_query = "threshold runaway control"
-    fake_build_jump_search_queries.last_transferable_query_profile = {"usable": False}
+    fake_build_jump_search_queries = _make_fake_build_jump_search_queries(
+        ["threshold runaway control"],
+        labels=["mechanism-family"],
+        legacy_built_jump_query="threshold runaway control",
+        transferable_query_profile={"usable": False},
+    )
 
     def fake_search(**kwargs):
         if kwargs.get("include_domains"):
@@ -4267,10 +4301,12 @@ def test_lateral_jump_with_diagnostics_clusters_coherent_results_ahead_of_generi
     monkeypatch.setattr(
         jump,
         "_build_jump_search_queries",
-        lambda *_args, **_kwargs: [
-            "queue threshold throttling latency",
-            "queue threshold throttling latency workaround",
-        ],
+        _make_fake_build_jump_search_queries(
+            [
+                "queue threshold throttling latency",
+                "queue threshold throttling latency workaround",
+            ]
+        ),
     )
 
     def fake_search(**kwargs):
@@ -4438,7 +4474,7 @@ def test_lateral_jump_with_diagnostics_keeps_broad_result_with_anchor_overlap(
     monkeypatch.setattr(
         jump,
         "_build_jump_search_queries",
-        lambda *_args, **_kwargs: ["relay gating mismatch suppression"],
+        _make_fake_build_jump_search_queries(["relay gating mismatch suppression"]),
     )
     monkeypatch.setattr(
         jump._tavily,
@@ -4596,7 +4632,7 @@ def test_lateral_jump_with_diagnostics_retains_adjacent_specific_hit_but_drops_b
     monkeypatch.setattr(
         jump,
         "_build_jump_search_queries",
-        lambda *_args, **_kwargs: ["relay gating mismatch suppression"],
+        _make_fake_build_jump_search_queries(["relay gating mismatch suppression"]),
     )
 
     def fake_search(**kwargs):
@@ -4682,7 +4718,7 @@ def test_lateral_jump_with_diagnostics_prefers_anchored_cluster_over_collision_p
     monkeypatch.setattr(
         jump,
         "_build_jump_search_queries",
-        lambda *_args, **_kwargs: ["relay gating mismatch suppression"],
+        _make_fake_build_jump_search_queries(["relay gating mismatch suppression"]),
     )
 
     monkeypatch.setattr(
@@ -4763,7 +4799,7 @@ def test_lateral_jump_with_diagnostics_promotes_intervention_bearing_cluster(
     monkeypatch.setattr(
         jump,
         "_build_jump_search_queries",
-        lambda *_args, **_kwargs: ["gas saturation routing suppression"],
+        _make_fake_build_jump_search_queries(["gas saturation routing suppression"]),
     )
     monkeypatch.setattr(
         jump._tavily,
@@ -4836,7 +4872,7 @@ def test_lateral_jump_with_diagnostics_enriches_stage1_packet_with_evidence_role
     monkeypatch.setattr(
         jump,
         "_build_jump_search_queries",
-        lambda *_args, **_kwargs: ["relay gating mismatch suppression"],
+        _make_fake_build_jump_search_queries(["relay gating mismatch suppression"]),
     )
     monkeypatch.setattr(
         jump._tavily,
@@ -5241,7 +5277,7 @@ def test_lateral_jump_with_diagnostics_does_not_promote_descriptive_process_pape
     monkeypatch.setattr(
         jump,
         "_build_jump_search_queries",
-        lambda *_args, **_kwargs: ["gas saturation routing suppression"],
+        _make_fake_build_jump_search_queries(["gas saturation routing suppression"]),
     )
     monkeypatch.setattr(
         jump._tavily,
@@ -5304,10 +5340,12 @@ def test_lateral_jump_with_diagnostics_prefers_better_solution_bearing_excerpt_f
     monkeypatch.setattr(
         jump,
         "_build_jump_search_queries",
-        lambda *_args, **_kwargs: [
-            "queue threshold throttling latency",
-            "queue threshold throttling latency workaround",
-        ],
+        _make_fake_build_jump_search_queries(
+            [
+                "queue threshold throttling latency",
+                "queue threshold throttling latency workaround",
+            ]
+        ),
     )
 
     def fake_search(**kwargs):
@@ -5385,10 +5423,12 @@ def test_lateral_jump_with_diagnostics_prefers_solution_biased_duplicate_excerpt
     monkeypatch.setattr(
         jump,
         "_build_jump_search_queries",
-        lambda *_args, **_kwargs: [
-            "queue threshold throttling latency",
-            "queue threshold throttling latency workaround",
-        ],
+        _make_fake_build_jump_search_queries(
+            [
+                "queue threshold throttling latency",
+                "queue threshold throttling latency workaround",
+            ]
+        ),
     )
 
     def fake_search(**kwargs):
@@ -5473,10 +5513,12 @@ def test_lateral_jump_with_diagnostics_continues_after_partial_tavily_failure(
     monkeypatch.setattr(
         jump,
         "_build_jump_search_queries",
-        lambda *_args, **_kwargs: [
-            "queue threshold throttling latency",
-            "queue threshold throttling latency workaround",
-        ],
+        _make_fake_build_jump_search_queries(
+            [
+                "queue threshold throttling latency",
+                "queue threshold throttling latency workaround",
+            ]
+        ),
     )
 
     def fake_search(**kwargs):
