@@ -1,0 +1,115 @@
+{
+  "id": "good_transferable_rerouting",
+  "description": "High-signal transferable query with focused evidence clusters and a clear intervention-bearing result.",
+  "source_domain": "Reservoir Engineering",
+  "source_category": "Energy",
+  "llm_jump_query": null,
+  "pattern": {
+    "pattern_name": "Supply-boundary throttling",
+    "abstract_structure": "Location and permeability of the supply boundary shape source flow.",
+    "search_query": "location permeability supply boundary",
+    "measurable_signal": "reservoir permeability and coal flow rate",
+    "control_lever": "change supply boundary location and permeability",
+    "transfer_rationale": "",
+    "transferable": {
+      "mechanism": "accumulated load crosses a gating limit and triggers demand rerouting",
+      "control_logic": "move the gating limit or raise the release threshold",
+      "signal_shape": "monotonic load rise to a release threshold"
+    },
+    "grounded": {
+      "source_control": "change supply boundary location and permeability",
+      "source_metric": "reservoir permeability and coal flow rate"
+    }
+  },
+  "search_responses": [
+    {
+      "query": "monotonic load gating release",
+      "lane": "general",
+      "results": [
+        {
+          "title": "Flow-control threshold rerouting note",
+          "content": "Accumulated load crosses a gating limit and reroutes demand before overload propagates across the constrained path.",
+          "url": "https://target.test/flow-control-threshold"
+        },
+        {
+          "title": "General systems overview",
+          "content": "Introduction overview of general systems and broad background context for flow and control.",
+          "url": "https://overview.test/general-systems"
+        }
+      ]
+    },
+    {
+      "query": "monotonic load gating release release threshold workaround",
+      "lane": "general",
+      "results": [
+        {
+          "title": "Workaround for thresholded rerouting",
+          "content": "Operators tune the gating limit and reroute demand when pressure spikes at startup, a workaround that suppresses overload and restores service.",
+          "url": "https://target.test/rerouting-workaround"
+        }
+      ]
+    },
+    {
+      "query": "monotonic load gating release release threshold failure",
+      "lane": "general",
+      "results": [
+        {
+          "title": "Release-threshold monitoring guide",
+          "content": "Teams monitor backlog growth and release-threshold crossings to decide when to reroute demand.",
+          "url": "https://target.test/threshold-monitoring"
+        }
+      ]
+    },
+    {
+      "query": "monotonic load gating release",
+      "lane": "academic",
+      "results": [
+        {
+          "title": "Threshold-triggered demand rerouting",
+          "content": "Demand rerouting is triggered after cumulative load crosses a gating threshold and service recovers once release windows reopen.",
+          "url": "https://arxiv.org/abs/2604.00002"
+        }
+      ]
+    }
+  ],
+  "stage1_stub": {
+    "data": {
+      "target_domain": "Flow control",
+      "signal": "shared thresholded rerouting",
+      "evidence": "specific evidence",
+      "solution_evidence": "operators tune the gating limit and reroute demand when pressure spikes at startup"
+    },
+    "failure_hint": null
+  },
+  "stage2_stub": {
+    "data": {
+      "no_connection": false,
+      "target_domain": "Flow control"
+    },
+    "failure_hint": null,
+    "incomplete_fields": null
+  },
+  "expect": {
+    "built_queries": [
+      "monotonic load gating release",
+      "monotonic load gating release release threshold workaround",
+      "monotonic load gating release release threshold failure"
+    ],
+    "raw_result_count": 5,
+    "filtered_result_count": 2,
+    "retained_result_count": 3,
+    "cluster_count": 3,
+    "highlighted_evidence_count": 3,
+    "intervention_bearing_result_count": 1,
+    "packet_quality": "focused",
+    "top_cluster_hints": [
+      "workaround thresholded rerouting",
+      "threshold-triggered rerouting",
+      "flow-control rerouting"
+    ],
+    "obvious_source_leakage": false,
+    "stage1_outcome": "detect_signal",
+    "search_call_count": 4,
+    "unexpected_search_calls": 0
+  }
+}

@@ -11,9 +11,8 @@ import re
 from urllib.parse import urlparse
 from tavily import TavilyClient
 from config import TAVILY_API_KEY
+from cycle_budget import CycleBudget, CycleBudgetExhausted
 from hypothesis_validation import (
-    CORE_TARGET_BROAD_PAGE_MARKERS,
-    CORE_TARGET_WEAK_SOURCE_MARKERS,
     MECHANISM_TYPE_V1_VOCAB,
     PROCESS_CONNECTORS,
     normalize_edge_analysis,
@@ -26,6 +25,24 @@ from llm_client import get_llm_client
 from sanitize import sanitize, check_llm_output
 from store import get_relevant_scars, increment_tavily_calls, increment_llm_calls
 from debug_log import log_gemini_output
+import jump_support as _jump_support
+from jump_pre_stage1 import (
+    _build_alternate_jump_search_query,
+    _build_jump_search_content,
+    _classify_weak_jump_result,
+    _has_intervention_query_label,
+    _jump_result_anchor_context,
+    _should_attempt_alternate_jump_retrieval,
+    PreStage1Dependencies,
+    augment_pre_stage1_with_query,
+    run_pre_stage1,
+)
+from jump_types import (
+    JumpAttemptDiagnostic,
+    JumpQueryBuildResult,
+    JumpSearchQueryMetadataResult,
+    JumpReplaySnapshot,
+)
 
 _llm_client = get_llm_client()
 _tavily = TavilyClient(api_key=TAVILY_API_KEY)
@@ -602,6 +619,47 @@ JSON_RETRY_PROMPT = (
     "Your previous response was not valid JSON. Please respond with ONLY valid JSON, "
     "no markdown, no explanation, no trailing commas, no comments. Here is what I need:"
 )
+
+STAGE_ONE_SOLUTION_EVIDENCE_PLACEHOLDERS = {
+    "n a",
+    "na",
+    "n/a",
+    "none",
+    "null",
+    "not applicable",
+    "not available",
+    "no",
+    "no evidence",
+    "no solution evidence",
+    "no workaround evidence",
+    "no mitigation evidence",
+    "no concrete workaround evidence",
+    "unknown",
+    "unspecified",
+}
+
+STAGE_ONE_SOLUTION_EVIDENCE_GENERIC_TOKENS = {
+    "candidate",
+    "cluster",
+    "domain",
+    "evidence",
+    "intervention",
+    "mechanism",
+    "mitigation",
+    "operator",
+    "response",
+    "result",
+    "results",
+    "retrieved",
+    "search",
+    "signal",
+    "snippet",
+    "solution",
+    "supporting",
+    "title",
+    "via",
+    "workaround",
+}
 
 JUMP_QUERY_PROMPT = """Write one compact technical web search query for cross-domain jump retrieval.
 
@@ -1434,6 +1492,43 @@ def _normalize_jump_result_host(url: str) -> str:
     return host
 
 
+def _normalize_jump_scope_text(value: object) -> str:
+    """Normalize one scope or result string for source-domain containment checks."""
+    return " ".join(re.findall(r"[a-z0-9]+", str(value or "").lower())).strip()
+
+
+def _jump_result_mentions_source_domain(
+    title_text: str,
+    clean: str,
+    url: str,
+    normalized_host: str,
+    source_domain: str,
+) -> bool:
+    """Reject same-source-domain hits even when the title omits the source domain."""
+    source_scope = _normalize_jump_scope_text(source_domain)
+    if not source_scope:
+        return False
+    candidate_scope = _normalize_jump_scope_text(
+        " ".join(
+            part
+            for part in (
+                title_text,
+                clean,
+                url,
+                normalized_host,
+            )
+            if str(part or "").strip()
+        )
+    )
+    if not candidate_scope:
+        return False
+    source_tokens = source_scope.split()
+    candidate_tokens = candidate_scope.split()
+    if len(source_tokens) == 1:
+        return source_tokens[0] in set(candidate_tokens)
+    return f" {source_scope} " in f" {candidate_scope} "
+
+
 def _host_matches_jump_include_domains(host: str, include_domains: tuple[str, ...]) -> bool:
     clean_host = str(host or "").strip().lower()
     if not clean_host:
@@ -2128,15 +2223,26 @@ def _build_jump_keyword_query_fragment(
         if len(phrase_tokens) < 2 or len(phrase_tokens) > 3:
             return False
         first_token = phrase_tokens[0]
+        second_token = phrase_tokens[1]
+        second_is_anchor_tail = (
+            second_token in PHRASE_ANCHOR_TAIL_TOKENS
+            or second_token in MECHANISM_QUERY_TOKENS
+        )
         if (
             first_token in blocked_tokens
             or first_token in GENERIC_QUERY_TOKENS
-            or first_token in WEAK_QUERY_TOKENS
+            or (first_token in WEAK_QUERY_TOKENS and not second_is_anchor_tail)
             or first_token in JUMP_QUERY_FILLER_TOKENS
             or first_token in QUERY_PHRASE_STOPWORDS
-            or first_token in OVERLOADED_JUMP_QUERY_TOKENS
+            or (
+                first_token in OVERLOADED_JUMP_QUERY_TOKENS
+                and not second_is_anchor_tail
+            )
             or len(first_token) <= 2
-            or _looks_like_jump_query_verb_token(first_token)
+            or (
+                _looks_like_jump_query_verb_token(first_token)
+                and not second_is_anchor_tail
+            )
         ):
             return False
         weak_relational_count = sum(
@@ -2147,10 +2253,9 @@ def _build_jump_keyword_query_fragment(
         for token in phrase_tokens[1:]:
             if token in WEAK_RELATIONAL_QUERY_TOKENS:
                 continue
-            if (
-                not _is_keyword_token(token)
-                or _looks_like_jump_query_verb_token(token)
-            ):
+            if token == second_token and second_is_anchor_tail:
+                continue
+            if (not _is_keyword_token(token) or _looks_like_jump_query_verb_token(token)):
                 return False
         if not any(
             _is_keyword_phrase_anchor_token(token)
@@ -2164,7 +2269,7 @@ def _build_jump_keyword_query_fragment(
                 for token in phrase_tokens
                 if token not in WEAK_RELATIONAL_QUERY_TOKENS
             )
-        return _is_keyword_token(phrase_tokens[1])
+        return second_is_anchor_tail or _is_keyword_token(phrase_tokens[1])
 
     def _append_part(part: str) -> None:
         nonlocal has_causal_term, has_outcome_term
@@ -2213,8 +2318,7 @@ def _build_jump_keyword_query_fragment(
             anchor_pattern,
             blocked_tokens,
         )
-        best_anchor_phrase = _select_best_jump_anchor_phrase(preferred_anchor_phrases)
-        for phrase in [best_anchor_phrase, *preferred_anchor_phrases]:
+        for phrase in preferred_anchor_phrases:
             normalized_phrase = _trim_jump_query_connector_tail(phrase)
             if (
                 not normalized_phrase
@@ -2750,6 +2854,65 @@ def _preferred_jump_query_anchor_phrases(
     return phrases
 
 
+GENERIC_QUERY_TOKENS = _jump_support.GENERIC_QUERY_TOKENS
+WEAK_QUERY_TOKENS = _jump_support.WEAK_QUERY_TOKENS
+AMBIGUOUS_JUMP_QUERY_TOKENS = _jump_support.AMBIGUOUS_JUMP_QUERY_TOKENS
+OVERLOADED_JUMP_QUERY_TOKENS = _jump_support.OVERLOADED_JUMP_QUERY_TOKENS
+JUMP_TITLE_SIGNATURE_NOISE_TOKENS = _jump_support.JUMP_TITLE_SIGNATURE_NOISE_TOKENS
+MECHANISM_QUERY_TOKENS = _jump_support.MECHANISM_QUERY_TOKENS
+PHRASE_ANCHOR_TAIL_TOKENS = _jump_support.PHRASE_ANCHOR_TAIL_TOKENS
+SOLUTION_EVIDENCE_MARKERS = _jump_support.SOLUTION_EVIDENCE_MARKERS
+INTERVENTION_CONTROL_MARKERS = _jump_support.INTERVENTION_CONTROL_MARKERS
+INTERVENTION_RESPONSE_MARKERS = _jump_support.INTERVENTION_RESPONSE_MARKERS
+INTERVENTION_CONDITION_PHRASES = _jump_support.INTERVENTION_CONDITION_PHRASES
+INTERVENTION_CONDITION_TOKENS = _jump_support.INTERVENTION_CONDITION_TOKENS
+QUERY_PHRASE_STOPWORDS = _jump_support.QUERY_PHRASE_STOPWORDS
+JUMP_QUERY_CAUSAL_VERB_STEMS = _jump_support.JUMP_QUERY_CAUSAL_VERB_STEMS
+JUMP_QUERY_CAUSAL_OUTCOME_HINTS = _jump_support.JUMP_QUERY_CAUSAL_OUTCOME_HINTS
+JUMP_QUERY_CLAUSE_PREFIXES = _jump_support.JUMP_QUERY_CLAUSE_PREFIXES
+JUMP_QUERY_FILLER_TOKENS = _jump_support.JUMP_QUERY_FILLER_TOKENS
+JUMP_SOURCE_LEAKAGE_GENERIC_TOKENS = _jump_support.JUMP_SOURCE_LEAKAGE_GENERIC_TOKENS
+JUMP_BROAD_SOURCE_OVERLAP_TOKENS = _jump_support.JUMP_BROAD_SOURCE_OVERLAP_TOKENS
+
+_tokenize_query_terms = _jump_support._tokenize_query_terms
+_jump_transferable_source_leakage_terms = (
+    _jump_support._jump_transferable_source_leakage_terms
+)
+_jump_exact_domain_blocker_tokens = _jump_support._jump_exact_domain_blocker_tokens
+_is_generic_jump_grounded_source_token = (
+    _jump_support._is_generic_jump_grounded_source_token
+)
+_is_strong_jump_source_specific_token = (
+    _jump_support._is_strong_jump_source_specific_token
+)
+_strong_jump_source_terms = _jump_support._strong_jump_source_terms
+_jump_grounded_source_tokens = _jump_support._jump_grounded_source_tokens
+_jump_source_shaped_terms = _jump_support._jump_source_shaped_terms
+_is_specific_jump_query_token = _jump_support._is_specific_jump_query_token
+_is_concrete_jump_query_token = _jump_support._is_concrete_jump_query_token
+_is_causal_jump_query_token = _jump_support._is_causal_jump_query_token
+_normalize_jump_result_host = _jump_support._normalize_jump_result_host
+_normalize_jump_scope_text = _jump_support._normalize_jump_scope_text
+_jump_result_mentions_source_domain = _jump_support._jump_result_mentions_source_domain
+_host_matches_jump_include_domains = _jump_support._host_matches_jump_include_domains
+_build_jump_title_signature = _jump_support._build_jump_title_signature
+_jump_solution_marker_count = _jump_support._jump_solution_marker_count
+_classify_jump_intervention_evidence = (
+    _jump_support._classify_jump_intervention_evidence
+)
+_jump_legacy_flat_pattern = _jump_support._jump_legacy_flat_pattern
+_normalize_jump_query_clause = _jump_support._normalize_jump_query_clause
+_score_jump_query_clause = _jump_support._score_jump_query_clause
+_jump_transferable_query_profile = _jump_support._jump_transferable_query_profile
+_jump_query_pattern_view = _jump_support._jump_query_pattern_view
+_jump_query_support_context = _jump_support._jump_query_support_context
+_extract_jump_query_phrases = _jump_support._extract_jump_query_phrases
+_preferred_jump_query_anchor_phrases = (
+    _jump_support._preferred_jump_query_anchor_phrases
+)
+_select_best_jump_anchor_phrase = _jump_support._select_best_jump_anchor_phrase
+
+
 def _looks_like_formal_jump_query_token_soup(
     raw_candidate: str,
     candidate_tokens: list[str],
@@ -3207,30 +3370,72 @@ def _build_jump_search_query(
     source_domain: str,
     source_category: str,
 ) -> str:
-    query, _collision_guard_applied = _build_jump_search_query_with_metadata(
-        pattern,
-        source_domain,
-        source_category,
+    query_build_result = _coerce_jump_search_query_metadata_result(
+        _build_jump_search_query_with_metadata(
+            pattern,
+            source_domain,
+            source_category,
+        )
     )
-    return query
+    return query_build_result.built_jump_query
+
+
+def _default_jump_transferable_query_profile() -> dict[str, object]:
+    return {
+        "usable": False,
+        "backfilled": False,
+        "backfilled_fields": [],
+        "has_transferable_fields": False,
+        "concerns": [],
+        "source_leakage_terms": [],
+        "overlap_pairs": [],
+        "fields": {},
+    }
+
+
+def _coerce_jump_search_query_metadata_result(
+    query_build_output: JumpSearchQueryMetadataResult | tuple[str, bool],
+) -> JumpSearchQueryMetadataResult:
+    if isinstance(query_build_output, JumpSearchQueryMetadataResult):
+        return JumpSearchQueryMetadataResult(
+            built_jump_query=str(query_build_output.built_jump_query or "").strip(),
+            legacy_built_jump_query=str(
+                query_build_output.legacy_built_jump_query or ""
+            ).strip(),
+            transferable_query_profile=dict(
+                query_build_output.transferable_query_profile or {}
+            ),
+            query_collision_guard_applied=bool(
+                query_build_output.query_collision_guard_applied
+            ),
+        )
+
+    built_jump_query, query_collision_guard_applied = query_build_output
+    return JumpSearchQueryMetadataResult(
+        built_jump_query=str(built_jump_query or "").strip(),
+        legacy_built_jump_query="",
+        transferable_query_profile=_default_jump_transferable_query_profile(),
+        query_collision_guard_applied=bool(query_collision_guard_applied),
+    )
 
 
 def _build_jump_search_query_with_metadata(
     pattern: dict,
     source_domain: str,
     source_category: str,
-) -> tuple[str, bool]:
+) -> JumpSearchQueryMetadataResult:
     raw_query = str(pattern.get("search_query", "") or "").strip()
     if not raw_query:
-        _build_jump_search_query_with_metadata.last_legacy_query = ""
-        _build_jump_search_query_with_metadata.last_transferable_query_profile = (
-            _jump_transferable_query_profile(
+        return JumpSearchQueryMetadataResult(
+            built_jump_query="",
+            legacy_built_jump_query="",
+            transferable_query_profile=_jump_transferable_query_profile(
                 pattern,
                 source_domain,
                 source_category,
-            )
+            ),
+            query_collision_guard_applied=False,
         )
-        return "", False
 
     query_pattern, transferable_profile = _jump_query_pattern_view(
         pattern,
@@ -3289,10 +3494,6 @@ def _build_jump_search_query_with_metadata(
         source_domain,
         source_category,
     )
-    _build_jump_search_query_with_metadata.last_legacy_query = legacy_query
-    _build_jump_search_query_with_metadata.last_transferable_query_profile = (
-        transferable_profile
-    )
 
     llm_query = _generate_llm_jump_search_query(
         query_pattern,
@@ -3300,6 +3501,8 @@ def _build_jump_search_query_with_metadata(
         source_category,
         heuristic_query,
     )
+    original_llm_query = None
+    llm_query_adjusted = False
     if llm_query:
         original_llm_query = llm_query
         llm_query = _disambiguate_jump_search_query(
@@ -3308,6 +3511,7 @@ def _build_jump_search_query_with_metadata(
             source_domain,
             source_category,
         )
+        llm_query_adjusted = llm_query != original_llm_query
     llm_collision_guard_applied = False
     if llm_query:
         llm_query, llm_collision_guard_applied = _apply_jump_query_collision_guard(
@@ -3315,6 +3519,11 @@ def _build_jump_search_query_with_metadata(
             query_pattern,
             source_domain,
             source_category,
+        )
+        llm_query_adjusted = (
+            llm_query_adjusted
+            or llm_collision_guard_applied
+            or llm_query != original_llm_query
         )
         llm_query = _preserve_jump_query_causal_shape(
             original_llm_query,
@@ -3330,18 +3539,25 @@ def _build_jump_search_query_with_metadata(
             source_category,
             heuristic_query,
         ):
+            llm_query_adjusted = True
             llm_query = None
-    return (
-        llm_query or heuristic_query,
-        heuristic_collision_guard_applied or llm_collision_guard_applied,
+    return JumpSearchQueryMetadataResult(
+        built_jump_query=llm_query or heuristic_query,
+        legacy_built_jump_query=legacy_query,
+        transferable_query_profile=transferable_profile,
+        query_collision_guard_applied=(
+            heuristic_collision_guard_applied
+            or llm_collision_guard_applied
+            or llm_query_adjusted
+        ),
     )
 
 
-def _build_jump_search_queries(
+def _build_jump_query_build_result(
     pattern: dict,
     source_domain: str,
     source_category: str,
-) -> list[str]:
+) -> JumpQueryBuildResult:
     query_pattern, _transferable_profile = _jump_query_pattern_view(
         pattern,
         source_domain,
@@ -3366,9 +3582,19 @@ def _build_jump_search_queries(
             for phrase in _extract_jump_query_phrases(clean_text, blocked_tokens):
                 normalized_phrase = re.sub(r"\s+", " ", phrase).strip()
                 phrase_tokens = _tokenize_query_terms(normalized_phrase)
+                unseen_tokens = [
+                    token for token in phrase_tokens if token not in base_tokens
+                ]
                 if (
                     not phrase_tokens
-                    or all(token in base_tokens for token in phrase_tokens)
+                    or not unseen_tokens
+                    or all(
+                        token in GENERIC_QUERY_TOKENS
+                        or token in WEAK_QUERY_TOKENS
+                        or token in QUERY_PHRASE_STOPWORDS
+                        or len(token) <= 2
+                        for token in unseen_tokens
+                    )
                     or normalized_phrase in seen_terms
                 ):
                     continue
@@ -3457,26 +3683,28 @@ def _build_jump_search_queries(
             break
         return re.sub(r"\s+", " ", " ".join(selected)).strip()
 
-    query, collision_guard_applied = _build_jump_search_query_with_metadata(
-        pattern,
-        source_domain,
-        source_category,
-    )
-    _build_jump_search_queries.last_collision_guard_applied = collision_guard_applied
-    _build_jump_search_queries.last_query_labels = []
-    _build_jump_search_queries.last_legacy_query = str(
-        getattr(_build_jump_search_query_with_metadata, "last_legacy_query", "") or ""
-    ).strip()
-    _build_jump_search_queries.last_transferable_query_profile = dict(
-        getattr(
-            _build_jump_search_query_with_metadata,
-            "last_transferable_query_profile",
-            {},
+    query_metadata_result = _coerce_jump_search_query_metadata_result(
+        _build_jump_search_query_with_metadata(
+            pattern,
+            source_domain,
+            source_category,
         )
-        or {}
+    )
+    query = query_metadata_result.built_jump_query
+    collision_guard_applied = query_metadata_result.query_collision_guard_applied
+    legacy_built_jump_query = query_metadata_result.legacy_built_jump_query
+    transferable_query_profile = dict(
+        query_metadata_result.transferable_query_profile
     )
     if not query:
-        return []
+        return JumpQueryBuildResult(
+            built_jump_query="",
+            built_jump_queries=[],
+            built_jump_query_labels=[],
+            legacy_built_jump_query=legacy_built_jump_query,
+            transferable_query_profile=transferable_query_profile,
+            query_collision_guard_applied=collision_guard_applied,
+        )
 
     intervention_terms = (
         "workaround",
@@ -3532,319 +3760,51 @@ def _build_jump_search_queries(
         seen_queries.add(normalized_query)
         queries.append(normalized_query)
         query_labels.append(label)
-    _build_jump_search_queries.last_query_labels = query_labels
-    return queries
-
-
-_build_jump_search_queries.last_collision_guard_applied = False
-_build_jump_search_queries.last_query_labels = []
-_build_jump_search_queries.last_legacy_query = ""
-_build_jump_search_queries.last_transferable_query_profile = {}
-_build_jump_search_query_with_metadata.last_legacy_query = ""
-_build_jump_search_query_with_metadata.last_transferable_query_profile = {
-    "usable": False,
-    "backfilled": False,
-    "backfilled_fields": [],
-    "has_transferable_fields": False,
-    "concerns": [],
-    "source_leakage_terms": [],
-    "overlap_pairs": [],
-    "fields": {},
-}
-
-
-def _has_intervention_query_label(labels: list[str] | tuple[str, ...]) -> bool:
-    return any(
-        str(label).strip() in {"solution-biased", "intervention-family"}
-        for label in labels
-        if str(label).strip()
+    return JumpQueryBuildResult(
+        built_jump_query=queries[0] if queries else "",
+        built_jump_queries=queries,
+        built_jump_query_labels=query_labels,
+        legacy_built_jump_query=legacy_built_jump_query,
+        transferable_query_profile=transferable_query_profile,
+        query_collision_guard_applied=collision_guard_applied,
     )
 
 
-def _build_alternate_jump_search_query(
+def _build_jump_search_queries(
     pattern: dict,
     source_domain: str,
     source_category: str,
-    base_query: str,
-) -> str:
-    clean_base_query = re.sub(r"\s+", " ", str(base_query or "").strip())
-    blocked_tokens, preferred_anchor_phrases, support_tokens = _jump_query_support_context(
+) -> list[str]:
+    query_build_result = _build_jump_query_build_result(
         pattern,
         source_domain,
         source_category,
     )
-    selected: list[str] = []
-    covered_tokens: set[str] = set()
-    base_tokens = set(_tokenize_query_terms(clean_base_query))
-
-    def _append_part(part: str) -> None:
-        normalized = re.sub(r"\s+", " ", str(part or "").strip().lower())
-        if not normalized or normalized in selected:
-            return
-        selected.append(normalized)
-        covered_tokens.update(_tokenize_query_terms(normalized))
-
-    anchor_phrase = _select_best_jump_anchor_phrase(preferred_anchor_phrases)
-    if anchor_phrase:
-        _append_part(anchor_phrase)
-
-    for token in support_tokens:
-        if (
-            token in covered_tokens
-            or token in base_tokens
-            or token in GENERIC_QUERY_TOKENS
-            or token in WEAK_QUERY_TOKENS
-            or token in OVERLOADED_JUMP_QUERY_TOKENS
-            or len(token) <= 2
-        ):
-            continue
-        _append_part(token)
-        if len(_tokenize_query_terms(" ".join(selected))) >= 4:
-            break
-
-    for term in ("control", "mechanism", "workaround"):
-        if term not in covered_tokens:
-            _append_part(term)
-
-    alternate_query = " ".join(_tokenize_query_terms(" ".join(selected))[:8]).strip()
-    if len(_tokenize_query_terms(alternate_query)) < 4:
-        fallback_tokens = [
-            token
-            for token in _tokenize_query_terms(clean_base_query)
-            if (
-                token not in GENERIC_QUERY_TOKENS
-                and token not in WEAK_QUERY_TOKENS
-                and token not in OVERLOADED_JUMP_QUERY_TOKENS
-            )
-        ]
-        alternate_query = " ".join((fallback_tokens[:4] + ["control", "mechanism", "workaround"])[:8]).strip()
-    if alternate_query == clean_base_query:
-        alternate_query = f"{alternate_query} control workaround".strip()
-    return alternate_query
+    return list(query_build_result.built_jump_queries)
 
 
-def _should_attempt_alternate_jump_retrieval(
-    merged_results: list[dict],
-    clustered_results: list[dict],
-) -> bool:
-    if not merged_results or not clustered_results:
-        return False
-
-    top_cluster_results = list(clustered_results[0].get("results") or [])
-    if not top_cluster_results:
-        return False
-
-    top_cluster_keep_hits = sum(
-        1
-        for result in top_cluster_results
-        if str(result.get("triage_class") or "keep").strip() == "keep"
-    )
-    top_cluster_anchor_max = max(
-        (int(result.get("anchor_overlap") or 0) for result in top_cluster_results),
-        default=0,
-    )
-    top_cluster_intervention_hits = sum(
-        1 for result in top_cluster_results if result.get("intervention_evidence")
-    )
-    total_keep_count = sum(
-        1
-        for result in merged_results
-        if str(result.get("triage_class") or "keep").strip() == "keep"
-    )
-    adjacent_count = sum(
-        1
-        for result in merged_results
-        if str(result.get("triage_class") or "keep").strip() == "adjacent"
-    )
-    thin_underanchored_top_cluster = (
-        top_cluster_anchor_max < 2
-        and top_cluster_intervention_hits == 0
-        and top_cluster_keep_hits <= 1
-    )
-    low_coherence_top_cluster = (
-        len(clustered_results) >= 2 and len(top_cluster_results) <= 1
-    )
-    underanchored_adjacent_packet = (
-        adjacent_count > 0
-        and len(merged_results) >= 2
-        and total_keep_count <= 1
-        and thin_underanchored_top_cluster
-    )
-    broad_underanchored_packet = (
-        low_coherence_top_cluster
-        and len(merged_results) >= 2
-        and adjacent_count > 0
-        and total_keep_count <= 1
-        and thin_underanchored_top_cluster
-    )
-    return underanchored_adjacent_packet or broad_underanchored_packet
-
-
-def _jump_result_anchor_context(
+def _build_pre_stage1_jump_query_build_result(
     pattern: dict,
     source_domain: str,
     source_category: str,
-    queries: list[str],
-) -> tuple[set[str], list[str], set[str]]:
-    blocked_tokens = set(_tokenize_query_terms(source_domain))
-    blocked_tokens.update(_tokenize_query_terms(source_category))
-    preferred_anchor_phrases = _preferred_jump_query_anchor_phrases(pattern, blocked_tokens)
-    strong_anchor_tokens: set[str] = set()
-    for text in (
-        str(pattern.get("control_lever", "") or ""),
-        str(pattern.get("abstract_structure", "") or ""),
-        str(pattern.get("measurable_signal", "") or ""),
-        str(pattern.get("pattern_name", "") or ""),
-        str(pattern.get("transfer_rationale", "") or ""),
-        *(str(query or "") for query in queries),
+) -> JumpQueryBuildResult:
+    legacy_builder = globals().get("_build_jump_search_queries")
+    if (
+        callable(legacy_builder)
+        and legacy_builder is not _ORIGINAL_BUILD_JUMP_SEARCH_QUERIES
     ):
-        for token in _tokenize_query_terms(text):
-            if (
-                token in blocked_tokens
-                or token in GENERIC_QUERY_TOKENS
-                or token in WEAK_QUERY_TOKENS
-                or token in OVERLOADED_JUMP_QUERY_TOKENS
-                or len(token) <= 2
-                or not _is_specific_jump_query_token(token)
-            ):
-                continue
-            strong_anchor_tokens.add(token)
-    return blocked_tokens, preferred_anchor_phrases, strong_anchor_tokens
-
-
-def _score_jump_result_anchor_overlap(
-    title_text: str,
-    url: str,
-    clean: str,
-    preferred_anchor_phrases: list[str],
-    strong_anchor_tokens: set[str],
-) -> tuple[int, bool]:
-    combined_text = " ".join(
-        part for part in (str(title_text or ""), str(clean or "")) if part
-    ).lower()
-    preferred_phrase_match = any(
-        phrase and phrase in combined_text for phrase in preferred_anchor_phrases
-    )
-    text_tokens = set(_tokenize_query_terms(f"{title_text} {clean} {url}"))
-    anchor_overlap = len(text_tokens.intersection(strong_anchor_tokens))
-    return anchor_overlap, preferred_phrase_match
-
-
-def _classify_weak_jump_result(
-    title_text: str,
-    url: str,
-    clean: str,
-    preferred_anchor_phrases: list[str],
-    strong_anchor_tokens: set[str],
-) -> tuple[bool, dict[str, object]]:
-    reference_text = " ".join(
-        part for part in (str(title_text or ""), str(url or "")) if part
-    ).lower()
-    weak_source = any(marker in reference_text for marker in CORE_TARGET_WEAK_SOURCE_MARKERS)
-    broad_page = any(marker in reference_text for marker in CORE_TARGET_BROAD_PAGE_MARKERS)
-    anchor_overlap, preferred_phrase_match = _score_jump_result_anchor_overlap(
-        title_text,
-        url,
-        clean,
-        preferred_anchor_phrases,
-        strong_anchor_tokens,
-    )
-    solution_marker_count = _jump_solution_marker_count(clean)
-    specificity_score = len(
-        {
-            token
-            for token in _tokenize_query_terms(f"{title_text} {clean}")
-            if (
-                len(token) >= 5
-                and token not in GENERIC_QUERY_TOKENS
-                and token not in WEAK_QUERY_TOKENS
-                and token not in JUMP_TITLE_SIGNATURE_NOISE_TOKENS
-                and token not in QUERY_PHRASE_STOPWORDS
-                and token
-                not in {
-                    "background",
-                    "broad",
-                    "context",
-                    "generic",
-                    "general",
-                    "introduction",
-                    "only",
-                    "overview",
-                    "performance",
-                    "system",
-                    "systems",
-                    "tutorial",
-                }
-            )
-        }
-    )
-    reliable_solution_evidence = solution_marker_count > 0 and specificity_score >= 4
-    intervention_context = _classify_jump_intervention_evidence(
-        title_text,
-        clean,
-        anchor_overlap=anchor_overlap,
-        preferred_phrase_match=preferred_phrase_match,
-        strong_anchor_tokens=strong_anchor_tokens,
-        solution_marker_count=solution_marker_count,
-        specificity_score=specificity_score,
-    )
-    intervention_marker_count = int(
-        intervention_context.get("intervention_marker_count") or 0
-    )
-    intervention_evidence = bool(intervention_context.get("intervention_evidence"))
-    # Metadata-only additive signal for later adjacent-result compression.
-    adjacent_strength = min(anchor_overlap, 2)
-    if preferred_phrase_match:
-        adjacent_strength += 2
-    adjacent_strength += min(solution_marker_count, 2)
-    if specificity_score >= 4:
-        adjacent_strength += 1
-    if specificity_score >= 6:
-        adjacent_strength += 1
-    if intervention_evidence:
-        adjacent_strength += 2
-    adjacent_strength += min(intervention_marker_count, 2)
-    strong_grounding_signal = intervention_evidence or reliable_solution_evidence
-    adjacent_retained = (
-        anchor_overlap < 2
-        and not preferred_phrase_match
-        and (
-            ((weak_source or broad_page) and strong_grounding_signal)
-            or (not weak_source and not broad_page and specificity_score >= 6)
+        return legacy_builder(
+            pattern,
+            source_domain,
+            source_category,
         )
+    return _build_jump_query_build_result(
+        pattern,
+        source_domain,
+        source_category,
     )
-    should_drop = (
-        (weak_source or broad_page)
-        and anchor_overlap < 2
-        and not preferred_phrase_match
-        and not strong_grounding_signal
-    )
-    triage_class = "drop" if should_drop else ("adjacent" if adjacent_retained else "keep")
-    reason_codes: list[str] = []
-    if should_drop:
-        if weak_source:
-            reason_codes.append("weak_source")
-        if broad_page:
-            reason_codes.append("broad_page")
-        if anchor_overlap < 2:
-            reason_codes.append("low_anchor_overlap")
-    return should_drop, {
-        "weak_source": weak_source,
-        "broad_page": broad_page,
-        "anchor_overlap": anchor_overlap,
-        "preferred_phrase_match": preferred_phrase_match,
-        "solution_marker_count": solution_marker_count,
-        "specificity_score": specificity_score,
-        "adjacent_strength": adjacent_strength,
-        "triage_class": triage_class,
-        "intervention_marker_count": intervention_marker_count,
-        "intervention_evidence": intervention_evidence,
-        "intervention_signal": str(
-            intervention_context.get("intervention_signal") or ""
-        ).strip(),
-        "reason_codes": reason_codes,
-    }
 
+_ORIGINAL_BUILD_JUMP_SEARCH_QUERIES = _build_jump_search_queries
 
 def _extract_json_substring(text: str) -> str | None:
     """
@@ -3875,7 +3835,13 @@ def _extract_json_substring(text: str) -> str | None:
         return None
 
 
-def _generate_json_with_retry(full_prompt: str, stage: str, max_output_tokens: int) -> str | None:
+def _generate_json_with_retry(
+    full_prompt: str,
+    stage: str,
+    max_output_tokens: int,
+    cycle_budget: CycleBudget | None = None,
+    budget_outcome: str | None = None,
+) -> str | None:
     """Generate JSON with one retry if parsing fails."""
     env_key = {
         "stage1_detect": "BLACKCLAW_JUMP_STAGE1_MAX_OUTPUT_TOKENS",
@@ -3899,6 +3865,11 @@ def _generate_json_with_retry(full_prompt: str, stage: str, max_output_tokens: i
         os.getenv("BLACKCLAW_JUMP_DISABLE_JSON_RETRY", "")
     ).strip().lower() in {"1", "true", "yes", "on"}
     try:
+        if cycle_budget is not None and budget_outcome:
+            cycle_budget.consume_llm(
+                outcome=budget_outcome,
+                callsite=str(stage or "").strip() or "stage1_detect",
+            )
         response = _llm_client.generate_content(
             full_prompt,
             generation_config={
@@ -3920,6 +3891,11 @@ def _generate_json_with_retry(full_prompt: str, stage: str, max_output_tokens: i
             return None
 
         retry_prompt = f"{JSON_RETRY_PROMPT}\n\n{full_prompt}"
+        if cycle_budget is not None and budget_outcome:
+            cycle_budget.consume_llm(
+                outcome=budget_outcome,
+                callsite=str(stage or "").strip() or "stage1_detect",
+            )
         retry_response = _llm_client.generate_content(
             retry_prompt,
             generation_config={
@@ -3935,6 +3911,8 @@ def _generate_json_with_retry(full_prompt: str, stage: str, max_output_tokens: i
             print(f"  [!] Jump {stage} retry output failed safety check")
             return None
         return _extract_json_substring(retry_checked)
+    except CycleBudgetExhausted:
+        raise
     except Exception as e:
         print(f"  [!] Jump {stage} LLM call failed: {e}")
         return None
@@ -6357,17 +6335,110 @@ def salvage_high_value_candidate(
     return repaired_candidate
 
 
+def _normalize_stage_one_solution_evidence_text(value: object) -> str:
+    """Normalize Stage 1 solution evidence for placeholder and grounding checks."""
+    return " ".join(_tokenize_query_terms(str(value or ""))).strip()
+
+
+def _stage_one_solution_evidence_is_placeholder(solution_evidence: str) -> bool:
+    """Return True for empty or placeholder-only solution evidence payloads."""
+    normalized = _normalize_stage_one_solution_evidence_text(solution_evidence)
+    if not normalized:
+        return True
+    if normalized in STAGE_ONE_SOLUTION_EVIDENCE_PLACEHOLDERS:
+        return True
+    return normalized.startswith("no ") and any(
+        token in normalized
+        for token in (
+            "evidence",
+            "intervention",
+            "mitigation",
+            "solution",
+            "workaround",
+        )
+    )
+
+
+def _stage_one_search_result_grounding_tokens(search_results: str) -> set[str]:
+    """Extract non-metadata tokens from Stage 1 title/snippet lines."""
+    evidence_lines: list[str] = []
+    for raw_line in str(search_results or "").splitlines():
+        clean_line = " ".join(str(raw_line or "").split()).strip()
+        if not clean_line:
+            continue
+        lower_line = clean_line.lower()
+        for prefix in ("title:", "snippet:"):
+            if lower_line.startswith(prefix):
+                evidence_lines.append(clean_line[len(prefix):].strip())
+                break
+    corpus = " ".join(evidence_lines).strip() or str(search_results or "")
+    return {
+        token
+        for token in _tokenize_query_terms(corpus)
+        if token not in GENERIC_QUERY_TOKENS
+        and token not in WEAK_QUERY_TOKENS
+        and token not in JUMP_QUERY_FILLER_TOKENS
+        and token not in QUERY_PHRASE_STOPWORDS
+        and token not in STAGE_ONE_SOLUTION_EVIDENCE_GENERIC_TOKENS
+        and len(token) > 2
+    }
+
+
+def _stage_one_solution_evidence_is_grounded(
+    solution_evidence: str,
+    search_results: str,
+) -> bool:
+    """Check that Stage 1 solution evidence is concrete and grounded in retrieved text."""
+    if _stage_one_solution_evidence_is_placeholder(solution_evidence):
+        return False
+    normalized_solution_evidence = " ".join(
+        str(solution_evidence or "").split()
+    ).strip()
+    if not normalized_solution_evidence:
+        return False
+    if normalized_solution_evidence.lower() in str(search_results or "").lower():
+        return True
+
+    grounding_tokens = _stage_one_search_result_grounding_tokens(search_results)
+    solution_tokens = {
+        token
+        for token in _tokenize_query_terms(normalized_solution_evidence)
+        if token not in GENERIC_QUERY_TOKENS
+        and token not in WEAK_QUERY_TOKENS
+        and token not in JUMP_QUERY_FILLER_TOKENS
+        and token not in QUERY_PHRASE_STOPWORDS
+        and token not in STAGE_ONE_SOLUTION_EVIDENCE_GENERIC_TOKENS
+        and len(token) > 2
+    }
+    if not solution_tokens:
+        return False
+    return len(solution_tokens.intersection(grounding_tokens)) >= min(
+        2,
+        len(solution_tokens),
+    )
+
+
 def _stage_one_detect_with_diagnostics(
     source_domain: str,
     abstract_structure: str,
     search_results: str,
+    cycle_budget: CycleBudget | None = None,
 ) -> tuple[dict | None, str | None]:
     prompt = DETECT_PROMPT.format(
         source_domain=source_domain,
         abstract_structure=abstract_structure,
         search_results=search_results,
     )
-    extracted_json = _generate_json_with_retry(prompt, "stage1_detect", 2048)
+    if cycle_budget is None:
+        extracted_json = _generate_json_with_retry(prompt, "stage1_detect", 2048)
+    else:
+        extracted_json = _generate_json_with_retry(
+            prompt,
+            "stage1_detect",
+            2048,
+            cycle_budget=cycle_budget,
+            budget_outcome="budget_exhausted_stage1",
+        )
     if extracted_json is None:
         return None, "generation_failed"
     try:
@@ -6387,7 +6458,10 @@ def _stage_one_detect_with_diagnostics(
     data["target_domain"] = target_domain
     data["signal"] = signal
     data["evidence"] = evidence
-    if not solution_evidence:
+    if not _stage_one_solution_evidence_is_grounded(
+        solution_evidence,
+        search_results,
+    ):
         data.pop("solution_evidence", None)
         return data, "missing_solution_evidence"
     data["solution_evidence"] = solution_evidence
@@ -6762,1227 +6836,148 @@ def _stage_two_hypothesize(
     return data
 
 
-def _build_jump_search_content(
-    merged_results: list[dict],
-    blocked_cluster_tokens: set[str],
-    strong_anchor_tokens: set[str],
-) -> tuple[str, list[dict], list[str], list[dict], bool, dict[str, object]]:
-    def _excerpt_rank(text: str, labels: list[str]) -> tuple[int, int, int, int, int]:
-        tokens = _tokenize_query_terms(text)
-        return (
-            _jump_solution_marker_count(text),
-            len(set(tokens)),
-            len(tokens),
-            len(text),
-            1 if _has_intervention_query_label(labels) else 0,
-        )
-
-    def _clustered_result_rank(
-        result: dict,
-    ) -> tuple[int, int, int, int, int, int, int, int, int, int, int]:
-        clean = str(result.get("clean", "") or "").strip()
-        query_labels = [
-            str(label).strip()
-            for label in (result.get("query_labels") or [])
-            if str(label).strip()
-        ]
-        title_signature = tuple(result.get("title_signature") or ())
-        excerpt_rank = _excerpt_rank(clean, query_labels)
-        intervention_evidence = bool(result.get("intervention_evidence"))
-        triage_class = str(result.get("triage_class") or "keep").strip() or "keep"
-        return (
-            1 if triage_class == "keep" else 0,
-            int(result.get("anchor_overlap") or 0),
-            1 if result.get("preferred_phrase_match") else 0,
-            1 if intervention_evidence else 0,
-            int(result.get("intervention_marker_count") or 0)
-            if intervention_evidence
-            else 0,
-            1 if _has_intervention_query_label(query_labels) else 0,
-            int(result.get("solution_marker_count") or excerpt_rank[0]),
-            len(title_signature),
-            excerpt_rank[1],
-            excerpt_rank[2],
-            excerpt_rank[3],
-        )
-
-    def _is_adjacent_result(result: dict) -> bool:
-        return str(result.get("triage_class") or "keep").strip() == "adjacent"
-
-    def _adjacent_strength(result: dict) -> int:
-        return int(result.get("adjacent_strength") or 0)
-
-    def _stage_one_mechanism_evidence_rank(
-        result: dict,
-    ) -> tuple[int, int, int, int, int, int, int]:
-        clean = str(result.get("clean", "") or "").strip()
-        title_text = str(result.get("title_text", "") or "").strip()
-        query_labels = [
-            str(label).strip()
-            for label in (result.get("query_labels") or [])
-            if str(label).strip()
-        ]
-        token_set = set(_tokenize_query_terms(f"{title_text} {clean}"))
-        mechanism_token_count = len(token_set.intersection(MECHANISM_QUERY_TOKENS))
-        anchor_token_count = len(token_set.intersection(strong_anchor_tokens))
-        excerpt_rank = _excerpt_rank(clean, query_labels)
-        triage_class = str(result.get("triage_class") or "keep").strip() or "keep"
-        return (
-            1 if triage_class == "keep" else 0,
-            1 if result.get("preferred_phrase_match") else 0,
-            int(result.get("anchor_overlap") or 0),
-            anchor_token_count + mechanism_token_count,
-            excerpt_rank[0],
-            excerpt_rank[1],
-            excerpt_rank[2],
-        )
-
-    def _stage_one_intervention_evidence_rank(
-        result: dict,
-    ) -> tuple[int, int, int, int, int, int, int]:
-        clean = str(result.get("clean", "") or "").strip()
-        query_labels = [
-            str(label).strip()
-            for label in (result.get("query_labels") or [])
-            if str(label).strip()
-        ]
-        excerpt_rank = _excerpt_rank(clean, query_labels)
-        return (
-            1 if result.get("intervention_evidence") else 0,
-            int(result.get("intervention_marker_count") or 0),
-            int(result.get("solution_marker_count") or 0),
-            1 if _has_intervention_query_label(query_labels) else 0,
-            int(result.get("anchor_overlap") or 0),
-            1 if result.get("preferred_phrase_match") else 0,
-            excerpt_rank[1],
-        )
-
-    def _mechanism_highlight_predicate(result: dict) -> bool:
-        return (
-            bool(result.get("preferred_phrase_match"))
-            or int(result.get("anchor_overlap") or 0) >= 2
-            or _stage_one_mechanism_evidence_rank(result)[3] >= 3
-        )
-
-    def _intervention_highlight_predicate(result: dict) -> bool:
-        return bool(result.get("intervention_evidence")) or int(
-            result.get("solution_marker_count") or 0
-        ) > 0
-
-    def _operator_response_highlight_predicate(result: dict) -> bool:
-        return (
-            bool(str(result.get("intervention_signal", "") or "").strip())
-            or bool(result.get("intervention_evidence"))
-            or int(result.get("solution_marker_count") or 0) > 0
-        )
-
-    def _stage_one_packet_result_key(result: dict) -> str:
-        return (
-            str(result.get("url", "") or "").strip().lower()
-            or str(result.get("title_text", "") or "").strip().lower()
-            or str(result.get("clean", "") or "").strip().lower()
-        )
-
-    def _compress_adjacent_display_results(
-        cluster_results: list[dict],
-        *,
-        adjacent_heavy_packet: bool,
-    ) -> list[dict]:
-        if not adjacent_heavy_packet:
-            return cluster_results
-        adjacent_results = [
-            result for result in cluster_results if _is_adjacent_result(result)
-        ]
-        keep_results = [
-            result for result in cluster_results if not _is_adjacent_result(result)
-        ]
-        if len(adjacent_results) < 4 or len(adjacent_results) < len(keep_results) + 2:
-            return cluster_results
-
-        selected_adjacent_keys: set[str] = set()
-
-        def _select_adjacent(predicate, ranker) -> None:
-            candidates = [
-                result
-                for result in adjacent_results
-                if predicate(result)
-                and _stage_one_packet_result_key(result) not in selected_adjacent_keys
-            ]
-            if not candidates:
-                return
-            best_result = max(candidates, key=ranker)
-            selected_adjacent_keys.add(_stage_one_packet_result_key(best_result))
-
-        # Keep one strong adjacent per evidence role, plus at most one extra fallback.
-        _select_adjacent(
-            _mechanism_highlight_predicate,
-            lambda result: (
-                _adjacent_strength(result),
-                *_stage_one_mechanism_evidence_rank(result),
-            ),
-        )
-        _select_adjacent(
-            _intervention_highlight_predicate,
-            lambda result: (
-                _adjacent_strength(result),
-                *_stage_one_intervention_evidence_rank(result),
-            ),
-        )
-        _select_adjacent(
-            _operator_response_highlight_predicate,
-            lambda result: (
-                1 if str(result.get("intervention_signal", "") or "").strip() else 0,
-                _adjacent_strength(result),
-                *_stage_one_intervention_evidence_rank(result),
-            ),
-        )
-        remaining_adjacent = [
-            result
-            for result in adjacent_results
-            if _stage_one_packet_result_key(result) not in selected_adjacent_keys
-        ]
-        if remaining_adjacent:
-            best_remaining_adjacent = max(
-                remaining_adjacent,
-                key=lambda result: (
-                    _adjacent_strength(result),
-                    *_stage_one_intervention_evidence_rank(result),
-                    *_stage_one_mechanism_evidence_rank(result),
-                ),
-            )
-            if _adjacent_strength(best_remaining_adjacent) >= 4 or not selected_adjacent_keys:
-                selected_adjacent_keys.add(
-                    _stage_one_packet_result_key(best_remaining_adjacent)
-                )
-
-        return [
-            result
-            for result in cluster_results
-            if not _is_adjacent_result(result)
-            or _stage_one_packet_result_key(result) in selected_adjacent_keys
-        ]
-
-    def _stage_one_adjacent_fallback_rank(
-        result: dict,
-    ) -> tuple[int, int, int, int, int, int, int, int, int, int, int, int, int, int]:
-        return (
-            _adjacent_strength(result),
-            *_stage_one_intervention_evidence_rank(result),
-            *_stage_one_mechanism_evidence_rank(result),
-        )
-
-    def _stage_one_adjacent_highlight_extra_rank(
-        highlight: dict[str, object],
-    ) -> tuple[int, int, int, int, int, int, int, int, int, int, int, int, int, int, int]:
-        result = dict(highlight.get("result") or {})
-        return (
-            _adjacent_strength(result),
-            len(
-                [
-                    label
-                    for label in (highlight.get("labels") or [])
-                    if str(label).strip()
-                ]
-            ),
-            *_stage_one_intervention_evidence_rank(result),
-            *_stage_one_mechanism_evidence_rank(result),
-        )
-
-    def _select_stage_one_evidence_highlights(
-        cluster_results: list[dict],
-    ) -> list[dict[str, object]]:
-        highlight_order: list[str] = []
-        highlights_by_key: dict[str, dict[str, object]] = {}
-
-        def _pick_highlight(label: str, predicate, ranker) -> None:
-            candidates = [result for result in cluster_results if predicate(result)]
-            if not candidates:
-                return
-            best_result = max(candidates, key=ranker)
-            key = _stage_one_packet_result_key(best_result)
-            existing = highlights_by_key.get(key)
-            if existing is None:
-                highlight_order.append(key)
-                highlights_by_key[key] = {
-                    "result": best_result,
-                    "labels": [label],
-                }
-                return
-            labels = existing.setdefault("labels", [])
-            if label not in labels:
-                labels.append(label)
-
-        _pick_highlight(
-            "Mechanism evidence",
-            _mechanism_highlight_predicate,
-            _stage_one_mechanism_evidence_rank,
-        )
-        _pick_highlight(
-            "Intervention/workaround evidence",
-            _intervention_highlight_predicate,
-            _stage_one_intervention_evidence_rank,
-        )
-        _pick_highlight(
-            "Operator response evidence",
-            _operator_response_highlight_predicate,
-            lambda result: (
-                1 if str(result.get("intervention_signal", "") or "").strip() else 0,
-                *_stage_one_intervention_evidence_rank(result),
-            ),
-        )
-        return [highlights_by_key[key] for key in highlight_order]
-
-    clustered_results: list[dict] = []
-    for merged_result in merged_results:
-        title_signature = _build_jump_title_signature(
-            str(merged_result.get("title_text", "") or ""),
-            blocked_cluster_tokens,
-        )
-        normalized_host = _normalize_jump_result_host(str(merged_result.get("url", "") or ""))
-        result_entry = {
-            **merged_result,
-            "title_signature": title_signature,
-            "normalized_host": normalized_host,
-        }
-        matching_cluster: dict | None = None
-        if title_signature:
-            signature_set = set(title_signature)
-            for cluster in clustered_results:
-                cluster_signature = tuple(cluster.get("title_signature") or ())
-                if cluster_signature and cluster_signature == title_signature:
-                    matching_cluster = cluster
-                    break
-            if matching_cluster is None and normalized_host:
-                for cluster in clustered_results:
-                    cluster_signature = tuple(cluster.get("title_signature") or ())
-                    if (
-                        not cluster_signature
-                        or str(cluster.get("normalized_host", "") or "") != normalized_host
-                        or len(signature_set.intersection(cluster_signature)) < 2
-                    ):
-                        continue
-                    matching_cluster = cluster
-                    break
-        if matching_cluster is None:
-            clustered_results.append(
-                {
-                    "title_signature": title_signature,
-                    "normalized_host": normalized_host,
-                    "results": [result_entry],
-                }
-            )
-        else:
-            matching_cluster["results"].append(result_entry)
-
-    for cluster in clustered_results:
-        cluster_results = sorted(
-            cluster.get("results") or [],
-            key=_clustered_result_rank,
-            reverse=True,
-        )
-        cluster["results"] = cluster_results
-        cluster_signature = tuple(cluster.get("title_signature") or ())
-        best_result = cluster_results[0] if cluster_results else {}
-        cluster_hint = " ".join(cluster_signature).strip()
-        if not cluster_hint:
-            cluster_hint = str(best_result.get("title_text", "") or "").strip()
-        if not cluster_hint:
-            cluster_hint = str(cluster.get("normalized_host", "") or "").strip()
-        cluster["cluster_hint"] = cluster_hint or "singleton result"
-        marker_density = (
-            sum(
-                int(
-                    result.get("solution_marker_count")
-                    or _jump_solution_marker_count(str(result.get("clean", "") or ""))
-                )
-                for result in cluster_results
-            )
-            / max(len(cluster_results), 1)
-        )
-        anchor_overlap_total = sum(
-            int(result.get("anchor_overlap") or 0) for result in cluster_results
-        )
-        preferred_phrase_matches = sum(
-            1 for result in cluster_results if result.get("preferred_phrase_match")
-        )
-        keep_hits = sum(
-            1
-            for result in cluster_results
-            if str(result.get("triage_class") or "keep").strip() == "keep"
-        )
-        intervention_hits = sum(
-            1 for result in cluster_results if result.get("intervention_evidence")
-        )
-        intervention_score = sum(
-            int(result.get("intervention_marker_count") or 0)
-            for result in cluster_results
-            if result.get("intervention_evidence")
-        ) + intervention_hits * 2
-        cluster_intervention_signal = next(
-            (
-                str(result.get("intervention_signal") or "").strip()
-                for result in cluster_results
-                if result.get("intervention_evidence")
-                and str(result.get("intervention_signal") or "").strip()
-            ),
-            "",
-        )
-        cluster["intervention_score"] = intervention_score
-        cluster["intervention_signal"] = cluster_intervention_signal
-        best_result_rank = (
-            _clustered_result_rank(best_result)
-            if cluster_results
-            else (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-        )
-        cluster["rank"] = (
-            len(cluster_results),
-            keep_hits,
-            intervention_hits,
-            intervention_score,
-            anchor_overlap_total,
-            preferred_phrase_matches,
-            1
-            if any(
-                _has_intervention_query_label(result.get("query_labels") or [])
-                for result in cluster_results
-            )
-            else 0,
-            marker_density,
-            best_result_rank[4],
-            best_result_rank[5],
-            best_result_rank[6],
-            len(cluster_signature),
-        )
-
-    clustered_results.sort(
-        key=lambda cluster: cluster.get("rank")
-        or (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
-        reverse=True,
-    )
-    adjacent_result_count = sum(
-        1 for result in merged_results if _is_adjacent_result(result)
-    )
-    keep_result_count = sum(
-        1 for result in merged_results if not _is_adjacent_result(result)
-    )
-    adjacent_heavy_packet = (
-        adjacent_result_count >= 4
-        and adjacent_result_count >= keep_result_count + 2
-    )
-
-    search_content: list[str] = []
-    raw_target_candidates: list[dict] = []
-    top_titles: list[str] = []
-    enriched_packet = False
-    adjacent_highlighted_count = 0
-    adjacent_suppressed_count = 0
-    cluster_packet_sections: list[dict[str, object]] = []
-
-    for cluster in clustered_results:
-        cluster_hint = str(cluster.get("cluster_hint", "") or "").strip() or "Unknown"
-        cluster_results = list(cluster.get("results") or [])
-        display_cluster_results = _compress_adjacent_display_results(
-            cluster_results,
-            adjacent_heavy_packet=adjacent_heavy_packet,
-        )
-        adjacent_suppressed_count += max(
-            sum(1 for result in cluster_results if _is_adjacent_result(result))
-            - sum(1 for result in display_cluster_results if _is_adjacent_result(result)),
-            0,
-        )
-        fallback_results: list[dict] = []
-        for merged_result in cluster_results:
-            title_text = str(merged_result.get("title_text", "") or "").strip()
-            clean = str(merged_result.get("clean", "") or "").strip()
-            url = str(merged_result.get("url", "") or "").strip()
-            source_reference = url or title_text
-            raw_target_candidates.append(
-                {
-                    "target_excerpt": clean[:500],
-                    "target_url": source_reference or None,
-                    "evaluation_source_reference": " ".join(
-                        part for part in (title_text, url) if part
-                    )
-                    or source_reference
-                    or None,
-                }
-            )
-            if title_text and title_text not in top_titles and len(top_titles) < 3:
-                top_titles.append(title_text)
-        cluster_packet_sections.append(
-            {
-                "cluster": cluster,
-                "cluster_hint": cluster_hint,
-                "cluster_results": cluster_results,
-                "display_cluster_results": display_cluster_results,
-                "highlights": _select_stage_one_evidence_highlights(
-                    display_cluster_results
-                ),
-                "fallback_results": fallback_results,
-            }
-        )
-
-    adjacent_highlight_candidates = [
-        highlight
-        for section in cluster_packet_sections
-        for highlight in list(section.get("highlights") or [])
-        if _is_adjacent_result(dict(highlight.get("result") or {}))
-    ]
-    adjacent_highlight_candidate_count = len(adjacent_highlight_candidates)
-    if adjacent_heavy_packet and len(adjacent_highlight_candidates) > 3:
-        selected_adjacent_highlights: dict[str, dict[str, object]] = {}
-
-        def _adjacent_highlight_key(highlight: dict[str, object]) -> str:
-            return _stage_one_packet_result_key(dict(highlight.get("result") or {}))
-
-        def _pick_adjacent_highlight(
-            label_text: str,
-            ranker,
-        ) -> None:
-            candidates = [
-                highlight
-                for highlight in adjacent_highlight_candidates
-                if label_text in (highlight.get("labels") or [])
-                and _adjacent_highlight_key(highlight)
-                not in selected_adjacent_highlights
-            ]
-            if not candidates:
-                return
-            best_highlight = max(candidates, key=ranker)
-            selected_adjacent_highlights[_adjacent_highlight_key(best_highlight)] = (
-                best_highlight
-            )
-
-        _pick_adjacent_highlight(
-            "Mechanism evidence",
-            lambda highlight: (
-                _adjacent_strength(dict(highlight.get("result") or {})),
-                *_stage_one_mechanism_evidence_rank(
-                    dict(highlight.get("result") or {})
-                ),
-            ),
-        )
-        _pick_adjacent_highlight(
-            "Intervention/workaround evidence",
-            lambda highlight: (
-                _adjacent_strength(dict(highlight.get("result") or {})),
-                *_stage_one_intervention_evidence_rank(
-                    dict(highlight.get("result") or {})
-                ),
-            ),
-        )
-        _pick_adjacent_highlight(
-            "Operator response evidence",
-            lambda highlight: (
-                1
-                if str(
-                    dict(highlight.get("result") or {}).get("intervention_signal") or ""
-                ).strip()
-                else 0,
-                _adjacent_strength(dict(highlight.get("result") or {})),
-                *_stage_one_intervention_evidence_rank(
-                    dict(highlight.get("result") or {})
-                ),
-            ),
-        )
-        remaining_adjacent_highlights = [
-            highlight
-            for highlight in adjacent_highlight_candidates
-            if _adjacent_highlight_key(highlight) not in selected_adjacent_highlights
-        ]
-        if remaining_adjacent_highlights:
-            best_remaining_adjacent_highlight = max(
-                remaining_adjacent_highlights,
-                key=_stage_one_adjacent_highlight_extra_rank,
-            )
-            if (
-                _adjacent_strength(
-                    dict(best_remaining_adjacent_highlight.get("result") or {})
-                )
-                >= 6
-                or not selected_adjacent_highlights
-            ):
-                selected_adjacent_highlights[
-                    _adjacent_highlight_key(best_remaining_adjacent_highlight)
-                ] = best_remaining_adjacent_highlight
-
-        kept_adjacent_highlight_keys = set(selected_adjacent_highlights)
-        for section in cluster_packet_sections:
-            section["highlights"] = [
-                highlight
-                for highlight in list(section.get("highlights") or [])
-                if not _is_adjacent_result(dict(highlight.get("result") or {}))
-                or _stage_one_packet_result_key(dict(highlight.get("result") or {}))
-                in kept_adjacent_highlight_keys
-            ]
-
-    adjacent_highlighted_count = sum(
-        1
-        for section in cluster_packet_sections
-        for highlight in list(section.get("highlights") or [])
-        if _is_adjacent_result(dict(highlight.get("result") or {}))
-    )
-    enriched_packet = any(section.get("highlights") for section in cluster_packet_sections)
-
-    for section in cluster_packet_sections:
-        highlighted_result_keys = {
-            _stage_one_packet_result_key(dict(highlight.get("result") or {}))
-            for highlight in list(section.get("highlights") or [])
-        }
-        section["fallback_results"] = [
-            merged_result
-            for merged_result in list(section.get("display_cluster_results") or [])
-            if _stage_one_packet_result_key(merged_result) not in highlighted_result_keys
-        ]
-
-    adjacent_fallback_budget = 1 if adjacent_highlighted_count > 0 else 2
-    adjacent_fallback_candidates = [
-        result
-        for section in cluster_packet_sections
-        for result in list(section.get("fallback_results") or [])
-        if _is_adjacent_result(result)
-    ]
-    if (
-        adjacent_heavy_packet
-        and len(adjacent_fallback_candidates) > adjacent_fallback_budget
-    ):
-        kept_adjacent_fallback_keys = {
-            _stage_one_packet_result_key(result)
-            for result in sorted(
-                adjacent_fallback_candidates,
-                key=_stage_one_adjacent_fallback_rank,
-                reverse=True,
-            )[:adjacent_fallback_budget]
-        }
-        for section in cluster_packet_sections:
-            filtered_fallback_results: list[dict] = []
-            for result in list(section.get("fallback_results") or []):
-                if not _is_adjacent_result(result):
-                    filtered_fallback_results.append(result)
-                    continue
-                if _stage_one_packet_result_key(result) in kept_adjacent_fallback_keys:
-                    filtered_fallback_results.append(result)
-                    continue
-                adjacent_suppressed_count += 1
-            section["fallback_results"] = filtered_fallback_results
-
-    visible_cluster_sections = [
-        section
-        for section in cluster_packet_sections
-        if (section.get("highlights") or section.get("fallback_results"))
-    ]
-
-    for cluster_index, section in enumerate(visible_cluster_sections, start=1):
-        cluster = dict(section.get("cluster") or {})
-        cluster_hint = str(section.get("cluster_hint", "") or "").strip() or "Unknown"
-        cluster_results = list(section.get("cluster_results") or [])
-        highlights = list(section.get("highlights") or [])
-        fallback_results = list(section.get("fallback_results") or [])
-        search_content.append(f"Candidate cluster {cluster_index}:")
-        search_content.append(f"Cluster hint: {cluster_hint}")
-        search_content.append(f"Supporting results: {len(cluster_results)}")
-        if str(cluster.get("intervention_signal", "") or "").strip():
-            search_content.append(
-                f"Intervention signal: {str(cluster.get('intervention_signal') or '').strip()}"
-            )
-        elif int(cluster.get("intervention_score") or 0) > 0:
-            search_content.append("Intervention evidence: yes")
-        for highlight in highlights:
-            highlighted_result = dict(highlight.get("result") or {})
-            title_text = str(highlighted_result.get("title_text", "") or "").strip()
-            clean = str(highlighted_result.get("clean", "") or "").strip()
-            url = str(highlighted_result.get("url", "") or "").strip()
-            query_label_text = ", ".join(
-                str(label).strip()
-                for label in (highlighted_result.get("query_labels") or [])
-                if str(label).strip()
-            )
-            label_texts = [
-                str(label).strip()
-                for label in (highlight.get("labels") or [])
-                if str(label).strip()
-            ]
-            for label_text in label_texts:
-                search_content.append(f"{label_text}:")
-            if query_label_text:
-                search_content.append(f"Retrieved via: {query_label_text}")
-            search_content.append(f"Title: {title_text or 'Unknown'}")
-            if url:
-                search_content.append(f"URL: {url}")
-            search_content.append(f"Snippet: {clean}")
-        for result_index, merged_result in enumerate(fallback_results[:2], start=1):
-            title_text = str(merged_result.get("title_text", "") or "").strip()
-            clean = str(merged_result.get("clean", "") or "").strip()
-            url = str(merged_result.get("url", "") or "").strip()
-            if result_index <= 2:
-                search_content.append(f"Search result {result_index}:")
-                search_content.append(
-                    f"Retrieved via: {', '.join(merged_result.get('query_labels', []))}"
-                )
-                search_content.append(f"Title: {title_text or 'Unknown'}")
-                if url:
-                    search_content.append(f"URL: {url}")
-                search_content.append(f"Snippet: {clean}")
-        search_content.append("")
-
-    packet_quality = "focused"
-    if adjacent_heavy_packet:
-        packet_quality = (
-            "adjacent_compressed"
-            if (
-                adjacent_suppressed_count > 0
-                or adjacent_highlighted_count < adjacent_highlight_candidate_count
-            )
-            else "adjacent_heavy"
-        )
-
-    return (
-        "\n".join(search_content),
-        raw_target_candidates,
-        top_titles,
-        clustered_results,
-        enriched_packet,
-        {
-            "packet_quality": packet_quality,
-            "adjacent_highlighted_count": adjacent_highlighted_count,
-            "adjacent_suppressed_count": adjacent_suppressed_count,
-        },
+def _make_pre_stage1_dependencies() -> PreStage1Dependencies:
+    return PreStage1Dependencies(
+        build_jump_search_queries=_build_pre_stage1_jump_query_build_result,
+        tavily_search=_tavily.search,
+        increment_tavily_calls=increment_tavily_calls,
+        academic_jump_include_domains=ACADEMIC_JUMP_INCLUDE_DOMAINS,
     )
 
 
-def lateral_jump_with_diagnostics(
-    pattern: dict,
+def _apply_pre_stage1_diagnostics(
+    diagnostic: JumpAttemptDiagnostic,
+    pre_stage1_diagnostics,
+) -> None:
+    diagnostic.update(pre_stage1_diagnostics.to_dict())
+
+
+def _apply_stage_one_diagnostic(
+    diagnostic: JumpAttemptDiagnostic,
+    stage_one: dict | None,
+    stage_one_outcome: str,
+    stage_one_failure_hint: str | None,
+) -> None:
+    diagnostic["stage1_outcome"] = stage_one_outcome
+    diagnostic["stage1_target_domain"] = (
+        str(stage_one.get("target_domain", "") or "").strip()
+        if isinstance(stage_one, dict)
+        else None
+    ) or None
+    diagnostic["stage1_failure_hint"] = (
+        None if stage_one_outcome == "detect_signal" else stage_one_failure_hint
+    )
+
+
+def _return_runtime_terminal_result(
+    diagnostic: JumpAttemptDiagnostic,
+    *,
+    stage_one_outcome: str,
+    stage_one_failure_hint: str | None,
+    stage_one: dict | None = None,
+    budget_stop: dict | None = None,
+) -> tuple[None, JumpAttemptDiagnostic]:
+    _apply_stage_one_diagnostic(
+        diagnostic,
+        stage_one,
+        str(stage_one_outcome or "").strip() or "no_results",
+        stage_one_failure_hint,
+    )
+    if budget_stop is not None:
+        diagnostic["budget_stop"] = budget_stop
+    return None, diagnostic
+
+
+def _apply_runtime_result_context(
+    diagnostic: JumpAttemptDiagnostic,
+    *,
+    pattern: dict | None = None,
+    source_domain: str | None = None,
+    raw_target_candidates: list[dict] | None = None,
+    data: dict | None = None,
+    stage_one: dict | None = None,
+    search_results: str | None = None,
+) -> dict | None:
+    benchmark_snapshot = diagnostic.get("benchmark_snapshot")
+    if isinstance(benchmark_snapshot, dict):
+        if search_results is not None:
+            benchmark_snapshot["search_results"] = search_results
+        if isinstance(stage_one, dict):
+            benchmark_snapshot["stage_one_success"] = dict(stage_one)
+        diagnostic["benchmark_snapshot"] = benchmark_snapshot
+
+    if data is None or pattern is None or source_domain is None:
+        return data
+
+    data["abstract_structure"] = str(pattern.get("abstract_structure", "") or "").strip()
+    target_excerpt, target_url = _select_display_target_evidence(
+        data,
+        raw_target_candidates or [],
+    )
+    seed_url, seed_excerpt = _select_display_source_evidence(
+        pattern,
+        data,
+        source_domain,
+    )
+    if target_url:
+        data["target_url"] = target_url
+    if target_excerpt:
+        data["target_excerpt"] = target_excerpt
+    if seed_url:
+        data["seed_url"] = seed_url
+        data["source_url"] = seed_url
+    if seed_excerpt:
+        data["seed_excerpt"] = seed_excerpt
+        data["source_excerpt"] = seed_excerpt
+    return data
+
+
+def _run_post_pre_stage1_flow(
+    *,
     source_domain: str,
-    source_category: str,
-) -> tuple[dict | None, dict]:
-    """
-    Attempt a lateral jump and return lightweight diagnostics describing where it died.
-    """
-    raw_search_query = str(pattern.get("search_query", "") or "").strip()
-    diagnostic = {
-        "pattern_name": str(pattern.get("pattern_name", "") or "").strip() or "Unknown",
-        "abstract_structure": str(pattern.get("abstract_structure", "") or "").strip(),
-        "raw_search_query": raw_search_query,
-        "legacy_built_jump_query": "",
-        "built_jump_query": None,
-        "built_jump_queries": [],
-        "built_jump_query_labels": [],
-        "transferable_query_profile": {},
-        "transferable_fallback_gate_blocked": False,
-        "transferable_used_but_source_shaped": False,
-        "transferable_used_source_shape_terms": [],
-        "query_collision_guard_applied": False,
-        "result_count": 0,
-        "general_result_count": 0,
-        "academic_result_count": 0,
-        "filtered_result_count": 0,
-        "filtered_result_reason_counts": {},
-        "cluster_count": 0,
-        "top_cluster_hints": [],
-        "top_cluster_intervention_scores": [],
-        "intervention_promoted_result_count": 0,
-        "adjacent_result_count": 0,
-        "adjacent_retained_result_count": 0,
-        "retained_adjacent_result_count": 0,
-        "adjacent_highlighted_count": 0,
-        "adjacent_suppressed_count": 0,
-        "packet_quality": "focused",
-        "alternate_retrieval_attempted": False,
-        "alternate_jump_query": None,
-        "alternate_result_count": 0,
-        "enriched_packet": False,
-        "top_result_titles": [],
-        "stage1_outcome": None,
-        "stage1_target_domain": None,
-        "stage1_failure_hint": None,
-        "stage1_soft_gate_attempted": False,
-        "stage1_soft_gate_recovered": False,
-        "stage2_outcome": None,
-        "stage2_target_domain": None,
-        "stage2_failure_hint": None,
-        "stage2_failed_at": None,
-        "benchmark_snapshot": None,
-    }
+    abstract_structure: str,
+    search_results: str,
+    diagnostic: JumpAttemptDiagnostic,
+    cycle_budget: CycleBudget | None = None,
+    stage_one_success: dict | None = None,
+) -> tuple[dict | None, dict | None, str, str | None]:
+    stage_one = copy.deepcopy(stage_one_success) if isinstance(stage_one_success, dict) else None
+    stage_one_failure_hint = None
 
-    queries = _build_jump_search_queries(
-        pattern,
-        source_domain,
-        source_category,
-    )
-    diagnostic["query_collision_guard_applied"] = bool(
-        getattr(_build_jump_search_queries, "last_collision_guard_applied", False)
-    )
-    diagnostic["legacy_built_jump_query"] = str(
-        getattr(_build_jump_search_queries, "last_legacy_query", "") or ""
-    ).strip()
-    diagnostic["transferable_query_profile"] = dict(
-        getattr(_build_jump_search_queries, "last_transferable_query_profile", {}) or {}
-    )
-    query_labels = [
-        str(label).strip()
-        for label in (getattr(_build_jump_search_queries, "last_query_labels", []) or [])
-        if str(label).strip()
-    ]
-    while len(query_labels) < len(queries):
-        index = len(query_labels)
-        if index == 0:
-            query_labels.append("base")
-        elif index == 1:
-            query_labels.append("solution-biased")
-        else:
-            query_labels.append(f"variant-{index + 1}")
-    query = queries[0] if queries else ""
-    diagnostic["built_jump_query"] = query
-    diagnostic["built_jump_queries"] = queries
-    diagnostic["built_jump_query_labels"] = query_labels[: len(queries)]
-    source_shape_terms = _jump_source_shaped_terms(query, pattern)
-    diagnostic["transferable_fallback_gate_blocked"] = not bool(
-        diagnostic["transferable_query_profile"].get("usable")
-    )
-    diagnostic["transferable_used_but_source_shaped"] = bool(
-        diagnostic["transferable_query_profile"].get("usable")
-    ) and len(source_shape_terms) >= 2
-    diagnostic["transferable_used_source_shape_terms"] = source_shape_terms[:4]
-    if not query:
-        diagnostic["stage1_outcome"] = "no_results"
-        diagnostic["stage1_failure_hint"] = "empty_jump_query"
-        return None, diagnostic
-
-    source_lower = source_domain.lower()
-    category_lower = source_category.lower()
-    merged_results: list[dict] = []
-    merged_result_index: dict[str, int] = {}
-    query_error_count = 0
-    general_result_count = 0
-    academic_result_count = 0
-    filtered_result_reason_counts: dict[str, int] = {}
-    filtered_result_reason_keys: dict[str, set[str]] = {}
-    blocked_cluster_tokens = set(_tokenize_query_terms(source_domain))
-    blocked_cluster_tokens.update(_tokenize_query_terms(source_category))
-    _blocked_anchor_tokens, preferred_anchor_phrases, strong_anchor_tokens = _jump_result_anchor_context(
-        pattern,
-        source_domain,
-        source_category,
-        queries,
-    )
-
-    def _excerpt_rank(text: str, labels: list[str]) -> tuple[int, int, int, int, int]:
-        tokens = _tokenize_query_terms(text)
-        return (
-            _jump_solution_marker_count(text),
-            len(set(tokens)),
-            len(tokens),
-            len(text),
-            1 if _has_intervention_query_label(labels) else 0,
-        )
-
-    def _merge_search_results(
-        raw_results: list[dict],
-        query_label: str,
-        *,
-        include_domains: tuple[str, ...] | None = None,
-    ) -> None:
-        for result in raw_results:
-            title_text = str(result.get("title", "") or "").strip()
-            title = title_text.lower()
-            content = result.get("content", "")
-            if source_lower in title or category_lower in title:
-                continue
-            clean = sanitize(content)
-            if not clean:
-                continue
-            url = str(result.get("url", "") or "").strip()
-            normalized_host = _normalize_jump_result_host(url)
-            if include_domains and not _host_matches_jump_include_domains(
-                normalized_host,
-                include_domains,
-            ):
-                continue
-            should_drop, weak_result_context = _classify_weak_jump_result(
-                title_text,
-                url,
-                clean,
-                preferred_anchor_phrases,
-                strong_anchor_tokens,
-            )
-            if should_drop:
-                filtered_key = (url or title_text or clean).lower()
-                existing_reason_codes = filtered_result_reason_keys.setdefault(
-                    filtered_key,
-                    set(),
-                )
-                if not existing_reason_codes:
-                    diagnostic["filtered_result_count"] += 1
-                for reason_code in weak_result_context.get("reason_codes") or []:
-                    if reason_code in existing_reason_codes:
-                        continue
-                    existing_reason_codes.add(reason_code)
-                    filtered_result_reason_counts[reason_code] = (
-                        filtered_result_reason_counts.get(reason_code, 0) + 1
-                    )
-                continue
-            anchor_overlap = int(weak_result_context.get("anchor_overlap") or 0)
-            preferred_phrase_match = bool(
-                weak_result_context.get("preferred_phrase_match")
-            )
-            solution_marker_count = int(
-                weak_result_context.get("solution_marker_count") or 0
-            )
-            adjacent_strength = int(weak_result_context.get("adjacent_strength") or 0)
-            intervention_marker_count = int(
-                weak_result_context.get("intervention_marker_count") or 0
-            )
-            intervention_evidence = bool(
-                weak_result_context.get("intervention_evidence")
-            )
-            intervention_signal = str(
-                weak_result_context.get("intervention_signal") or ""
-            ).strip()
-            triage_class = str(weak_result_context.get("triage_class") or "keep").strip() or "keep"
-            dedupe_key = (url or title_text or clean).lower()
-            existing_index = merged_result_index.get(dedupe_key)
-            if existing_index is None:
-                merged_result_index[dedupe_key] = len(merged_results)
-                merged_results.append(
-                    {
-                        "title_text": title_text,
-                        "clean": clean,
-                        "url": url,
-                        "query_labels": [query_label],
-                        "anchor_overlap": anchor_overlap,
-                        "preferred_phrase_match": preferred_phrase_match,
-                        "solution_marker_count": solution_marker_count,
-                        "adjacent_strength": adjacent_strength,
-                        "intervention_marker_count": intervention_marker_count,
-                        "intervention_evidence": intervention_evidence,
-                        "intervention_signal": intervention_signal,
-                        "triage_class": triage_class,
-                    }
-                )
-                continue
-            existing_result = merged_results[existing_index]
-            existing_labels = list(existing_result["query_labels"])
-            incoming_labels = [query_label]
-            incoming_rank = _excerpt_rank(clean, incoming_labels)
-            existing_rank = _excerpt_rank(
-                str(existing_result.get("clean", "") or ""),
-                existing_labels,
-            )
-            if incoming_rank > existing_rank:
-                existing_result["clean"] = clean
-                if title_text:
-                    existing_result["title_text"] = title_text
-                existing_result["anchor_overlap"] = anchor_overlap
-                existing_result["preferred_phrase_match"] = preferred_phrase_match
-                existing_result["solution_marker_count"] = solution_marker_count
-                existing_result["adjacent_strength"] = adjacent_strength
-                existing_result["intervention_marker_count"] = intervention_marker_count
-                existing_result["intervention_evidence"] = intervention_evidence
-                existing_result["intervention_signal"] = intervention_signal
-                existing_result["triage_class"] = triage_class
-            else:
-                existing_result["adjacent_strength"] = max(
-                    int(existing_result.get("adjacent_strength") or 0),
-                    adjacent_strength,
-                )
-                existing_result["intervention_marker_count"] = max(
-                    int(existing_result.get("intervention_marker_count") or 0),
-                    intervention_marker_count,
-                )
-                existing_result["intervention_evidence"] = bool(
-                    existing_result.get("intervention_evidence")
-                ) or intervention_evidence
-                if (
-                    intervention_signal
-                    and not str(existing_result.get("intervention_signal") or "").strip()
-                ):
-                    existing_result["intervention_signal"] = intervention_signal
-                existing_triage = str(existing_result.get("triage_class") or "keep").strip() or "keep"
-                if existing_triage != "keep":
-                    existing_result["triage_class"] = (
-                        "keep" if triage_class == "keep" else "adjacent"
-                    )
-            if query_label not in existing_result["query_labels"]:
-                existing_result["query_labels"].append(query_label)
-
-    def _apply_packet_observability(packet_observability: dict[str, object]) -> None:
-        diagnostic["adjacent_highlighted_count"] = int(
-            packet_observability.get("adjacent_highlighted_count") or 0
-        )
-        diagnostic["adjacent_suppressed_count"] = int(
-            packet_observability.get("adjacent_suppressed_count") or 0
-        )
-        diagnostic["packet_quality"] = (
-            str(packet_observability.get("packet_quality") or "focused").strip()
-            or "focused"
-        )
-
-    for index, current_query in enumerate(queries):
-        try:
-            results = _tavily.search(
-                query=current_query,
-                max_results=5,
-                include_answer=False,
-                search_depth="basic",
-            )
-            increment_tavily_calls(1)
-        except Exception as e:
-            print(f"  [!] Tavily search failed for jump query '{current_query}': {e}")
-            query_error_count += 1
-            continue
-
-        raw_results = results.get("results", [])
-        if not isinstance(raw_results, list):
-            raw_results = []
-        general_result_count += len(raw_results)
-
-        query_label = query_labels[index] if index < len(query_labels) else f"variant-{index + 1}"
-        _merge_search_results(raw_results, query_label)
-
-    try:
-        academic_results = _tavily.search(
-            query=query,
-            max_results=5,
-            include_answer=False,
-            search_depth="basic",
-            include_domains=list(ACADEMIC_JUMP_INCLUDE_DOMAINS),
-        )
-        increment_tavily_calls(1)
-    except Exception as e:
-        print(f"  [!] Tavily academic jump search failed for query '{query}': {e}")
-        query_error_count += 1
-        academic_results = {"results": []}
-
-    raw_academic_results = academic_results.get("results", [])
-    if not isinstance(raw_academic_results, list):
-        raw_academic_results = []
-    academic_result_count = len(raw_academic_results)
-    _merge_search_results(
-        raw_academic_results,
-        "academic",
-        include_domains=ACADEMIC_JUMP_INCLUDE_DOMAINS,
-    )
-    diagnostic["general_result_count"] = general_result_count
-    diagnostic["academic_result_count"] = academic_result_count
-    print(
-        f"[Jump] general_results={general_result_count} academic_results={academic_result_count}"
-    )
-
-    diagnostic["filtered_result_reason_counts"] = filtered_result_reason_counts
-
-    if query_error_count == len(queries) + 1:
-        diagnostic["stage1_outcome"] = "no_results"
-        diagnostic["stage1_failure_hint"] = "search_error"
-        return None, diagnostic
-
-    combined, raw_target_candidates, top_titles, clustered_results, enriched_packet, packet_observability = (
-        _build_jump_search_content(
-            merged_results,
-            blocked_cluster_tokens,
-            strong_anchor_tokens,
-        )
-    )
-    _apply_packet_observability(packet_observability)
-    if _should_attempt_alternate_jump_retrieval(merged_results, clustered_results):
-        alternate_query = _build_alternate_jump_search_query(
-            pattern,
-            source_domain,
-            source_category,
-            query,
-        )
-        if alternate_query and alternate_query not in queries:
-            diagnostic["alternate_retrieval_attempted"] = True
-            diagnostic["alternate_jump_query"] = alternate_query
-            try:
-                alternate_results = _tavily.search(
-                    query=alternate_query,
-                    max_results=5,
-                    include_answer=False,
-                    search_depth="basic",
-                )
-                increment_tavily_calls(1)
-            except Exception as e:
-                print(f"  [!] Tavily alternate jump search failed for query '{alternate_query}': {e}")
-                alternate_results = {"results": []}
-            raw_alternate_results = alternate_results.get("results", [])
-            if not isinstance(raw_alternate_results, list):
-                raw_alternate_results = []
-            diagnostic["alternate_result_count"] = len(raw_alternate_results)
-            _merge_search_results(raw_alternate_results, "alternate")
-            combined, raw_target_candidates, top_titles, clustered_results, enriched_packet, packet_observability = (
-                _build_jump_search_content(
-                    merged_results,
-                    blocked_cluster_tokens,
-                    strong_anchor_tokens,
-                )
-            )
-            _apply_packet_observability(packet_observability)
-
-    diagnostic["intervention_promoted_result_count"] = sum(
-        1 for result in merged_results if result.get("intervention_evidence")
-    )
-    adjacent_result_count = sum(
-        1 for result in merged_results if result.get("triage_class") == "adjacent"
-    )
-    diagnostic["adjacent_result_count"] = adjacent_result_count
-    diagnostic["adjacent_retained_result_count"] = adjacent_result_count
-    diagnostic["retained_adjacent_result_count"] = adjacent_result_count
-    diagnostic["result_count"] = len(merged_results)
-    diagnostic["cluster_count"] = len(clustered_results)
-    diagnostic["top_cluster_hints"] = [
-        str(cluster.get("cluster_hint", "") or "").strip()
-        for cluster in clustered_results[:3]
-        if str(cluster.get("cluster_hint", "") or "").strip()
-    ]
-    diagnostic["top_cluster_intervention_scores"] = [
-        int(cluster.get("intervention_score") or 0)
-        for cluster in clustered_results[:3]
-    ]
-    diagnostic["top_result_titles"] = top_titles
-    diagnostic["enriched_packet"] = enriched_packet
-
-    if not combined.strip():
-        diagnostic["stage1_outcome"] = "no_results"
-        diagnostic["stage1_failure_hint"] = "no_usable_results"
-        return None, diagnostic
-    diagnostic["benchmark_snapshot"] = {
-        "source_domain": source_domain,
-        "source_category": source_category,
-        "pattern_name": diagnostic["pattern_name"],
-        "abstract_structure": diagnostic["abstract_structure"],
-        "built_jump_query": query,
-        "search_results": combined,
-    }
-
-    stage_one, stage_one_failure_hint = _stage_one_detect_with_diagnostics(
-        source_domain=source_domain,
-        abstract_structure=pattern.get("abstract_structure", ""),
-        search_results=combined,
-    )
-    stage_one_outcome = _classify_stage_one_outcome(stage_one, stage_one_failure_hint)
-    initial_stage_one = stage_one
-    initial_stage_one_failure_hint = stage_one_failure_hint
-
-    if stage_one_outcome == "weak_signal":
-        diagnostic["stage1_soft_gate_attempted"] = True
-        recovery_query = _build_stage_one_soft_gate_query(
-            query,
-            str(stage_one.get("target_domain", "") or "").strip(),
-        )
-        if recovery_query:
-            try:
-                recovery_results = _tavily.search(
-                    query=recovery_query,
-                    max_results=5,
-                    include_answer=False,
-                    search_depth="basic",
-                )
-                increment_tavily_calls(1)
-            except Exception as e:
-                print(
-                    f"  [!] Tavily soft-gate search failed for jump query '{recovery_query}': {e}"
-                )
-                recovery_results = {"results": []}
-            raw_recovery_results = recovery_results.get("results", [])
-            if not isinstance(raw_recovery_results, list):
-                raw_recovery_results = []
-            general_result_count += len(raw_recovery_results)
-            _merge_search_results(raw_recovery_results, "soft-gate")
-
-            try:
-                recovery_academic_results = _tavily.search(
-                    query=recovery_query,
-                    max_results=5,
-                    include_answer=False,
-                    search_depth="basic",
-                    include_domains=list(ACADEMIC_JUMP_INCLUDE_DOMAINS),
-                )
-                increment_tavily_calls(1)
-            except Exception as e:
-                print(
-                    "[!] Tavily academic soft-gate search failed for jump query "
-                    f"'{recovery_query}': {e}"
-                )
-                recovery_academic_results = {"results": []}
-            raw_recovery_academic_results = recovery_academic_results.get("results", [])
-            if not isinstance(raw_recovery_academic_results, list):
-                raw_recovery_academic_results = []
-            academic_result_count += len(raw_recovery_academic_results)
-            _merge_search_results(
-                raw_recovery_academic_results,
-                "soft-gate-academic",
-                include_domains=ACADEMIC_JUMP_INCLUDE_DOMAINS,
-            )
-
-        diagnostic["general_result_count"] = general_result_count
-        diagnostic["academic_result_count"] = academic_result_count
-        diagnostic["intervention_promoted_result_count"] = sum(
-            1 for result in merged_results if result.get("intervention_evidence")
-        )
-        combined, raw_target_candidates, top_titles, clustered_results, enriched_packet, packet_observability = _build_jump_search_content(
-            merged_results,
-            blocked_cluster_tokens,
-            strong_anchor_tokens,
-        )
-        _apply_packet_observability(packet_observability)
-        diagnostic["result_count"] = len(merged_results)
-        diagnostic["cluster_count"] = len(clustered_results)
-        diagnostic["top_cluster_hints"] = [
-            str(cluster.get("cluster_hint", "") or "").strip()
-            for cluster in clustered_results[:3]
-            if str(cluster.get("cluster_hint", "") or "").strip()
-        ]
-        diagnostic["top_cluster_intervention_scores"] = [
-            int(cluster.get("intervention_score") or 0)
-            for cluster in clustered_results[:3]
-        ]
-        diagnostic["top_result_titles"] = top_titles
-        diagnostic["enriched_packet"] = enriched_packet
-        if isinstance(diagnostic.get("benchmark_snapshot"), dict):
-            diagnostic["benchmark_snapshot"]["search_results"] = combined
-
-        recovered_stage_one, recovered_stage_one_failure_hint = _stage_one_detect_with_diagnostics(
+    if stage_one is None:
+        stage_one, stage_one_failure_hint = _stage_one_detect_with_diagnostics(
             source_domain=source_domain,
-            abstract_structure=pattern.get("abstract_structure", ""),
-            search_results=combined,
+            abstract_structure=abstract_structure,
+            search_results=search_results,
+            cycle_budget=cycle_budget,
         )
-        recovered_stage_one_outcome = _classify_stage_one_outcome(
-            recovered_stage_one,
-            recovered_stage_one_failure_hint,
+        stage_one_outcome = _classify_stage_one_outcome(
+            stage_one,
+            stage_one_failure_hint,
         )
-        if recovered_stage_one_outcome == "detect_signal":
-            stage_one = recovered_stage_one
-            stage_one_failure_hint = None
-            stage_one_outcome = "detect_signal"
-            diagnostic["stage1_soft_gate_recovered"] = True
-        else:
-            stage_one = initial_stage_one
-            stage_one_failure_hint = initial_stage_one_failure_hint
-            stage_one_outcome = "weak_signal"
+    else:
+        stage_one_outcome = "detect_signal"
 
-    if stage_one_outcome != "detect_signal":
-        diagnostic["stage1_outcome"] = stage_one_outcome
-        diagnostic["stage1_target_domain"] = (
-            str(stage_one.get("target_domain", "") or "").strip()
-            if isinstance(stage_one, dict)
-            else None
-        ) or None
-        diagnostic["stage1_failure_hint"] = stage_one_failure_hint
-        return None, diagnostic
-
-    diagnostic["stage1_outcome"] = "detect_signal"
-    diagnostic["stage1_target_domain"] = str(stage_one.get("target_domain", "") or "").strip() or None
-    diagnostic["stage1_failure_hint"] = None
-    if isinstance(diagnostic.get("benchmark_snapshot"), dict):
-        diagnostic["benchmark_snapshot"]["stage_one_success"] = dict(stage_one)
+    _apply_stage_one_diagnostic(
+        diagnostic,
+        stage_one,
+        stage_one_outcome,
+        stage_one_failure_hint,
+    )
+    if stage_one_outcome != "detect_signal" or not isinstance(stage_one, dict):
+        return None, stage_one, stage_one_outcome, stage_one_failure_hint
 
     stage_two_result = _stage_two_hypothesize_with_diagnostics(
         source_domain=source_domain,
-        abstract_structure=str(pattern.get("abstract_structure", "") or ""),
+        abstract_structure=abstract_structure,
         stage_one=stage_one,
-        search_results=combined,
+        search_results=search_results,
     )
-    data = stage_two_result[0] if isinstance(stage_two_result, tuple) and len(stage_two_result) >= 1 else None
+    data = (
+        stage_two_result[0]
+        if isinstance(stage_two_result, tuple) and len(stage_two_result) >= 1
+        else None
+    )
     stage_two_failure_hint = (
         stage_two_result[1]
         if isinstance(stage_two_result, tuple) and len(stage_two_result) >= 2
@@ -8000,7 +6995,9 @@ def lateral_jump_with_diagnostics(
     )
     if data is None:
         diagnostic["stage2_outcome"] = "stage2_no_connection"
-        diagnostic["stage2_failure_hint"] = stage_two_failure_hint or "returned_no_connection"
+        diagnostic["stage2_failure_hint"] = (
+            stage_two_failure_hint or "returned_no_connection"
+        )
         diagnostic["stage2_failed_at"] = (
             str(stage2_failed_at).strip() or None
             if stage2_failed_at is not None
@@ -8017,30 +7014,192 @@ def lateral_jump_with_diagnostics(
             ]
             if cleaned_incomplete_fields:
                 diagnostic["stage2_incomplete_fields"] = cleaned_incomplete_fields
-        return None, diagnostic
+        return None, stage_one, stage_one_outcome, stage_one_failure_hint
 
     diagnostic["stage2_outcome"] = "connection_found"
-    diagnostic["stage2_target_domain"] = str(data.get("target_domain", "") or "").strip() or None
-    data["abstract_structure"] = str(pattern.get("abstract_structure", "") or "").strip()
-    target_excerpt, target_url = _select_display_target_evidence(
-        data,
-        raw_target_candidates,
+    diagnostic["stage2_target_domain"] = (
+        str(data.get("target_domain", "") or "").strip() or None
     )
-    seed_url, seed_excerpt = _select_display_source_evidence(
+    return data, stage_one, stage_one_outcome, stage_one_failure_hint
+
+
+def lateral_jump_with_diagnostics(
+    pattern: dict,
+    source_domain: str,
+    source_category: str,
+    cycle_budget: CycleBudget | None = None,
+) -> tuple[dict | None, JumpAttemptDiagnostic]:
+    """
+    Attempt a lateral jump and return lightweight diagnostics describing where it died.
+    """
+    raw_search_query = str(pattern.get("search_query", "") or "").strip()
+    diagnostic = JumpAttemptDiagnostic(
+        pattern_name=str(pattern.get("pattern_name", "") or "").strip() or "Unknown",
+        abstract_structure=str(pattern.get("abstract_structure", "") or "").strip(),
+        raw_search_query=raw_search_query,
+    )
+
+    pre_stage1_dependencies = _make_pre_stage1_dependencies()
+    pre_stage1_result = run_pre_stage1(
         pattern,
-        data,
         source_domain,
+        source_category,
+        cycle_budget=cycle_budget,
+        deps=pre_stage1_dependencies,
     )
-    if target_url:
-        data["target_url"] = target_url
-    if target_excerpt:
-        data["target_excerpt"] = target_excerpt
-    if seed_url:
-        data["seed_url"] = seed_url
-        data["source_url"] = seed_url
-    if seed_excerpt:
-        data["seed_excerpt"] = seed_excerpt
-        data["source_excerpt"] = seed_excerpt
+    _apply_pre_stage1_diagnostics(diagnostic, pre_stage1_result.diagnostics)
+    if pre_stage1_result.stage1_outcome is not None:
+        return _return_runtime_terminal_result(
+            diagnostic,
+            stage_one_outcome=pre_stage1_result.stage1_outcome,
+            stage_one_failure_hint=pre_stage1_result.stage1_failure_hint,
+            budget_stop=pre_stage1_result.budget_stop,
+        )
+
+    pre_stage1_state = pre_stage1_result.state
+    if pre_stage1_state is None or pre_stage1_state.packet is None:
+        return _return_runtime_terminal_result(
+            diagnostic,
+            stage_one_outcome="no_results",
+            stage_one_failure_hint="no_usable_results",
+        )
+
+    query = str(pre_stage1_state.query_plan.built_jump_query or "").strip()
+    combined = pre_stage1_state.packet.search_content
+    raw_target_candidates = pre_stage1_state.packet.raw_target_candidates
+
+    try:
+        data, stage_one, stage_one_outcome, stage_one_failure_hint = _run_post_pre_stage1_flow(
+            source_domain=source_domain,
+            abstract_structure=str(pattern.get("abstract_structure", "") or ""),
+            search_results=combined,
+            diagnostic=diagnostic,
+            cycle_budget=cycle_budget,
+        )
+    except CycleBudgetExhausted as exhausted:
+        return _return_runtime_terminal_result(
+            diagnostic,
+            stage_one_outcome="budget_exhausted_stage1",
+            stage_one_failure_hint="cycle_budget_exhausted",
+            budget_stop=exhausted.to_diagnostic(),
+        )
+    initial_stage_one = stage_one
+    initial_stage_one_failure_hint = stage_one_failure_hint
+    initial_stage_one_outcome = stage_one_outcome
+
+    if stage_one_outcome == "weak_signal":
+        diagnostic["stage1_soft_gate_attempted"] = True
+        recovery_query = _build_stage_one_soft_gate_query(
+            query,
+            str(stage_one.get("target_domain", "") or "").strip(),
+        )
+        if recovery_query:
+            recovery_result = augment_pre_stage1_with_query(
+                pre_stage1_state,
+                pre_stage1_result.diagnostics,
+                query=recovery_query,
+                general_query_label="soft-gate",
+                academic_query_label="soft-gate-academic",
+                general_callsite="stage1_soft_gate_search",
+                academic_callsite="stage1_soft_gate_academic_search",
+                general_failure_message=(
+                    "  [!] Tavily soft-gate search failed for jump query "
+                    f"'{recovery_query}': {{error}}"
+                ),
+                academic_failure_message=(
+                    "[!] Tavily academic soft-gate search failed for jump query "
+                    f"'{recovery_query}': {{error}}"
+                ),
+                cycle_budget=cycle_budget,
+                deps=pre_stage1_dependencies,
+            )
+            _apply_pre_stage1_diagnostics(diagnostic, recovery_result.diagnostics)
+            if recovery_result.stage1_outcome is not None:
+                return _return_runtime_terminal_result(
+                    diagnostic,
+                    stage_one_outcome=recovery_result.stage1_outcome,
+                    stage_one_failure_hint=recovery_result.stage1_failure_hint,
+                    budget_stop=recovery_result.budget_stop,
+                )
+            if recovery_result.state is not None and recovery_result.state.packet is not None:
+                pre_stage1_state = recovery_result.state
+                combined = pre_stage1_state.packet.search_content
+                raw_target_candidates = pre_stage1_state.packet.raw_target_candidates
+                _apply_runtime_result_context(
+                    diagnostic,
+                    search_results=combined,
+                )
+
+        try:
+            data, recovered_stage_one, recovered_stage_one_outcome, recovered_stage_one_failure_hint = _run_post_pre_stage1_flow(
+                source_domain=source_domain,
+                abstract_structure=str(pattern.get("abstract_structure", "") or ""),
+                search_results=combined,
+                diagnostic=diagnostic,
+                cycle_budget=cycle_budget,
+            )
+        except CycleBudgetExhausted as exhausted:
+            return _return_runtime_terminal_result(
+                diagnostic,
+                stage_one_outcome="budget_exhausted_stage1",
+                stage_one_failure_hint="cycle_budget_exhausted",
+                budget_stop=exhausted.to_diagnostic(),
+            )
+        if recovered_stage_one_outcome == "detect_signal":
+            stage_one = recovered_stage_one
+            stage_one_failure_hint = recovered_stage_one_failure_hint
+            stage_one_outcome = recovered_stage_one_outcome
+            diagnostic["stage1_soft_gate_recovered"] = True
+        else:
+            return _return_runtime_terminal_result(
+                diagnostic,
+                stage_one_outcome=initial_stage_one_outcome,
+                stage_one_failure_hint=initial_stage_one_failure_hint,
+                stage_one=initial_stage_one,
+            )
+
+    if stage_one_outcome != "detect_signal":
+        return None, diagnostic
+
+    if data is None:
+        return None, diagnostic
+    data = _apply_runtime_result_context(
+        diagnostic,
+        pattern=pattern,
+        source_domain=source_domain,
+        raw_target_candidates=raw_target_candidates,
+        data=data,
+        stage_one=stage_one,
+    )
+    return data, diagnostic
+
+
+def replay_jump_attempt(
+    snapshot: JumpReplaySnapshot,
+) -> tuple[dict | None, JumpAttemptDiagnostic]:
+    """Replay one captured jump attempt through Stage 1 and Stage 2 only."""
+    replay_snapshot = JumpReplaySnapshot.from_dict(snapshot) or JumpReplaySnapshot()
+    source_domain = str(replay_snapshot.source_domain or "").strip() or "Unknown"
+    abstract_structure = str(replay_snapshot.abstract_structure or "").strip()
+    search_results = str(replay_snapshot.search_results or "").strip()
+    diagnostic = JumpAttemptDiagnostic(
+        pattern_name=str(replay_snapshot.pattern_name or "").strip() or "Unknown",
+        abstract_structure=abstract_structure,
+        built_jump_query=str(replay_snapshot.built_jump_query or "").strip() or None,
+        replay_snapshot=replay_snapshot,
+    )
+
+    data, _stage_one, _stage_one_outcome, _stage_one_failure_hint = _run_post_pre_stage1_flow(
+        source_domain=source_domain,
+        abstract_structure=abstract_structure,
+        search_results=search_results,
+        diagnostic=diagnostic,
+        stage_one_success=(
+            replay_snapshot.stage_one_success
+            if isinstance(replay_snapshot.stage_one_success, dict)
+            else None
+        ),
+    )
     return data, diagnostic
 
 

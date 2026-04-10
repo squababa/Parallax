@@ -1,0 +1,85 @@
+{
+  "id": "source_leakage_regression",
+  "description": "Source-shaped transferable phrasing that should be flagged as obvious leakage even if some target-side snippets still arrive.",
+  "source_domain": "TCP Congestion Control",
+  "source_category": "Networking",
+  "llm_jump_query": null,
+  "pattern": {
+    "pattern_name": "Additive increase multiplicative decrease",
+    "abstract_structure": "A sender ramps transmission upward before proportional rollback.",
+    "search_query": "additive increase multiplicative decrease",
+    "measurable_signal": "window slope and rollback depth",
+    "control_lever": "tune additive increase step and multiplicative decrease factor",
+    "transfer_rationale": "",
+    "transferable": {
+      "mechanism": "gradual additive increase meets multiplicative rollback after threshold breach",
+      "control_logic": "tune additive increase step and multiplicative decrease factor",
+      "signal_shape": "window slope rises before multiplicative rollback depth abruptly resets the path"
+    },
+    "grounded": {
+      "source_control": "tune additive increase step and multiplicative decrease factor",
+      "source_metric": "window slope and rollback depth"
+    }
+  },
+  "search_responses": [
+    {
+      "query": "ramps transmission additive increase multiplicative decrease rollback proportional mechanism",
+      "lane": "general",
+      "results": [
+        {
+          "title": "AIMD primer",
+          "content": "Additive increase multiplicative decrease is a congestion-control strategy for shared links.",
+          "url": "https://sourceleak.test/aimd-primer"
+        },
+        {
+          "title": "Shared resource rollback note",
+          "content": "Gradual ramp-up meets proportional rollback after threshold breach in a capacity-sharing controller.",
+          "url": "https://target.test/rollback-note"
+        }
+      ]
+    },
+    {
+      "query": "ramps transmission additive increase multiplicative decrease rollback proportional workaround",
+      "lane": "general",
+      "results": [
+        {
+          "title": "Rollback factor tuning guide",
+          "content": "Operators tune the rollback factor and ramp step to stabilize throughput after congestion events.",
+          "url": "https://target.test/rollback-tuning"
+        }
+      ]
+    },
+    {
+      "query": "ramps transmission additive increase multiplicative decrease rollback proportional mechanism",
+      "lane": "academic",
+      "results": []
+    }
+  ],
+  "stage1_stub": {
+    "data": null,
+    "failure_hint": "no_connection"
+  },
+  "expect": {
+    "built_queries": [
+      "ramps transmission additive increase multiplicative decrease rollback proportional mechanism",
+      "ramps transmission additive increase multiplicative decrease rollback proportional workaround",
+      "ramps transmission additive increase multiplicative decrease rollback proportional failure"
+    ],
+    "raw_result_count": 3,
+    "filtered_result_count": 0,
+    "retained_result_count": 3,
+    "cluster_count": 3,
+    "highlighted_evidence_count": 3,
+    "intervention_bearing_result_count": 1,
+    "packet_quality": "focused",
+    "top_cluster_hints": [
+      "AIMD primer",
+      "resource rollback",
+      "tuning rollback"
+    ],
+    "obvious_source_leakage": true,
+    "stage1_outcome": "detect_no_signal",
+    "search_call_count": 4,
+    "unexpected_search_calls": 1
+  }
+}

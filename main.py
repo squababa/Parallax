@@ -4,6 +4,7 @@ Entry point. Runs the exploration loop.
 """
 import argparse
 from datetime import datetime, timezone
+import inspect
 import json
 import os
 from pathlib import Path
@@ -1740,6 +1741,38 @@ def _print_recent_review_items(limit: int = 20):
         print("")
 
 
+_JUMP_ATTEMPT_MARKER_KEYS = {
+    "stage1_outcome",
+    "stage2_outcome",
+    "built_jump_query",
+    "adjacent_result_count",
+    "top_result_titles",
+    "benchmark_snapshot",
+}
+
+
+def _hydrate_jump_attempt_diagnostic(payload: object) -> JumpAttemptDiagnostic | None:
+    if isinstance(payload, JumpAttemptDiagnostic):
+        return payload
+    if not isinstance(payload, dict):
+        return None
+    if not any(key in payload for key in _JUMP_ATTEMPT_MARKER_KEYS):
+        return None
+    try:
+        return JumpAttemptDiagnostic.from_dict(payload)
+    except Exception:
+        return None
+
+
+def _hydrate_jump_replay_snapshot(payload: object) -> JumpReplaySnapshot | None:
+    if isinstance(payload, JumpReplaySnapshot):
+        return payload
+    try:
+        return JumpReplaySnapshot.from_dict(payload)
+    except Exception:
+        return None
+
+
 def _print_jump_diagnostics(limit: int = 20) -> None:
     """Print recent jump-stage attempt diagnostics from stored exploration JSON."""
     rows = list_recent_review_items(limit=max(1, int(limit)))
@@ -1780,12 +1813,21 @@ def _print_jump_diagnostics(limit: int = 20) -> None:
             continue
 
         for attempt in jump_attempts:
-            if not isinstance(attempt, dict):
+            hydrated_attempt = _hydrate_jump_attempt_diagnostic(attempt)
+            if hydrated_attempt is not None:
+                attempt_view = hydrated_attempt
+            elif isinstance(attempt, dict):
+                attempt_view = attempt
+            else:
                 continue
             total_attempts += 1
-            stage1_outcome = str(attempt.get("stage1_outcome") or "—").strip()
-            stage2_outcome = str(attempt.get("stage2_outcome") or "—").strip()
-            result_count = int(attempt.get("result_count") or 0)
+            stage1_outcome = str(attempt_view.get("stage1_outcome") or "—").strip()
+            stage2_outcome = str(attempt_view.get("stage2_outcome") or "—").strip()
+            result_count = (
+                hydrated_attempt.result_count
+                if hydrated_attempt is not None
+                else int(attempt_view.get("result_count") or 0)
+            )
             if stage1_outcome == "no_results":
                 outcome_counts["no_results"] += 1
             elif stage1_outcome == "weak_signal":
@@ -1797,16 +1839,42 @@ def _print_jump_diagnostics(limit: int = 20) -> None:
             elif stage2_outcome == "connection_found":
                 outcome_counts["connection_found"] += 1
 
-            pattern_name = _truncate_text(attempt.get("pattern_name"), 52)
-            built_query = _truncate_text(attempt.get("built_jump_query"), 72)
+            pattern_name = _truncate_text(
+                (
+                    hydrated_attempt.pattern_name
+                    if hydrated_attempt is not None
+                    else attempt_view.get("pattern_name")
+                ),
+                52,
+            )
+            built_query = _truncate_text(
+                (
+                    hydrated_attempt.built_jump_query
+                    if hydrated_attempt is not None
+                    else attempt_view.get("built_jump_query")
+                ),
+                72,
+            )
             target_domain = _truncate_text(
-                attempt.get("stage2_target_domain")
-                or attempt.get("stage1_target_domain"),
+                (
+                    hydrated_attempt.target_domain
+                    if hydrated_attempt is not None
+                    else (
+                        attempt_view.get("stage2_target_domain")
+                        or attempt_view.get("stage1_target_domain")
+                    )
+                ),
                 56,
             )
             failure_hint = _truncate_text(
-                attempt.get("stage2_failure_hint")
-                or attempt.get("stage1_failure_hint"),
+                (
+                    hydrated_attempt.failure_hint
+                    if hydrated_attempt is not None
+                    else (
+                        attempt_view.get("stage2_failure_hint")
+                        or attempt_view.get("stage1_failure_hint")
+                    )
+                ),
                 72,
             )
             print(
@@ -1814,24 +1882,28 @@ def _print_jump_diagnostics(limit: int = 20) -> None:
                 f"results={result_count} | stage1={stage1_outcome} | stage2={stage2_outcome}"
             )
             if target_domain != "—" or failure_hint != "—":
-                print(
-                    f"    target={target_domain} | failure_hint={failure_hint}"
+                print(f"    target={target_domain} | failure_hint={failure_hint}")
+            adjacent_result_count = (
+                hydrated_attempt.adjacent_result_count
+                if hydrated_attempt is not None
+                else int(
+                    attempt_view.get("adjacent_result_count")
+                    or attempt_view.get("retained_adjacent_result_count")
+                    or attempt_view.get("adjacent_retained_result_count")
+                    or 0
                 )
-            adjacent_result_count = int(
-                attempt.get("adjacent_result_count")
-                or attempt.get("retained_adjacent_result_count")
-                or attempt.get("adjacent_retained_result_count")
-                or 0
             )
-            retained_adjacent_result_count = int(
-                attempt.get("retained_adjacent_result_count")
-                or attempt.get("adjacent_retained_result_count")
-                or adjacent_result_count
+            retained_adjacent_result_count = adjacent_result_count
+            alternate_retrieval_attempted = (
+                hydrated_attempt.alternate_retrieval_attempted
+                if hydrated_attempt is not None
+                else bool(attempt_view.get("alternate_retrieval_attempted"))
             )
-            alternate_retrieval_attempted = bool(
-                attempt.get("alternate_retrieval_attempted")
+            enriched_packet = (
+                hydrated_attempt.enriched_packet
+                if hydrated_attempt is not None
+                else bool(attempt_view.get("enriched_packet"))
             )
-            enriched_packet = bool(attempt.get("enriched_packet"))
             prestage1_parts: list[str] = []
             if stage1_outcome == "detect_no_signal" and adjacent_result_count <= 0:
                 prestage1_parts.append("prestage1=hard_no_signal")
@@ -1852,12 +1924,24 @@ def _print_jump_diagnostics(limit: int = 20) -> None:
                 )
             if prestage1_parts:
                 print("    " + " | ".join(prestage1_parts))
-            packet_quality = str(attempt.get("packet_quality") or "focused").strip() or "focused"
-            adjacent_highlighted_count = int(
-                attempt.get("adjacent_highlighted_count") or 0
+            packet_quality = (
+                (
+                    str(hydrated_attempt.packet_quality or "focused").strip()
+                    or "focused"
+                )
+                if hydrated_attempt is not None
+                else str(attempt_view.get("packet_quality") or "focused").strip()
+                or "focused"
             )
-            adjacent_suppressed_count = int(
-                attempt.get("adjacent_suppressed_count") or 0
+            adjacent_highlighted_count = (
+                hydrated_attempt.adjacent_highlighted_count
+                if hydrated_attempt is not None
+                else int(attempt_view.get("adjacent_highlighted_count") or 0)
+            )
+            adjacent_suppressed_count = (
+                hydrated_attempt.adjacent_suppressed_count
+                if hydrated_attempt is not None
+                else int(attempt_view.get("adjacent_suppressed_count") or 0)
             )
             if packet_quality != "focused":
                 packet_parts = [f"packet={packet_quality}"]
@@ -1865,13 +1949,24 @@ def _print_jump_diagnostics(limit: int = 20) -> None:
                     packet_parts.append(
                         f"highlighted_adjacent={adjacent_highlighted_count}"
                     )
-                if adjacent_suppressed_count > 0 or packet_quality == "adjacent_compressed":
+                if (
+                    adjacent_suppressed_count > 0
+                    or packet_quality == "adjacent_compressed"
+                ):
                     packet_parts.append(
                         f"suppressed_adjacent={adjacent_suppressed_count}"
                     )
                 print("    " + " | ".join(packet_parts))
-            soft_gate_attempted = bool(attempt.get("stage1_soft_gate_attempted"))
-            soft_gate_recovered = bool(attempt.get("stage1_soft_gate_recovered"))
+            soft_gate_attempted = (
+                hydrated_attempt.stage1_soft_gate_attempted
+                if hydrated_attempt is not None
+                else bool(attempt_view.get("stage1_soft_gate_attempted"))
+            )
+            soft_gate_recovered = (
+                hydrated_attempt.stage1_soft_gate_recovered
+                if hydrated_attempt is not None
+                else bool(attempt_view.get("stage1_soft_gate_recovered"))
+            )
             if stage1_outcome == "weak_signal" or (
                 stage1_outcome == "detect_signal" and soft_gate_recovered
             ):
@@ -1883,13 +1978,17 @@ def _print_jump_diagnostics(limit: int = 20) -> None:
                 )
                 print(f"    soft_gate={attempted_text},{recovered_text}")
             incomplete_fields = (
-                attempt.get("stage2_incomplete_fields")
-                if isinstance(attempt.get("stage2_incomplete_fields"), list)
-                else []
+                list(hydrated_attempt.stage2_incomplete_fields)
+                if hydrated_attempt is not None
+                else (
+                    attempt_view.get("stage2_incomplete_fields")
+                    if isinstance(attempt_view.get("stage2_incomplete_fields"), list)
+                    else []
+                )
             )
             if (
                 stage2_outcome == "stage2_no_connection"
-                and str(attempt.get("stage2_failure_hint") or "").strip()
+                and str(attempt_view.get("stage2_failure_hint") or "").strip()
                 == "repair_incomplete"
                 and incomplete_fields
             ):
@@ -1908,7 +2007,11 @@ def _print_jump_diagnostics(limit: int = 20) -> None:
                     + ", ".join(shown_fields)
                     + suffix
                 )
-            titles = attempt.get("top_result_titles")
+            titles = (
+                list(hydrated_attempt.top_result_titles)
+                if hydrated_attempt is not None
+                else attempt_view.get("top_result_titles")
+            )
             if isinstance(titles, list) and titles:
                 print(
                     "    top_titles="
@@ -2027,16 +2130,45 @@ def _load_jump_attempt_for_benchmark(
     if not isinstance(attempt, dict):
         return None, f"jump attempt #{attempt_index} on exploration #{exploration_id} is invalid"
 
-    snapshot = (
+    attempt_diagnostic = _hydrate_jump_attempt_diagnostic(attempt)
+    attempt_view = attempt_diagnostic if attempt_diagnostic is not None else attempt
+    replay_snapshot = (
+        attempt_diagnostic.replay_snapshot
+        if attempt_diagnostic is not None
+        else None
+    )
+    if replay_snapshot is None:
+        replay_snapshot = _hydrate_jump_replay_snapshot(
+            attempt.get("benchmark_snapshot")
+        )
+    snapshot = replay_snapshot.to_dict() if replay_snapshot is not None else (
         attempt.get("benchmark_snapshot")
         if isinstance(attempt.get("benchmark_snapshot"), dict)
         else {}
     )
-    search_results = str(snapshot.get("search_results") or "").strip()
-    abstract_structure = str(
-        snapshot.get("abstract_structure") or attempt.get("abstract_structure") or ""
-    ).strip()
-    source_domain = str(snapshot.get("source_domain") or row["seed_domain"] or "").strip()
+    search_results = (
+        str(replay_snapshot.search_results or "").strip()
+        if replay_snapshot is not None
+        else str(snapshot.get("search_results") or "").strip()
+    )
+    abstract_structure = (
+        str(
+            replay_snapshot.abstract_structure
+            or attempt_view.get("abstract_structure")
+            or ""
+        ).strip()
+        if replay_snapshot is not None
+        else str(
+            snapshot.get("abstract_structure")
+            or attempt_view.get("abstract_structure")
+            or ""
+        ).strip()
+    )
+    source_domain = (
+        str(replay_snapshot.source_domain or row["seed_domain"] or "").strip()
+        if replay_snapshot is not None
+        else str(snapshot.get("source_domain") or row["seed_domain"] or "").strip()
+    )
     if not search_results:
         return None, (
             f"exploration #{exploration_id} attempt #{attempt_index} has no replay snapshot; "
@@ -2055,6 +2187,8 @@ def _load_jump_attempt_for_benchmark(
         "attempt_index": int(attempt_index),
         "attempt": dict(attempt),
         "snapshot": dict(snapshot),
+        "attempt_diagnostic": attempt_diagnostic,
+        "replay_snapshot": replay_snapshot,
     }, None
 
 
@@ -2080,6 +2214,17 @@ def _capture_jump_benchmark_case(
 
     attempt = loaded["attempt"]
     snapshot = loaded["snapshot"]
+    attempt_diagnostic = (
+        loaded.get("attempt_diagnostic")
+        if isinstance(loaded.get("attempt_diagnostic"), JumpAttemptDiagnostic)
+        else None
+    )
+    replay_snapshot = (
+        loaded.get("replay_snapshot")
+        if isinstance(loaded.get("replay_snapshot"), JumpReplaySnapshot)
+        else None
+    )
+    attempt_view = attempt_diagnostic if attempt_diagnostic is not None else attempt
     label_text = _clean_inline_text(label) or (
         f"exploration-{exploration_id}-attempt-{attempt_index}"
     )
@@ -2097,30 +2242,81 @@ def _capture_jump_benchmark_case(
             "attempt_index": attempt_index,
             "timestamp": loaded.get("timestamp"),
         },
-        "source_domain": str(snapshot.get("source_domain") or loaded.get("seed_domain") or "").strip(),
-        "source_category": str(snapshot.get("source_category") or loaded.get("seed_category") or "").strip(),
-        "pattern_name": str(snapshot.get("pattern_name") or attempt.get("pattern_name") or "").strip(),
-        "abstract_structure": str(snapshot.get("abstract_structure") or "").strip(),
-        "built_jump_query": str(snapshot.get("built_jump_query") or attempt.get("built_jump_query") or "").strip(),
-        "search_results": str(snapshot.get("search_results") or "").strip(),
+        "source_domain": str(
+            (
+                replay_snapshot.source_domain
+                if replay_snapshot is not None
+                else snapshot.get("source_domain")
+            )
+            or loaded.get("seed_domain")
+            or ""
+        ).strip(),
+        "source_category": str(
+            (
+                replay_snapshot.source_category
+                if replay_snapshot is not None
+                else snapshot.get("source_category")
+            )
+            or loaded.get("seed_category")
+            or ""
+        ).strip(),
+        "pattern_name": str(
+            (
+                replay_snapshot.pattern_name
+                if replay_snapshot is not None
+                else snapshot.get("pattern_name")
+            )
+            or attempt_view.get("pattern_name")
+            or ""
+        ).strip(),
+        "abstract_structure": str(
+            (
+                replay_snapshot.abstract_structure
+                if replay_snapshot is not None
+                else snapshot.get("abstract_structure")
+            )
+            or attempt_view.get("abstract_structure")
+            or ""
+        ).strip(),
+        "built_jump_query": str(
+            (
+                replay_snapshot.built_jump_query
+                if replay_snapshot is not None
+                else snapshot.get("built_jump_query")
+            )
+            or attempt_view.get("built_jump_query")
+            or ""
+        ).strip(),
+        "search_results": str(
+            (
+                replay_snapshot.search_results
+                if replay_snapshot is not None
+                else snapshot.get("search_results")
+            )
+            or ""
+        ).strip(),
         "expected": {
-            "stage1_outcome": str(attempt.get("stage1_outcome") or "").strip() or None,
-            "stage1_failure_hint": str(attempt.get("stage1_failure_hint") or "").strip() or None,
-            "stage1_target_domain": str(attempt.get("stage1_target_domain") or "").strip() or None,
-            "stage2_outcome": str(attempt.get("stage2_outcome") or "").strip() or None,
-            "stage2_failure_hint": str(attempt.get("stage2_failure_hint") or "").strip() or None,
-            "stage2_target_domain": str(attempt.get("stage2_target_domain") or "").strip() or None,
+            "stage1_outcome": str(attempt_view.get("stage1_outcome") or "").strip() or None,
+            "stage1_failure_hint": str(attempt_view.get("stage1_failure_hint") or "").strip() or None,
+            "stage1_target_domain": str(attempt_view.get("stage1_target_domain") or "").strip() or None,
+            "stage2_outcome": str(attempt_view.get("stage2_outcome") or "").strip() or None,
+            "stage2_failure_hint": str(attempt_view.get("stage2_failure_hint") or "").strip() or None,
+            "stage2_target_domain": str(attempt_view.get("stage2_target_domain") or "").strip() or None,
             "stage2_incomplete_fields": [
                 str(field).strip()
-                for field in (attempt.get("stage2_incomplete_fields") or [])
+                for field in (attempt_view.get("stage2_incomplete_fields") or [])
                 if str(field).strip()
             ],
         },
     }
     stage_one_success = (
-        snapshot.get("stage_one_success")
-        if isinstance(snapshot.get("stage_one_success"), dict)
-        else None
+        replay_snapshot.stage_one_success
+        if replay_snapshot is not None
+        else (
+            snapshot.get("stage_one_success")
+            if isinstance(snapshot.get("stage_one_success"), dict)
+            else None
+        )
     )
     if stage_one_success is not None:
         case["stage_one_success"] = dict(stage_one_success)
@@ -2264,6 +2460,8 @@ def _strong_rejection_benchmark_rank(verdict: str | None) -> int:
 def _run_jump_attempt_benchmark_case(case: dict) -> dict:
     """Replay one stored jump-attempt case against current Stage 1/Stage 2 code."""
     source_domain = _clean_inline_text(case.get("source_domain")) or "Unknown"
+    source_category = _clean_inline_text(case.get("source_category")) or ""
+    pattern_name = _clean_inline_text(case.get("pattern_name")) or "Unknown"
     abstract_structure = _clean_inline_text(case.get("abstract_structure")) or ""
     search_results = _truncate_benchmark_search_results(
         case.get("search_results") or "",
@@ -2278,81 +2476,70 @@ def _run_jump_attempt_benchmark_case(case: dict) -> dict:
             "message": "missing abstract_structure or search_results",
         }
 
-    replay_mode = "full"
-    stage_one_failure_hint = None
-    stage_one = _benchmark_stage_one_success_snapshot(case)
-    if stage_one is None:
-        stage_one, stage_one_failure_hint = jump_module._stage_one_detect_with_diagnostics(
-            source_domain=source_domain,
-            abstract_structure=abstract_structure,
-            search_results=search_results,
+    snapshot = JumpReplaySnapshot(
+        source_domain=source_domain,
+        source_category=source_category,
+        pattern_name=pattern_name,
+        abstract_structure=abstract_structure,
+        built_jump_query=_clean_inline_text(case.get("built_jump_query")),
+        search_results=search_results,
+        stage_one_success=_benchmark_stage_one_success_snapshot(case),
+    )
+    replay_mode = "stage2_only" if snapshot.stage_one_success is not None else "full"
+    connection, diagnostic = jump_module.replay_jump_attempt(snapshot)
+    actual_stage1_outcome = (
+        str(diagnostic.get("stage1_outcome") or "").strip() or None
+    )
+    actual_stage1_failure_hint = (
+        str(diagnostic.get("stage1_failure_hint") or "").strip() or None
+    )
+    actual_stage1_target_domain = _clean_inline_text(
+        diagnostic.get("stage1_target_domain")
+    )
+    actual_stage2_outcome = (
+        str(diagnostic.get("stage2_outcome") or "").strip() or None
+    )
+    actual_stage2_failure_hint = (
+        str(diagnostic.get("stage2_failure_hint") or "").strip() or None
+    )
+    actual_stage2_target_domain = _clean_inline_text(
+        diagnostic.get("stage2_target_domain")
+        or (
+            connection.get("target_domain")
+            if isinstance(connection, dict)
+            else None
         )
-        if stage_one is None:
-            if str(stage_one_failure_hint or "").strip() == "generation_failed":
-                return {
-                    "type": "jump_attempt",
-                    "case_id": case.get("id"),
-                    "label": case.get("label"),
-                    "status": "ERROR",
-                    "message": "stage1_detect generation failed during benchmark replay",
-                    "actual_stage1_failure_hint": stage_one_failure_hint,
-                    "pattern_name": _clean_inline_text(case.get("pattern_name")),
-                    "replay_mode": replay_mode,
-                }
-        actual_stage1_outcome = jump_module._classify_stage_one_outcome(
-            stage_one,
-            stage_one_failure_hint,
-        )
-        actual_stage2_outcome = None
-        actual_stage2_failure_hint = None
-        actual_stage2_incomplete_fields: list[str] = []
-        actual_stage2_target_domain = None
-        actual_stage1_target_domain = _clean_inline_text(
-            stage_one.get("target_domain") if isinstance(stage_one, dict) else None
-        )
-    else:
-        replay_mode = "stage2_only"
-        actual_stage1_outcome = "detect_signal"
-        actual_stage1_target_domain = _clean_inline_text(stage_one.get("target_domain"))
+    )
+    actual_stage2_incomplete_fields = [
+        str(field).strip()
+        for field in diagnostic.stage2_incomplete_fields
+        if str(field).strip()
+    ]
 
-    if stage_one is not None and actual_stage1_outcome == "detect_signal":
-        stage_two_data, stage_two_failure_hint, stage_two_incomplete_fields = (
-            jump_module._stage_two_hypothesize_with_diagnostics(
-                source_domain=source_domain,
-                abstract_structure=abstract_structure,
-                stage_one=stage_one,
-                search_results=search_results,
-            )
-        )
-        if stage_two_data is None:
-            if str(stage_two_failure_hint or "").strip() == "generation_failed":
-                return {
-                    "type": "jump_attempt",
-                    "case_id": case.get("id"),
-                    "label": case.get("label"),
-                    "status": "ERROR",
-                    "message": "stage2_hypothesize generation failed during benchmark replay",
-                    "actual_stage1_outcome": actual_stage1_outcome,
-                    "actual_stage1_target_domain": actual_stage1_target_domain,
-                    "actual_stage2_failure_hint": stage_two_failure_hint,
-                    "pattern_name": _clean_inline_text(case.get("pattern_name")),
-                    "replay_mode": replay_mode,
-                }
-            actual_stage2_outcome = "stage2_no_connection"
-            actual_stage2_failure_hint = stage_two_failure_hint or "returned_no_connection"
-            actual_stage2_incomplete_fields = [
-                str(field).strip()
-                for field in (stage_two_incomplete_fields or [])
-                if str(field).strip()
-            ]
-            actual_stage2_target_domain = None
-        else:
-            actual_stage2_outcome = "connection_found"
-            actual_stage2_failure_hint = None
-            actual_stage2_incomplete_fields = []
-            actual_stage2_target_domain = _clean_inline_text(
-                stage_two_data.get("target_domain")
-            )
+    if actual_stage1_failure_hint == "generation_failed":
+        return {
+            "type": "jump_attempt",
+            "case_id": case.get("id"),
+            "label": case.get("label"),
+            "status": "ERROR",
+            "message": "stage1_detect generation failed during benchmark replay",
+            "actual_stage1_failure_hint": actual_stage1_failure_hint,
+            "pattern_name": pattern_name,
+            "replay_mode": replay_mode,
+        }
+    if actual_stage2_failure_hint == "generation_failed":
+        return {
+            "type": "jump_attempt",
+            "case_id": case.get("id"),
+            "label": case.get("label"),
+            "status": "ERROR",
+            "message": "stage2_hypothesize generation failed during benchmark replay",
+            "actual_stage1_outcome": actual_stage1_outcome,
+            "actual_stage1_target_domain": actual_stage1_target_domain,
+            "actual_stage2_failure_hint": actual_stage2_failure_hint,
+            "pattern_name": pattern_name,
+            "replay_mode": replay_mode,
+        }
 
     expected_stage1_outcome = str(expected.get("stage1_outcome") or "").strip() or None
     expected_stage2_outcome = str(expected.get("stage2_outcome") or "").strip() or None
@@ -2378,13 +2565,13 @@ def _run_jump_attempt_benchmark_case(case: dict) -> dict:
         "expected_stage1_outcome": expected_stage1_outcome,
         "expected_stage2_outcome": expected_stage2_outcome,
         "actual_stage1_outcome": actual_stage1_outcome,
-        "actual_stage1_failure_hint": stage_one_failure_hint,
+        "actual_stage1_failure_hint": actual_stage1_failure_hint,
         "actual_stage1_target_domain": actual_stage1_target_domain,
         "actual_stage2_outcome": actual_stage2_outcome,
         "actual_stage2_failure_hint": actual_stage2_failure_hint,
         "actual_stage2_target_domain": actual_stage2_target_domain,
         "actual_stage2_incomplete_fields": actual_stage2_incomplete_fields,
-        "pattern_name": _clean_inline_text(case.get("pattern_name")),
+        "pattern_name": pattern_name,
         "replay_mode": replay_mode,
     }
 
@@ -5657,10 +5844,14 @@ from config import (
     INVARIANCE_KILL_THRESHOLD,
     CYCLE_COOLDOWN,
     MAX_PATTERNS_PER_CYCLE,
+    MAX_TAVILY_CALLS_PER_CYCLE,
+    MAX_LLM_CALLS_PER_CYCLE,
 )
+from cycle_budget import CycleBudget
 from explore import append_jump_attempt_diagnostic, dive, finalize_pattern_diagnostics
 import jump as jump_module
 from jump import lateral_jump, lateral_jump_with_diagnostics, salvage_high_value_candidate
+from jump_types import JumpAttemptDiagnostic, JumpReplaySnapshot
 from score import (
     score_connection,
     deep_dive_convergence,
@@ -9238,13 +9429,69 @@ def _build_eval_notes(
     return "\n".join(line for line in lines if line)
 
 
+def _build_eval_budget_result(
+    pair: dict,
+    seed_topic: str,
+    expectation_type: str,
+    budget_outcome: str,
+    budget_text: str | None,
+    candidate: dict | None = None,
+) -> dict:
+    """Build one eval row describing a budget-exhausted partial or empty run."""
+    matched_expected_target = bool(candidate and candidate.get("target_match"))
+    extra_note = (
+        f"{budget_outcome}: {budget_text}"
+        if isinstance(budget_text, str) and budget_text.strip()
+        else budget_outcome
+    )
+    return {
+        "pair_id": pair.get("id"),
+        "category": pair.get("category"),
+        "seed": seed_topic,
+        "expected_target": pair.get("expected_target"),
+        "expectation_type": expectation_type,
+        "actual_target": candidate.get("actual_target") if candidate else None,
+        "transmitted": bool(candidate.get("should_transmit") if candidate else False),
+        "total_score": candidate.get("total_score") if candidate else None,
+        "depth_score": candidate.get("depth_score") if candidate else None,
+        "distance_score": candidate.get("distance_score") if candidate else None,
+        "novelty_score": candidate.get("novelty_score") if candidate else None,
+        "provenance_complete": candidate.get("provenance_ok") if candidate else None,
+        "result_label": "manual_review",
+        "notes": _build_eval_notes(
+            pair,
+            candidate,
+            matched_expected_target=matched_expected_target,
+            extra_note=extra_note,
+        ),
+    }
+
+
 def _run_eval_pair(pair: dict, threshold: float, max_patterns: int) -> dict:
     """Run one golden pair through the direct-hop pipeline and return the stored row payload."""
     seed_topic = _build_eval_seed_topic(pair)
     seed = build_custom_seed(seed_topic)
-    patterns = dive(seed)
+    expectation_type = str(pair.get("expectation_type") or "").strip()
+    cycle_budget = CycleBudget(
+        max_tavily_calls=MAX_TAVILY_CALLS_PER_CYCLE,
+        max_llm_calls=MAX_LLM_CALLS_PER_CYCLE,
+    )
+    patterns = _call_with_cycle_budget(dive, seed, cycle_budget=cycle_budget)
+    if _pattern_budget_exhausted(seed):
+        diagnostics = seed.get("pattern_diagnostics")
+        budget_outcome = (
+            str(diagnostics.get("outcome") or "").strip()
+            if isinstance(diagnostics, dict)
+            else "budget_exhausted_pre_stage1"
+        ) or "budget_exhausted_pre_stage1"
+        return _build_eval_budget_result(
+            pair,
+            seed_topic,
+            expectation_type,
+            budget_outcome,
+            _budget_stop_text(diagnostics if isinstance(diagnostics, dict) else None),
+        )
     if not patterns:
-        expectation_type = str(pair.get("expectation_type") or "").strip()
         if expectation_type == "manual_judge":
             result_label = "manual_review"
         elif expectation_type == "should_find":
@@ -9274,13 +9521,27 @@ def _run_eval_pair(pair: dict, threshold: float, max_patterns: int) -> dict:
         }
 
     candidates: list[dict] = []
+    eval_budget_stop: tuple[str, str | None] | None = None
     effective_max = _effective_pattern_budget(len(patterns), max_patterns)
     for pattern in patterns[:effective_max]:
         print(
             f"  [Eval Jump] {pair.get('id', '')} pattern "
             f"{pattern.get('pattern_name', 'Pattern')} -> searching..."
         )
-        connection = lateral_jump(pattern, seed["name"], seed["category"])
+        connection, jump_diagnostic = _call_with_cycle_budget(
+            lateral_jump_with_diagnostics,
+            pattern,
+            seed["name"],
+            seed["category"],
+            cycle_budget=cycle_budget,
+        )
+        if _jump_budget_exhausted(jump_diagnostic):
+            eval_budget_stop = (
+                _jump_budget_outcome_text(jump_diagnostic)
+                or "budget_exhausted_pre_stage1",
+                _budget_stop_text(jump_diagnostic),
+            )
+            break
         if connection is None:
             print("  [Eval Jump] No connection found")
             continue
@@ -9298,7 +9559,17 @@ def _run_eval_pair(pair: dict, threshold: float, max_patterns: int) -> dict:
         candidate["target_match"] = _target_matches_expected(target, pair)
         candidates.append(candidate)
 
-    expectation_type = str(pair.get("expectation_type") or "").strip()
+    if eval_budget_stop is not None:
+        best_partial = max(candidates, key=_candidate_sort_key) if candidates else None
+        return _build_eval_budget_result(
+            pair,
+            seed_topic,
+            expectation_type,
+            eval_budget_stop[0],
+            eval_budget_stop[1],
+            candidate=best_partial,
+        )
+
     matching_candidates = [item for item in candidates if item.get("target_match")]
     matching_transmitted = [
         item for item in matching_candidates if item.get("should_transmit")
@@ -9673,6 +9944,70 @@ def _pattern_diagnostic_text(seed: dict) -> str | None:
     )
 
 
+def _supports_cycle_budget(func: object) -> bool:
+    """Return True when one callable can accept `cycle_budget=`."""
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return False
+    if "cycle_budget" in signature.parameters:
+        return True
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+
+
+def _call_with_cycle_budget(func: object, *args, cycle_budget: CycleBudget):
+    """Call one function with cycle budget only when its signature supports it."""
+    if not _supports_cycle_budget(func):
+        return func(*args)
+    return func(*args, cycle_budget=cycle_budget)
+
+
+def _pattern_budget_exhausted(seed: dict) -> bool:
+    diagnostics = seed.get("pattern_diagnostics")
+    if not isinstance(diagnostics, dict) or not diagnostics:
+        return False
+    return str(diagnostics.get("outcome") or "").strip().startswith("budget_exhausted_")
+
+
+def _jump_budget_exhausted(jump_attempt: object | None) -> bool:
+    hydrated_attempt = _hydrate_jump_attempt_diagnostic(jump_attempt)
+    if hydrated_attempt is not None:
+        return hydrated_attempt.budget_exhausted
+    if not isinstance(jump_attempt, dict):
+        return False
+    return str(jump_attempt.get("stage1_outcome") or "").strip() in {
+        "budget_exhausted_pre_stage1",
+        "budget_exhausted_stage1",
+    }
+
+
+def _jump_budget_outcome_text(jump_attempt: object | None) -> str | None:
+    hydrated_attempt = _hydrate_jump_attempt_diagnostic(jump_attempt)
+    if hydrated_attempt is not None:
+        return str(hydrated_attempt.get("stage1_outcome") or "").strip() or None
+    if not isinstance(jump_attempt, dict):
+        return None
+    text = str(jump_attempt.get("stage1_outcome") or "").strip()
+    return text or None
+
+
+def _budget_stop_text(payload: object | None) -> str | None:
+    hydrated_attempt = _hydrate_jump_attempt_diagnostic(payload)
+    if hydrated_attempt is not None:
+        budget_stop = hydrated_attempt.budget_stop
+    elif isinstance(payload, dict):
+        budget_stop = payload.get("budget_stop")
+    else:
+        return None
+    if not isinstance(budget_stop, dict):
+        return None
+    text = str(budget_stop.get("summary") or "").strip()
+    return text or None
+
+
 def run_cycle(
     cycle_num: int,
     threshold: float,
@@ -9687,6 +10022,11 @@ def run_cycle(
     connections_found = 0
     max_hops_per_cycle = 2
     hops_completed = 0
+    cycle_budget = CycleBudget(
+        max_tavily_calls=MAX_TAVILY_CALLS_PER_CYCLE,
+        max_llm_calls=MAX_LLM_CALLS_PER_CYCLE,
+    )
+    cycle_stopped_by_budget = False
 
     if manual_seed is not None:
         seed = dict(manual_seed)
@@ -9714,11 +10054,16 @@ def run_cycle(
     update_domain_visited(seed["name"], seed["category"])
 
     print("  [Dive] Searching and extracting patterns...")
-    patterns = dive(seed)
+    patterns = _call_with_cycle_budget(dive, seed, cycle_budget=cycle_budget)
     print(f"  [Dive] Found {len(patterns)} patterns")
     pattern_diag_text = _pattern_diagnostic_text(seed)
     if pattern_diag_text:
         print(f"  [Dive] Pattern quality: {pattern_diag_text}")
+    if _pattern_budget_exhausted(seed):
+        cycle_stopped_by_budget = True
+        budget_text = _budget_stop_text(seed.get("pattern_diagnostics"))
+        if budget_text:
+            print(f"  [Budget] {budget_text}")
 
     if not patterns:
         finalize_pattern_diagnostics(seed, connections_found=0)
@@ -9751,12 +10096,20 @@ def run_cycle(
             break
 
         print(f"  [Jump] Pattern {i+1}: {pattern['pattern_name']} → searching...")
-        connection, jump_attempt = lateral_jump_with_diagnostics(
+        connection, jump_attempt = _call_with_cycle_budget(
+            lateral_jump_with_diagnostics,
             pattern,
             seed["name"],
             seed["category"],
+            cycle_budget=cycle_budget,
         )
         append_jump_attempt_diagnostic(seed, jump_attempt)
+        if _jump_budget_exhausted(jump_attempt):
+            cycle_stopped_by_budget = True
+            budget_text = _budget_stop_text(jump_attempt)
+            if budget_text:
+                print(f"  [Budget] {budget_text}")
+            break
         if connection is None:
             print("  [Jump] No connection found")
             consecutive_misses += 1
@@ -9801,11 +10154,17 @@ def run_cycle(
         update_domain_visited(hop_seed["name"], hop_seed["category"])
 
         print("  [Hop-2 Dive] Searching and extracting patterns...")
-        hop_patterns = dive(hop_seed)
+        hop_patterns = _call_with_cycle_budget(dive, hop_seed, cycle_budget=cycle_budget)
         print(f"  [Hop-2 Dive] Found {len(hop_patterns)} patterns")
         hop_pattern_diag_text = _pattern_diagnostic_text(hop_seed)
         if hop_pattern_diag_text:
             print(f"  [Hop-2 Dive] Pattern quality: {hop_pattern_diag_text}")
+        if _pattern_budget_exhausted(hop_seed):
+            cycle_stopped_by_budget = True
+            budget_text = _budget_stop_text(hop_seed.get("pattern_diagnostics"))
+            if budget_text:
+                print(f"  [Budget] {budget_text}")
+            break
         if not hop_patterns:
             continue
 
@@ -9835,12 +10194,20 @@ def run_cycle(
                 f"  [Hop-2 Jump] Pattern {j+1}: "
                 f"{hop_pattern['pattern_name']} → searching..."
             )
-            second_connection, hop_jump_attempt = lateral_jump_with_diagnostics(
+            second_connection, hop_jump_attempt = _call_with_cycle_budget(
+                lateral_jump_with_diagnostics,
                 hop_pattern,
                 hop_seed["name"],
                 hop_seed["category"],
+                cycle_budget=cycle_budget,
             )
             append_jump_attempt_diagnostic(hop_seed, hop_jump_attempt)
+            if _jump_budget_exhausted(hop_jump_attempt):
+                cycle_stopped_by_budget = True
+                budget_text = _budget_stop_text(hop_jump_attempt)
+                if budget_text:
+                    print(f"  [Budget] {budget_text}")
+                break
             if second_connection is None:
                 print("  [Hop-2 Jump] No connection found")
                 hop_consecutive_misses += 1
@@ -9872,6 +10239,9 @@ def run_cycle(
             )
             if tx_sent_2:
                 transmitted = True
+            break
+
+        if cycle_stopped_by_budget:
             break
 
     if connections_found == 0:
