@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="panel page-intro">
+    <div>
+      <p class="eyebrow">Archive</p>
+      <h1 class="page-title">Read the historical trail.</h1>
+      <p class="muted page-text">
+        This page holds the long-term record: cost, transmission timeline, grading, and export-ready outputs.
+      </p>
+    </div>
+    <div class="page-actions">
+      <a class="hero-link" href="{{ url_for('map_page') }}">Open Map</a>
+      <a class="hero-link" href="{{ url_for('review_page') }}">Open Review</a>
+    </div>
+  </section>
+
+  <section class="panel compact-panel">
+    <div class="subpanel-heading">
+      <div>
+        <p class="eyebrow">Costs</p>
+        <h2>Operational Spend</h2>
+      </div>
+    </div>
+    <div id="costs" class="grid">
+      <p class="muted">Loading…</p>
+    </div>
+  </section>
+
+  <section class="panel compact-panel">
+    <div class="subpanel-heading">
+      <div>
+        <p class="eyebrow">Timeline</p>
+        <h2>Transmission History</h2>
+        <p class="muted">A historical view of score evolution and what actually transmitted.</p>
+      </div>
+    </div>
+    <div id="transmission-timeline">
+      <p class="muted">Loading…</p>
+    </div>
+  </section>
+
+  <section class="panel compact-panel">
+    <div class="subpanel-heading">
+      <div>
+        <p class="eyebrow">Archive</p>
+        <h2>Transmission Archive</h2>
+        <p class="muted">Grade transmissions, add notes, and export markdown copies.</p>
+      </div>
+    </div>
+    <div id="grade-summary" class="grade-summary muted" hidden></div>
+    <p id="transmission-count" class="muted">Loading…</p>
+    <div id="transmissions"></div>
+  </section>
+{% endblock %}

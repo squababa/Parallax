@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BlackClaw Observatory</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+</head>
+<body>
+  <button id="theme-toggle" class="theme-toggle" type="button">Light Mode</button>
+
+  <main class="dashboard-shell">
+    <section class="hero panel">
+      <div class="hero-copy">
+        <p class="eyebrow">BlackClaw Observatory</p>
+        <h1>Map the search space, spot the bridges, see the pressure.</h1>
+        <p class="muted hero-text">
+          BlackClaw is a domain-jumping engine. This dashboard should feel like watching that territory take shape, not reading a stack of database tables.
+        </p>
+      </div>
+      <div class="hero-actions">
+        <a class="hero-link" href="/domains">Browse Domains</a>
+        <a class="hero-link" href="/explorations?limit=75">Recent Explorations</a>
+      </div>
+      <div id="hero-summary" class="grid">
+        <p class="muted">Loading live snapshot…</p>
+      </div>
+    </section>
+
+    <section class="panel graph-panel">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Exploration Web</p>
+          <h2>Where BlackClaw Has Been</h2>
+          <p class="muted">
+            Nodes are domains BlackClaw has touched. Links are real seed-to-target jumps. Search to isolate a local neighborhood, or filter down to the strongest and transmitted bridges.
+          </p>
+        </div>
+        <div class="graph-controls">
+          <label class="control-field">
+            <span>View</span>
+            <select id="graph-mode">
+              <option value="all">All explored</option>
+              <option value="successful">Transmitted only</option>
+              <option value="strong">High signal</option>
+            </select>
+          </label>
+          <label class="control-field control-search">
+            <span>Focus</span>
+            <input id="graph-search" type="text" placeholder="Try Locksmithing or Architecture">
+          </label>
+          <label class="control-field control-range">
+            <span>Min score <strong id="graph-score-value">0.00</strong></span>
+            <input id="graph-score" type="range" min="0" max="1" step="0.05" value="0">
+          </label>
+          <button id="graph-zoom-fit" type="button">Zoom To Fit</button>
+          <button id="graph-reset" type="button">Reset View</button>
+        </div>
+      </div>
+
+      <div id="domain-web-summary" class="grid">
+        <p class="muted">Loading graph…</p>
+      </div>
+
+      <div class="graph-layout">
+        <div class="graph-stage">
+          <div class="graph-caption muted">Start with the constellation view, then click a cluster to dive into its local web. Scroll to zoom and drag to pan.</div>
+          <canvas id="domain-web-canvas" class="domain-web-canvas"></canvas>
+          <div id="domain-web-empty" class="graph-empty" hidden>No domains match the current filters.</div>
+          <div class="graph-legend" aria-hidden="true">
+            <span class="legend-item"><span class="legend-bubble"></span>Constellation cluster</span>
+            <span class="legend-item"><span class="legend-dot legend-dot-seed"></span>Seed-heavy</span>
+            <span class="legend-item"><span class="legend-dot legend-dot-target"></span>Target-heavy</span>
+            <span class="legend-item"><span class="legend-dot legend-dot-bridge"></span>Bridge</span>
+            <span class="legend-item"><span class="legend-line"></span>Stronger or transmitted jump</span>
+          </div>
+        </div>
+
+        <aside id="domain-web-detail" class="inspector-panel">
+          <h3>Select Something In The Web</h3>
+          <p class="muted">
+            The inspector turns the graph into something operational. Pick a domain to see its neighborhood, or pick a jump to inspect a specific bridge.
+          </p>
+        </aside>
+      </div>
+    </section>
+
+    <section class="panel workspace-panel">
+      <div class="workspace-header">
+        <div>
+          <p class="eyebrow">Workspaces</p>
+          <h2>Operate The Territory</h2>
+          <p class="muted">
+            Frontier surfaces where BlackClaw looks promising. Failures shows what keeps dying. Review is where we adjudicate evidence and outcomes. Archive preserves the historical trail.
+          </p>
+        </div>
+      </div>
+
+      <div class="workspace-tabs" role="tablist" aria-label="Dashboard workspaces">
+        <button type="button" class="workspace-tab is-active" data-workspace="frontier" role="tab" aria-selected="true">Frontier</button>
+        <button type="button" class="workspace-tab" data-workspace="failures" role="tab" aria-selected="false">Failures</button>
+        <button type="button" class="workspace-tab" data-workspace="review" role="tab" aria-selected="false">Review</button>
+        <button type="button" class="workspace-tab" data-workspace="archive" role="tab" aria-selected="false">Archive</button>
+      </div>
+
+      <div class="workspace-body">
+        <section class="workspace-view is-active" data-workspace-panel="frontier">
+          <section class="subpanel">
+            <div class="subpanel-heading">
+              <div>
+                <h3>Next Moves</h3>
+                <p class="muted">Use the balanced frontier score to decide which region or seed domain BlackClaw should push next.</p>
+              </div>
+              <div class="frontier-mode-toggle" role="tablist" aria-label="Frontier next move mode">
+                <button type="button" class="frontier-mode-button is-active" data-frontier-mode="regions" aria-selected="true">Regions</button>
+                <button type="button" class="frontier-mode-button" data-frontier-mode="seeds" aria-selected="false">Seeds</button>
+              </div>
+            </div>
+            <div id="frontier-next-regions" class="frontier-next-view">
+              <p class="muted">Loading next regions…</p>
+            </div>
+            <div id="frontier-next-seeds" class="frontier-next-view" hidden>
+              <p class="muted">Loading next seeds…</p>
+            </div>
+          </section>
+
+          <div id="frontier-stats" class="grid">
+            <p class="muted">Loading frontier…</p>
+          </div>
+          <div class="split-grid">
+            <section class="subpanel">
+              <div class="subpanel-heading">
+                <div>
+                  <h3>Launchpads</h3>
+                  <p class="muted">Seed domains that keep producing strong or surviving jumps.</p>
+                </div>
+              </div>
+              <div id="frontier-launchpads"></div>
+            </section>
+            <section class="subpanel">
+              <div class="subpanel-heading">
+                <div>
+                  <h3>Strong Bridges</h3>
+                  <p class="muted">The best domain-to-domain jumps BlackClaw has actually made.</p>
+                </div>
+              </div>
+              <div id="frontier-bridges"></div>
+            </section>
+          </div>
+          <section class="subpanel">
+            <div class="subpanel-heading">
+              <div>
+                <h3>Promising Rejects</h3>
+                <p class="muted">High-scoring connections that failed packaging, evidence, or validation and may still deserve another pass.</p>
+              </div>
+            </div>
+            <div id="frontier-salvage"></div>
+          </section>
+        </section>
+
+        <section class="workspace-view" data-workspace-panel="failures" hidden>
+          <div id="stats" class="grid"></div>
+          <div class="split-grid">
+            <section class="subpanel">
+              <div class="subpanel-heading">
+                <div>
+                  <h3>Top Killed Connections</h3>
+                  <p class="muted">High-scoring failures with expandable adversarial detail.</p>
+                </div>
+              </div>
+              <div id="top-killed"></div>
+            </section>
+            <section class="subpanel">
+              <div class="subpanel-heading">
+                <div>
+                  <h3>Salvage Queue</h3>
+                  <p class="muted">Open strong rejections that still look structurally interesting.</p>
+                </div>
+              </div>
+              <div id="failure-salvage"></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="workspace-view" data-workspace-panel="review" hidden>
+          <section class="subpanel">
+            <div class="subpanel-heading">
+              <div>
+                <h3>Operator Home</h3>
+                <p class="muted">A triage snapshot of what needs human attention right now.</p>
+              </div>
+            </div>
+            <div id="operator-home-summary" class="grid">
+              <p class="muted">Loading…</p>
+            </div>
+            <div class="triage-panels">
+              <div class="triage-panel">
+                <h3>Evidence Backlog</h3>
+                <p class="muted">Unreviewed evidence hits ready for manual review.</p>
+                <div id="operator-home-evidence"></div>
+              </div>
+              <div class="triage-panel">
+                <h3>Outcome Backlog</h3>
+                <p class="muted">Predictions closest to outcome adjudication.</p>
+                <div id="operator-home-outcomes"></div>
+              </div>
+              <div class="triage-panel">
+                <h3>Strong Rejections</h3>
+                <p class="muted">Open salvage candidates sorted by score strength.</p>
+                <div id="operator-home-strong-rejections"></div>
+              </div>
+            </div>
+          </section>
+
+          <div class="split-grid">
+            <section class="subpanel">
+              <div class="subpanel-heading">
+                <div>
+                  <h3>Evidence Review</h3>
+                  <p class="muted">Review candidate evidence hits and accept or dismiss them.</p>
+                </div>
+              </div>
+              <div id="evidence-review-stats" class="grid">
+                <p class="muted">Loading…</p>
+              </div>
+              <div id="evidence-review-breakdown"></div>
+              <div id="evidence-review-queue"></div>
+              <div id="evidence-detail" class="detail-panel">
+                <p class="muted">Select an evidence hit to inspect details.</p>
+              </div>
+            </section>
+
+            <section class="subpanel">
+              <div class="subpanel-heading">
+                <div>
+                  <h3>Outcome Review</h3>
+                  <p class="muted">Adjudicate prediction outcomes once evidence starts accumulating.</p>
+                </div>
+              </div>
+              <div id="outcome-suggestion-buckets" class="grid">
+                <p class="muted">Loading…</p>
+              </div>
+              <div id="outcome-review-backlog" class="grid"></div>
+              <div id="outcome-review-queue"></div>
+              <div id="outcome-review-detail" class="detail-panel">
+                <p class="muted">Select a prediction to inspect outcome review detail.</p>
+              </div>
+            </section>
+          </div>
+
+          <section class="subpanel">
+            <div class="subpanel-heading">
+              <div>
+                <h3>Strong Rejections Review</h3>
+                <p class="muted">Inspect and salvage or dismiss high-scoring rejected connections.</p>
+              </div>
+            </div>
+            <div id="strong-rejection-stats" class="grid">
+              <p class="muted">Loading…</p>
+            </div>
+            <div id="strong-rejection-queue"></div>
+            <div id="strong-rejection-detail" class="detail-panel">
+              <p class="muted">Select a strong rejection to inspect details.</p>
+            </div>
+          </section>
+        </section>
+
+        <section class="workspace-view" data-workspace-panel="archive" hidden>
+          <div id="costs" class="grid"></div>
+          <section class="subpanel">
+            <div class="subpanel-heading">
+              <div>
+                <h3>Transmission Timeline</h3>
+                <p class="muted">A historical view of score evolution and what actually transmitted.</p>
+              </div>
+            </div>
+            <div id="transmission-timeline">
+              <p class="muted">Loading…</p>
+            </div>
+          </section>
+
+          <section class="subpanel">
+            <div class="subpanel-heading">
+              <div>
+                <h3>Transmission Archive</h3>
+                <p class="muted">Grade transmissions, add notes, and export markdown copies.</p>
+              </div>
+            </div>
+            <div id="grade-summary" class="grade-summary muted" hidden></div>
+            <p id="transmission-count" class="muted">Loading…</p>
+            <div id="transmissions"></div>
+          </section>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <script src="{{ url_for('static', filename='dashboard.js') }}" defer></script>
+</body>
+</html>

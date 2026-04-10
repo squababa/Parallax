@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="panel page-intro">
+    <div>
+      <p class="eyebrow">Frontier</p>
+      <h1 class="page-title">Decide where BlackClaw should push next.</h1>
+      <p class="muted page-text">
+        Regions and seed domains are ranked from observed behavior, not speculation. Use this page to pick the next region, inspect the strongest bridges, and understand why good paths are dying.
+      </p>
+    </div>
+    <div class="page-actions">
+      <a class="hero-link" href="{{ url_for('map_page') }}">Open Map</a>
+      <a class="hero-link" href="{{ url_for('review_page') }}">Open Review</a>
+    </div>
+  </section>
+
+  <section class="panel compact-panel">
+    <div class="subpanel-heading">
+      <div>
+        <p class="eyebrow">Next Moves</p>
+        <h2>Frontier Navigator</h2>
+        <p class="muted">Switch between region-level and seed-level recommendations, then jump straight into the map when you want to inspect them spatially.</p>
+      </div>
+      <div class="frontier-mode-toggle" role="tablist" aria-label="Frontier next move mode">
+        <button type="button" class="frontier-mode-button is-active" data-frontier-mode="regions" aria-selected="true">Regions</button>
+        <button type="button" class="frontier-mode-button" data-frontier-mode="seeds" aria-selected="false">Seeds</button>
+      </div>
+    </div>
+    <div id="frontier-next-regions" class="frontier-next-view">
+      <p class="muted">Loading next regions…</p>
+    </div>
+    <div id="frontier-next-seeds" class="frontier-next-view" hidden>
+      <p class="muted">Loading next seeds…</p>
+    </div>
+  </section>
+
+  <section class="panel compact-panel">
+    <div id="frontier-stats" class="grid">
+      <p class="muted">Loading frontier…</p>
+    </div>
+  </section>
+
+  <section class="split-grid">
+    <section class="subpanel">
+      <div class="subpanel-heading">
+        <div>
+          <h3>Launchpads</h3>
+          <p class="muted">Seed domains that keep producing strong or surviving jumps.</p>
+        </div>
+      </div>
+      <div id="frontier-launchpads"></div>
+    </section>
+
+    <section class="subpanel">
+      <div class="subpanel-heading">
+        <div>
+          <h3>Strong Bridges</h3>
+          <p class="muted">The best domain-to-domain jumps BlackClaw has actually made.</p>
+        </div>
+      </div>
+      <div id="frontier-bridges"></div>
+    </section>
+  </section>
+
+  <section class="panel compact-panel">
+    <div class="subpanel-heading">
+      <div>
+        <h3>Promising Rejects</h3>
+        <p class="muted">High-scoring connections that failed packaging, evidence, or validation and may still deserve another pass.</p>
+      </div>
+    </div>
+    <div id="frontier-salvage"></div>
+  </section>
+
+  <section class="panel compact-panel">
+    <div class="subpanel-heading">
+      <div>
+        <p class="eyebrow">Failure Signals</p>
+        <h2>Why Good Paths Keep Dying</h2>
+        <p class="muted">Keep the failure landscape close to the frontier, but separate from the main recommendation flow.</p>
+      </div>
+    </div>
+    <div id="stats" class="grid"></div>
+    <div class="split-grid">
+      <section class="subpanel">
+        <div class="subpanel-heading">
+          <div>
+            <h3>Top Killed Connections</h3>
+            <p class="muted">High-scoring failures with expandable adversarial detail.</p>
+          </div>
+        </div>
+        <div id="top-killed"></div>
+      </section>
+
+      <section class="subpanel">
+        <div class="subpanel-heading">
+          <div>
+            <h3>Salvage Queue</h3>
+            <p class="muted">Open strong rejections that still look structurally interesting.</p>
+          </div>
+        </div>
+        <div id="failure-salvage"></div>
+      </section>
+    </div>
+  </section>
+{% endblock %}

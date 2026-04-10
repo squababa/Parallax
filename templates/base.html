@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ page_title }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+</head>
+<body data-page="{{ page_key }}">
+  <button id="theme-toggle" class="theme-toggle" type="button">Light Mode</button>
+
+  <header class="site-header">
+    <div class="site-header-inner">
+      <a class="site-brand" href="{{ url_for('index') }}">
+        <span class="site-brand-mark">BlackClaw</span>
+        <span class="site-brand-subtitle">Observatory</span>
+      </a>
+
+      <nav class="site-nav" aria-label="Primary">
+        <a class="site-nav-link{% if page_key == 'home' %} is-active{% endif %}" href="{{ url_for('index') }}">Home</a>
+        <a class="site-nav-link{% if page_key == 'map' %} is-active{% endif %}" href="{{ url_for('map_page') }}">Map</a>
+        <a class="site-nav-link{% if page_key == 'frontier' %} is-active{% endif %}" href="{{ url_for('frontier_page') }}">Frontier</a>
+        <a class="site-nav-link{% if page_key == 'review' %} is-active{% endif %}" href="{{ url_for('review_page') }}">Review</a>
+        <a class="site-nav-link{% if page_key == 'archive' %} is-active{% endif %}" href="{{ url_for('archive_page') }}">Archive</a>
+      </nav>
+
+      <div class="site-utility-links">
+        <a class="site-utility-link" href="/domains">Domains</a>
+        <a class="site-utility-link" href="/explorations?limit=75">Explorations</a>
+      </div>
+    </div>
+  </header>
+
+  <main class="dashboard-shell site-shell">
+    {% block content %}{% endblock %}
+  </main>
+
+  <script src="{{ url_for('static', filename='dashboard.js') }}" defer></script>
+</body>
+</html>

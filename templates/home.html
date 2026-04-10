@@ -1,0 +1,149 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="hero panel hero-home">
+    <div class="hero-copy">
+      <p class="eyebrow">BlackClaw Observatory</p>
+      <h1>Explore the territory without drowning in the dashboard.</h1>
+      <p class="muted hero-text">
+        This is the website front door for BlackClaw. Start with the map, see the highest-pressure next moves, and jump into review only when it actually needs you.
+      </p>
+    </div>
+    <div class="hero-actions">
+      <a class="hero-link" href="{{ url_for('map_page') }}">Open Map</a>
+      <a class="hero-link" href="{{ url_for('frontier_page') }}">See Frontier</a>
+      <a class="hero-link" href="{{ url_for('review_page') }}">Review Queue</a>
+    </div>
+    <div id="hero-summary" class="grid">
+      <p class="muted">Loading live snapshot…</p>
+    </div>
+  </section>
+
+  <section class="home-overview-grid">
+    <section class="panel graph-panel">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Exploration Web</p>
+          <h2>Where BlackClaw Has Been</h2>
+          <p class="muted">
+            Start in the constellation view, then click a region to zoom into the live web of explored jumps.
+          </p>
+        </div>
+        <div class="graph-controls">
+          <label class="control-field">
+            <span>View</span>
+            <select id="graph-mode">
+              <option value="all">All explored</option>
+              <option value="successful">Transmitted only</option>
+              <option value="strong">High signal</option>
+            </select>
+          </label>
+          <label class="control-field control-search">
+            <span>Focus</span>
+            <input id="graph-search" type="text" placeholder="Try Locksmithing or Architecture">
+          </label>
+          <label class="control-field control-range">
+            <span>Min score <strong id="graph-score-value">0.00</strong></span>
+            <input id="graph-score" type="range" min="0" max="1" step="0.05" value="0">
+          </label>
+          <button id="graph-zoom-fit" type="button">Zoom To Fit</button>
+          <button id="graph-reset" type="button">Reset View</button>
+        </div>
+      </div>
+
+      <div id="domain-web-summary" class="grid">
+        <p class="muted">Loading graph…</p>
+      </div>
+
+      <div class="graph-layout">
+        <div class="graph-stage">
+          <div class="graph-caption muted">Scroll to zoom, drag to pan, and click a cluster bubble to dive into its local web.</div>
+          <canvas id="domain-web-canvas" class="domain-web-canvas"></canvas>
+          <div id="domain-web-empty" class="graph-empty" hidden>No domains match the current filters.</div>
+          <div class="graph-legend" aria-hidden="true">
+            <span class="legend-item"><span class="legend-bubble"></span>Constellation cluster</span>
+            <span class="legend-item"><span class="legend-dot legend-dot-seed"></span>Seed-heavy</span>
+            <span class="legend-item"><span class="legend-dot legend-dot-target"></span>Target-heavy</span>
+            <span class="legend-item"><span class="legend-dot legend-dot-bridge"></span>Bridge</span>
+            <span class="legend-item"><span class="legend-line"></span>Stronger or transmitted jump</span>
+          </div>
+        </div>
+
+        <aside id="domain-web-detail" class="inspector-panel">
+          <h3>Select Something In The Web</h3>
+          <p class="muted">The inspector turns the map into a readable story about BlackClaw’s territory.</p>
+        </aside>
+      </div>
+    </section>
+
+    <aside class="home-side-stack">
+      <section class="panel compact-panel">
+        <div class="subpanel-heading">
+          <div>
+            <p class="eyebrow">Review Pressure</p>
+            <h2>What Needs Human Attention</h2>
+          </div>
+        </div>
+        <div id="operator-home-summary" class="grid">
+          <p class="muted">Loading…</p>
+        </div>
+        <div class="panel-link-grid">
+          <a class="panel-link-card" href="{{ url_for('review_page') }}">
+            <strong>Open Review</strong>
+            <span class="muted">Evidence, outcomes, and strong rejections</span>
+          </a>
+          <a class="panel-link-card" href="{{ url_for('archive_page') }}">
+            <strong>Open Archive</strong>
+            <span class="muted">Timeline, transmissions, and grading</span>
+          </a>
+        </div>
+      </section>
+
+      <section class="panel compact-panel">
+        <div class="subpanel-heading">
+          <div>
+            <p class="eyebrow">Site Map</p>
+            <h2>Use The Right Workspace</h2>
+          </div>
+        </div>
+        <div class="panel-link-grid">
+          <a class="panel-link-card" href="{{ url_for('map_page') }}">
+            <strong>Map</strong>
+            <span class="muted">Explore clusters, nodes, and jump structure</span>
+          </a>
+          <a class="panel-link-card" href="{{ url_for('frontier_page') }}">
+            <strong>Frontier</strong>
+            <span class="muted">See ranked regions, seeds, and promising rejects</span>
+          </a>
+          <a class="panel-link-card" href="{{ url_for('review_page') }}">
+            <strong>Review</strong>
+            <span class="muted">Work the queues without the rest of the system around you</span>
+          </a>
+          <a class="panel-link-card" href="{{ url_for('archive_page') }}">
+            <strong>Archive</strong>
+            <span class="muted">Inspect transmission history and operational cost</span>
+          </a>
+        </div>
+      </section>
+    </aside>
+  </section>
+
+  <section class="panel compact-panel">
+    <div class="subpanel-heading">
+      <div>
+        <p class="eyebrow">Next Moves</p>
+        <h2>Frontier Preview</h2>
+        <p class="muted">The highest-leverage regions right now, without opening the full Frontier workspace.</p>
+      </div>
+      <div class="hero-actions">
+        <a class="hero-link" href="{{ url_for('frontier_page') }}">See Full Frontier</a>
+      </div>
+    </div>
+    <div id="frontier-stats" class="grid">
+      <p class="muted">Loading frontier…</p>
+    </div>
+    <div id="frontier-next-regions" class="frontier-next-view">
+      <p class="muted">Loading next regions…</p>
+    </div>
+  </section>
+{% endblock %}

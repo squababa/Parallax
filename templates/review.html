@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="panel page-intro">
+    <div>
+      <p class="eyebrow">Review</p>
+      <h1 class="page-title">Handle evidence, outcomes, and salvage work.</h1>
+      <p class="muted page-text">
+        This page is for operational review only. The graph and archive are out of the way so the adjudication work can stay focused and fast.
+      </p>
+    </div>
+    <div class="page-actions">
+      <a class="hero-link" href="{{ url_for('frontier_page') }}">Back To Frontier</a>
+      <a class="hero-link" href="{{ url_for('archive_page') }}">Open Archive</a>
+    </div>
+  </section>
+
+  <section class="panel compact-panel">
+    <div class="subpanel-heading">
+      <div>
+        <p class="eyebrow">Operator Home</p>
+        <h2>What Needs Human Attention</h2>
+        <p class="muted">A triage snapshot of what needs attention right now.</p>
+      </div>
+    </div>
+    <div id="operator-home-summary" class="grid">
+      <p class="muted">Loading…</p>
+    </div>
+    <div class="triage-panels">
+      <div class="triage-panel">
+        <h3>Evidence Backlog</h3>
+        <p class="muted">Unreviewed evidence hits ready for manual review.</p>
+        <div id="operator-home-evidence"></div>
+      </div>
+      <div class="triage-panel">
+        <h3>Outcome Backlog</h3>
+        <p class="muted">Predictions closest to outcome adjudication.</p>
+        <div id="operator-home-outcomes"></div>
+      </div>
+      <div class="triage-panel">
+        <h3>Strong Rejections</h3>
+        <p class="muted">Open salvage candidates sorted by score strength.</p>
+        <div id="operator-home-strong-rejections"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="split-grid">
+    <section class="subpanel">
+      <div class="subpanel-heading">
+        <div>
+          <h3>Evidence Review</h3>
+          <p class="muted">Review candidate evidence hits and accept or dismiss them.</p>
+        </div>
+      </div>
+      <div id="evidence-review-stats" class="grid">
+        <p class="muted">Loading…</p>
+      </div>
+      <div id="evidence-review-breakdown"></div>
+      <div id="evidence-review-queue"></div>
+      <div id="evidence-detail" class="detail-panel">
+        <p class="muted">Select an evidence hit to inspect details.</p>
+      </div>
+    </section>
+
+    <section class="subpanel">
+      <div class="subpanel-heading">
+        <div>
+          <h3>Outcome Review</h3>
+          <p class="muted">Adjudicate prediction outcomes once evidence starts accumulating.</p>
+        </div>
+      </div>
+      <div id="outcome-suggestion-buckets" class="grid">
+        <p class="muted">Loading…</p>
+      </div>
+      <div id="outcome-review-backlog" class="grid"></div>
+      <div id="outcome-review-queue"></div>
+      <div id="outcome-review-detail" class="detail-panel">
+        <p class="muted">Select a prediction to inspect outcome review detail.</p>
+      </div>
+    </section>
+  </section>
+
+  <section class="panel compact-panel">
+    <div class="subpanel-heading">
+      <div>
+        <h3>Strong Rejections Review</h3>
+        <p class="muted">Inspect and salvage or dismiss high-scoring rejected connections.</p>
+      </div>
+    </div>
+    <div id="strong-rejection-stats" class="grid">
+      <p class="muted">Loading…</p>
+    </div>
+    <div id="strong-rejection-queue"></div>
+    <div id="strong-rejection-detail" class="detail-panel">
+      <p class="muted">Select a strong rejection to inspect details.</p>
+    </div>
+  </section>
+{% endblock %}
