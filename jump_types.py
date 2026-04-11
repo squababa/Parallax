@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 from collections.abc import Iterator, MutableMapping
 from dataclasses import asdict, dataclass, field
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 
 
 class JumpSearchResult(TypedDict, total=False):
@@ -124,6 +124,7 @@ class JumpAttemptDiagnostic(MutableMapping[str, Any]):
     budget_exhausted: bool = False
     stage1_soft_gate_attempted: bool = False
     stage1_soft_gate_recovered: bool = False
+    stage1_failure_subtype: str | None = None
     stage2_failed_at: str | None = None
     stage2_incomplete_fields: list[str] = field(default_factory=list)
     budget_stop: dict[str, Any] | None = None
@@ -316,6 +317,7 @@ class JumpAttemptDiagnostic(MutableMapping[str, Any]):
             "stage1_outcome": self._stage1_outcome,
             "stage1_target_domain": self._stage1_target_domain,
             "stage1_failure_hint": self._stage1_failure_hint,
+            "stage1_failure_subtype": self.stage1_failure_subtype,
             "stage1_soft_gate_attempted": self.stage1_soft_gate_attempted,
             "stage1_soft_gate_recovered": self.stage1_soft_gate_recovered,
             "stage2_outcome": self._stage2_outcome,
@@ -363,6 +365,9 @@ class JumpAttemptDiagnostic(MutableMapping[str, Any]):
             ),
             stage1_soft_gate_recovered=_bool_value(
                 payload.get("stage1_soft_gate_recovered")
+            ),
+            stage1_failure_subtype=_clean_optional_text(
+                payload.get("stage1_failure_subtype")
             ),
             stage2_failed_at=_clean_optional_text(payload.get("stage2_failed_at")),
             stage2_incomplete_fields=_string_list(payload.get("stage2_incomplete_fields")),
@@ -596,6 +601,87 @@ class JumpAttemptDiagnostic(MutableMapping[str, Any]):
 
     def __len__(self) -> int:
         return len(self.to_dict())
+
+
+JumpFailureAttribution = Literal[
+    "pre_stage1_failure",
+    "stage1_failure",
+    "stage2_failure",
+    "successful_connection",
+    "ambiguous_failure",
+]
+
+_PRE_STAGE1_FAILURE_HINTS = {
+    "empty_jump_query",
+    "search_error",
+    "no_usable_results",
+}
+
+_CLEAR_STAGE1_NO_RESULTS_HINTS = {
+    "generation_failed",
+    "invalid_json",
+    "invalid_payload",
+    "invalid_payload_non_object",
+}
+
+
+def classify_jump_attempt_attribution(payload: object) -> JumpFailureAttribution:
+    """Classify where a jump attempt appears to have failed."""
+    diagnostic = JumpAttemptDiagnostic.from_dict(payload)
+    if diagnostic is None:
+        return "ambiguous_failure"
+
+    outcome = _clean_optional_text(diagnostic.outcome)
+    failure_stage = _clean_optional_text(diagnostic.failure_stage)
+    stage1_outcome = _clean_optional_text(diagnostic.get("stage1_outcome"))
+    stage1_failure_hint = _clean_optional_text(diagnostic.get("stage1_failure_hint"))
+    stage1_failure_subtype = _clean_optional_text(
+        diagnostic.get("stage1_failure_subtype")
+    )
+    stage2_outcome = _clean_optional_text(diagnostic.get("stage2_outcome"))
+    stage2_failure_hint = _clean_optional_text(diagnostic.get("stage2_failure_hint"))
+    target_domain = _clean_optional_text(diagnostic.target_domain)
+    stage2_failed_at = _clean_optional_text(diagnostic.stage2_failed_at)
+    stage2_incomplete_fields = _string_list(diagnostic.stage2_incomplete_fields)
+
+    if outcome == "connection_found" or stage2_outcome == "connection_found":
+        return "successful_connection"
+    if failure_stage == "stage2" or stage2_outcome == "stage2_no_connection":
+        return "stage2_failure"
+    if (
+        stage1_outcome == "detect_signal"
+        and target_domain
+        and (
+            stage2_failed_at
+            or stage2_failure_hint
+            or stage2_incomplete_fields
+        )
+    ):
+        return "stage2_failure"
+    if (
+        failure_stage == "pre_stage1"
+        or stage1_outcome == "budget_exhausted_pre_stage1"
+        or (
+            stage1_outcome == "no_results"
+            and (stage1_failure_hint or stage2_failure_hint) in _PRE_STAGE1_FAILURE_HINTS
+        )
+    ):
+        return "pre_stage1_failure"
+    if stage1_outcome in {
+        "detect_no_signal",
+        "weak_signal",
+        "budget_exhausted_stage1",
+    }:
+        return "stage1_failure"
+    if failure_stage == "stage1" and stage1_outcome != "no_results":
+        return "stage1_failure"
+    if stage1_outcome == "no_results":
+        if stage1_failure_subtype:
+            return "stage1_failure"
+        if stage1_failure_hint in _CLEAR_STAGE1_NO_RESULTS_HINTS:
+            return "stage1_failure"
+        return "ambiguous_failure"
+    return "ambiguous_failure"
 
 
 @dataclass

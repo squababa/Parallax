@@ -68,19 +68,22 @@ Strict rules:
 - Strong structural clues include similar threshold behavior, routing, bottlenecks, feedback loops, switching conditions, or gating logic.
 - Treat titles, provenance labels, and snippets as evidence, but weight concrete mechanism-bearing snippets more heavily than broad topical overlap or generic titles.
 - If SEARCH RESULTS are grouped into candidate clusters, reason cluster-by-cluster and prefer the strongest coherent cluster over isolated snippet overlap.
-- Approve only when one candidate domain shows one concrete target-domain process, one concrete shared constraint/mechanism, and one concrete workaround or operating response in the same evidence cluster.
-- Approve only when the target domain shows both the shared causal structure and concrete evidence of an already engineered workaround, mitigation, or operating response to that constraint.
+- Approve confidently when one candidate domain shows one concrete target-domain process, one concrete shared constraint/mechanism, and one concrete workaround or operating response in the same evidence cluster.
+- Treat the strongest positive cases as the ones where the target domain shows both the shared causal structure and concrete evidence of an already engineered workaround, mitigation, or operating response to that constraint.
 - Treat a concrete engineered intervention, operating adjustment, suppression/control response, or manipulated-condition change as valid solution-bearing evidence when it clearly manages the same constraint or failure mode.
 - A paper can count as solution-bearing even without the literal word `workaround` if it shows one concrete target-domain intervention that changes the same bottleneck, failure mode, or control problem.
+- If one candidate domain already shows a plausible target-domain process, a plausible shared structural signal, and supporting evidence, do not return `no_connection: true` solely because workaround or solution evidence is incomplete.
+- In those borderline-but-plausible cases, return `no_connection: false` with `target_domain`, `signal`, and `evidence` so the caller can treat it as a partial positive.
+- Include `solution_evidence` only when one concrete workaround, mitigation, operating response, or engineered intervention is concretely grounded in the retrieved material. If that part is weak, incomplete, or only implied, omit `solution_evidence` instead of flipping the whole case to `no_connection: true`.
 - Reject vague analogies, keyword overlap, and broad theme matches without similar causal organization.
 - Reject universal principles that connect everything (generic feedback, emergence, optimization, networks).
 - If multiple candidate domains appear, prefer the one with the clearest retrieved workaround or mitigation evidence.
 - Do not treat broad process description, descriptive operating context, or mechanism background alone as solution evidence unless it includes one concrete operator-relevant intervention or engineered response.
-- If the search results only restate the problem, constraint, or failure mode without concrete workaround evidence, return no_connection.
+- If the search results only restate the problem, constraint, or failure mode and do not support a plausible target-domain process plus shared structural signal, return no_connection.
 
 Return ONLY valid JSON. No markdown.
 If no real signal: {{"no_connection": true}}
-If yes signal:
+If yes signal or borderline partial positive:
 {{
   "no_connection": false,
   "target_domain": "specific target field",
@@ -6359,6 +6362,46 @@ def _stage_one_solution_evidence_is_placeholder(solution_evidence: str) -> bool:
     )
 
 
+def _stage_one_solution_evidence_failure_subtype(
+    solution_evidence: str,
+    search_results: str,
+) -> str | None:
+    """Return one concrete subtype when Stage 1 solution evidence is insufficient."""
+    normalized = _normalize_stage_one_solution_evidence_text(solution_evidence)
+    if not normalized:
+        return "solution_evidence_missing"
+    if _stage_one_solution_evidence_is_placeholder(solution_evidence):
+        return "solution_evidence_placeholder"
+
+    normalized_solution_evidence = " ".join(
+        str(solution_evidence or "").split()
+    ).strip()
+    if not normalized_solution_evidence:
+        return "solution_evidence_missing"
+    if normalized_solution_evidence.lower() in str(search_results or "").lower():
+        return None
+
+    grounding_tokens = _stage_one_search_result_grounding_tokens(search_results)
+    solution_tokens = {
+        token
+        for token in _tokenize_query_terms(normalized_solution_evidence)
+        if token not in GENERIC_QUERY_TOKENS
+        and token not in WEAK_QUERY_TOKENS
+        and token not in JUMP_QUERY_FILLER_TOKENS
+        and token not in QUERY_PHRASE_STOPWORDS
+        and token not in STAGE_ONE_SOLUTION_EVIDENCE_GENERIC_TOKENS
+        and len(token) > 2
+    }
+    if not solution_tokens:
+        return "solution_evidence_ungrounded"
+    if len(solution_tokens.intersection(grounding_tokens)) >= min(
+        2,
+        len(solution_tokens),
+    ):
+        return None
+    return "solution_evidence_ungrounded"
+
+
 def _stage_one_search_result_grounding_tokens(search_results: str) -> set[str]:
     """Extract non-metadata tokens from Stage 1 title/snippet lines."""
     evidence_lines: list[str] = []
@@ -6389,32 +6432,12 @@ def _stage_one_solution_evidence_is_grounded(
     search_results: str,
 ) -> bool:
     """Check that Stage 1 solution evidence is concrete and grounded in retrieved text."""
-    if _stage_one_solution_evidence_is_placeholder(solution_evidence):
-        return False
-    normalized_solution_evidence = " ".join(
-        str(solution_evidence or "").split()
-    ).strip()
-    if not normalized_solution_evidence:
-        return False
-    if normalized_solution_evidence.lower() in str(search_results or "").lower():
-        return True
-
-    grounding_tokens = _stage_one_search_result_grounding_tokens(search_results)
-    solution_tokens = {
-        token
-        for token in _tokenize_query_terms(normalized_solution_evidence)
-        if token not in GENERIC_QUERY_TOKENS
-        and token not in WEAK_QUERY_TOKENS
-        and token not in JUMP_QUERY_FILLER_TOKENS
-        and token not in QUERY_PHRASE_STOPWORDS
-        and token not in STAGE_ONE_SOLUTION_EVIDENCE_GENERIC_TOKENS
-        and len(token) > 2
-    }
-    if not solution_tokens:
-        return False
-    return len(solution_tokens.intersection(grounding_tokens)) >= min(
-        2,
-        len(solution_tokens),
+    return (
+        _stage_one_solution_evidence_failure_subtype(
+            solution_evidence,
+            search_results,
+        )
+        is None
     )
 
 
@@ -6424,6 +6447,7 @@ def _stage_one_detect_with_diagnostics(
     search_results: str,
     cycle_budget: CycleBudget | None = None,
 ) -> tuple[dict | None, str | None]:
+    setattr(_stage_one_detect_with_diagnostics, "last_failure_subtype", None)
     prompt = DETECT_PROMPT.format(
         source_domain=source_domain,
         abstract_structure=abstract_structure,
@@ -6440,28 +6464,66 @@ def _stage_one_detect_with_diagnostics(
             budget_outcome="budget_exhausted_stage1",
         )
     if extracted_json is None:
+        setattr(_stage_one_detect_with_diagnostics, "last_failure_subtype", "generation_failed")
         return None, "generation_failed"
     try:
         data = json.loads(extracted_json)
     except json.JSONDecodeError:
+        setattr(_stage_one_detect_with_diagnostics, "last_failure_subtype", "invalid_json")
         return None, "invalid_json"
     if not isinstance(data, dict):
+        setattr(_stage_one_detect_with_diagnostics, "last_failure_subtype", "invalid_payload_non_object")
         return None, "invalid_payload"
+    no_connection_defaulted = "no_connection" not in data
     if data.get("no_connection", True):
+        setattr(
+            _stage_one_detect_with_diagnostics,
+            "last_failure_subtype",
+            (
+                "implicit_no_connection_defaulted"
+                if no_connection_defaulted
+                else "explicit_no_connection"
+            ),
+        )
         return None, "no_connection"
     target_domain = str(data.get("target_domain", "")).strip()
     signal = str(data.get("signal", "")).strip()
     evidence = str(data.get("evidence", "")).strip()
     solution_evidence = str(data.get("solution_evidence", "")).strip()
-    if not target_domain or not signal or not evidence:
+    if not target_domain:
+        setattr(
+            _stage_one_detect_with_diagnostics,
+            "last_failure_subtype",
+            "invalid_payload_missing_target",
+        )
+        return None, "invalid_payload"
+    if not signal:
+        setattr(
+            _stage_one_detect_with_diagnostics,
+            "last_failure_subtype",
+            "invalid_payload_missing_signal",
+        )
+        return None, "invalid_payload"
+    if not evidence:
+        setattr(
+            _stage_one_detect_with_diagnostics,
+            "last_failure_subtype",
+            "invalid_payload_missing_evidence",
+        )
         return None, "invalid_payload"
     data["target_domain"] = target_domain
     data["signal"] = signal
     data["evidence"] = evidence
-    if not _stage_one_solution_evidence_is_grounded(
+    solution_evidence_failure_subtype = _stage_one_solution_evidence_failure_subtype(
         solution_evidence,
         search_results,
-    ):
+    )
+    if solution_evidence_failure_subtype is not None:
+        setattr(
+            _stage_one_detect_with_diagnostics,
+            "last_failure_subtype",
+            solution_evidence_failure_subtype,
+        )
         data.pop("solution_evidence", None)
         return data, "missing_solution_evidence"
     data["solution_evidence"] = solution_evidence
@@ -6857,6 +6919,7 @@ def _apply_stage_one_diagnostic(
     stage_one: dict | None,
     stage_one_outcome: str,
     stage_one_failure_hint: str | None,
+    stage_one_failure_subtype: str | None = None,
 ) -> None:
     diagnostic["stage1_outcome"] = stage_one_outcome
     diagnostic["stage1_target_domain"] = (
@@ -6867,6 +6930,9 @@ def _apply_stage_one_diagnostic(
     diagnostic["stage1_failure_hint"] = (
         None if stage_one_outcome == "detect_signal" else stage_one_failure_hint
     )
+    diagnostic["stage1_failure_subtype"] = (
+        None if stage_one_outcome == "detect_signal" else stage_one_failure_subtype
+    )
 
 
 def _return_runtime_terminal_result(
@@ -6874,6 +6940,7 @@ def _return_runtime_terminal_result(
     *,
     stage_one_outcome: str,
     stage_one_failure_hint: str | None,
+    stage_one_failure_subtype: str | None = None,
     stage_one: dict | None = None,
     budget_stop: dict | None = None,
 ) -> tuple[None, JumpAttemptDiagnostic]:
@@ -6882,6 +6949,7 @@ def _return_runtime_terminal_result(
         stage_one,
         str(stage_one_outcome or "").strip() or "no_results",
         stage_one_failure_hint,
+        stage_one_failure_subtype,
     )
     if budget_stop is not None:
         diagnostic["budget_stop"] = budget_stop
@@ -6943,6 +7011,7 @@ def _run_post_pre_stage1_flow(
 ) -> tuple[dict | None, dict | None, str, str | None]:
     stage_one = copy.deepcopy(stage_one_success) if isinstance(stage_one_success, dict) else None
     stage_one_failure_hint = None
+    stage_one_failure_subtype = None
 
     if stage_one is None:
         stage_one, stage_one_failure_hint = _stage_one_detect_with_diagnostics(
@@ -6950,6 +7019,13 @@ def _run_post_pre_stage1_flow(
             abstract_structure=abstract_structure,
             search_results=search_results,
             cycle_budget=cycle_budget,
+        )
+        stage_one_failure_subtype = (
+            str(
+                getattr(_stage_one_detect_with_diagnostics, "last_failure_subtype", "")
+                or ""
+            ).strip()
+            or None
         )
         stage_one_outcome = _classify_stage_one_outcome(
             stage_one,
@@ -6963,6 +7039,7 @@ def _run_post_pre_stage1_flow(
         stage_one,
         stage_one_outcome,
         stage_one_failure_hint,
+        stage_one_failure_subtype,
     )
     if stage_one_outcome != "detect_signal" or not isinstance(stage_one, dict):
         return None, stage_one, stage_one_outcome, stage_one_failure_hint
@@ -7086,6 +7163,9 @@ def lateral_jump_with_diagnostics(
     initial_stage_one = stage_one
     initial_stage_one_failure_hint = stage_one_failure_hint
     initial_stage_one_outcome = stage_one_outcome
+    initial_stage_one_failure_subtype = (
+        str(diagnostic.get("stage1_failure_subtype") or "").strip() or None
+    )
 
     if stage_one_outcome == "weak_signal":
         diagnostic["stage1_soft_gate_attempted"] = True
@@ -7155,6 +7235,7 @@ def lateral_jump_with_diagnostics(
                 diagnostic,
                 stage_one_outcome=initial_stage_one_outcome,
                 stage_one_failure_hint=initial_stage_one_failure_hint,
+                stage_one_failure_subtype=initial_stage_one_failure_subtype,
                 stage_one=initial_stage_one,
             )
 

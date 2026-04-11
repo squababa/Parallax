@@ -43,7 +43,11 @@ import explore
 import jump
 import main
 import store
-from jump_types import JumpQueryBuildResult
+from jump_types import (
+    JumpAttemptDiagnostic,
+    JumpQueryBuildResult,
+    classify_jump_attempt_attribution,
+)
 
 
 @pytest.fixture()
@@ -79,6 +83,33 @@ def _make_jump_query_build_result(
         transferable_query_profile=dict(transferable_query_profile or {}),
         query_collision_guard_applied=query_collision_guard_applied,
     )
+
+
+def test_classify_jump_attempt_attribution_marks_local_stage1_generation_failure() -> None:
+    diagnostic = JumpAttemptDiagnostic(pattern_name="x")
+    diagnostic["stage1_outcome"] = "no_results"
+    diagnostic["stage1_failure_hint"] = "generation_failed"
+    diagnostic["stage1_failure_subtype"] = "generation_failed"
+
+    assert classify_jump_attempt_attribution(diagnostic) == "stage1_failure"
+
+
+def test_classify_jump_attempt_attribution_marks_local_stage1_invalid_json() -> None:
+    diagnostic = JumpAttemptDiagnostic(pattern_name="x")
+    diagnostic["stage1_outcome"] = "no_results"
+    diagnostic["stage1_failure_hint"] = "invalid_json"
+    diagnostic["stage1_failure_subtype"] = "invalid_json"
+
+    assert classify_jump_attempt_attribution(diagnostic) == "stage1_failure"
+
+
+def test_classify_jump_attempt_attribution_preserves_true_prestage1_no_results() -> None:
+    diagnostic = JumpAttemptDiagnostic(pattern_name="x")
+    diagnostic["stage1_outcome"] = "no_results"
+    diagnostic["stage1_failure_hint"] = "no_usable_results"
+    diagnostic["stage1_failure_subtype"] = "generation_failed"
+
+    assert classify_jump_attempt_attribution(diagnostic) == "pre_stage1_failure"
 
 
 def _make_fake_build_jump_search_queries(
@@ -2633,16 +2664,53 @@ def test_stage_one_detect_prompt_prefers_solution_bearing_analogues(
 
     assert data is None
     assert failure_hint == "no_connection"
+    assert (
+        getattr(jump._stage_one_detect_with_diagnostics, "last_failure_subtype", None)
+        == "explicit_no_connection"
+    )
     assert "weight concrete mechanism-bearing snippets more heavily than broad topical overlap or generic titles" in captured["prompt"]
     assert "reason cluster-by-cluster and prefer the strongest coherent cluster over isolated snippet overlap" in captured["prompt"]
     assert "one concrete target-domain process, one concrete shared constraint/mechanism, and one concrete workaround or operating response in the same evidence cluster" in captured["prompt"]
     assert "concrete evidence of an already engineered workaround" in captured["prompt"]
     assert "Treat a concrete engineered intervention, operating adjustment, suppression/control response, or manipulated-condition change as valid solution-bearing evidence" in captured["prompt"]
     assert "A paper can count as solution-bearing even without the literal word `workaround`" in captured["prompt"]
+    assert "do not return `no_connection: true` solely because workaround or solution evidence is incomplete" in captured["prompt"]
+    assert "return `no_connection: false` with `target_domain`, `signal`, and `evidence`" in captured["prompt"]
+    assert "omit `solution_evidence` instead of flipping the whole case to `no_connection: true`" in captured["prompt"]
     assert "prefer the one with the clearest retrieved workaround or mitigation evidence" in captured["prompt"]
     assert "Do not treat broad process description, descriptive operating context, or mechanism background alone as solution evidence" in captured["prompt"]
-    assert "only restate the problem, constraint, or failure mode without concrete workaround evidence" in captured["prompt"]
+    assert "only restate the problem, constraint, or failure mode and do not support a plausible target-domain process plus shared structural signal" in captured["prompt"]
     assert '"solution_evidence": "specific retrieved workaround, mitigation, operating response, or engineered intervention evidence"' in captured["prompt"]
+    assert "If yes signal or borderline partial positive:" in captured["prompt"]
+
+
+def test_stage_one_detect_records_implicit_no_connection_default_subtype(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        jump,
+        "_generate_json_with_retry",
+        lambda *_args, **_kwargs: json.dumps(
+            {
+                "target_domain": "Wireless Scheduling",
+                "signal": "shared structural signal",
+                "evidence": "specific evidence",
+            }
+        ),
+    )
+
+    data, failure_hint = jump._stage_one_detect_with_diagnostics(
+        source_domain="Network Protocols",
+        abstract_structure="load compared against a queue threshold",
+        search_results="Retrieved via: base\nTitle: Target paper\nresponse details",
+    )
+
+    assert data is None
+    assert failure_hint == "no_connection"
+    assert (
+        getattr(jump._stage_one_detect_with_diagnostics, "last_failure_subtype", None)
+        == "implicit_no_connection_defaulted"
+    )
 
 
 def test_stage_one_detect_requires_solution_evidence_field_on_positive_payload(
@@ -2675,6 +2743,7 @@ def test_stage_one_detect_requires_solution_evidence_field_on_positive_payload(
     assert failure_hint is None
     assert data is not None
     assert data["target_domain"] == "Safety Interlock Monitoring"
+    assert getattr(jump._stage_one_detect_with_diagnostics, "last_failure_subtype", None) is None
     assert data["solution_evidence"] == (
         "redundant interlock logic suppresses actuation during mismatch faults"
     )
@@ -2707,6 +2776,10 @@ def test_stage_one_detect_returns_partial_payload_without_solution_evidence(
     assert data["target_domain"] == "Safety Interlock Monitoring"
     assert data["signal"] == "shared thresholded gating structure"
     assert data["evidence"] == "diagnostic comparison reveals the same constraint"
+    assert (
+        getattr(jump._stage_one_detect_with_diagnostics, "last_failure_subtype", None)
+        == "solution_evidence_missing"
+    )
     assert "solution_evidence" not in data
 
 
@@ -2740,6 +2813,10 @@ def test_stage_one_detect_rejects_placeholder_solution_evidence(
     assert data is not None
     assert failure_hint == "missing_solution_evidence"
     assert data["target_domain"] == "Safety Interlock Monitoring"
+    assert (
+        getattr(jump._stage_one_detect_with_diagnostics, "last_failure_subtype", None)
+        == "solution_evidence_placeholder"
+    )
     assert "solution_evidence" not in data
 
 
@@ -2773,7 +2850,72 @@ def test_stage_one_detect_rejects_ungrounded_solution_evidence(
     assert data is not None
     assert failure_hint == "missing_solution_evidence"
     assert data["target_domain"] == "Safety Interlock Monitoring"
+    assert (
+        getattr(jump._stage_one_detect_with_diagnostics, "last_failure_subtype", None)
+        == "solution_evidence_ungrounded"
+    )
     assert "solution_evidence" not in data
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_subtype"),
+    [
+        (
+            {
+                "no_connection": False,
+                "signal": "shared thresholded gating structure",
+                "evidence": "diagnostic comparison reveals the same constraint",
+                "solution_evidence": "redundant interlock logic suppresses actuation during mismatch faults",
+            },
+            "invalid_payload_missing_target",
+        ),
+        (
+            {
+                "no_connection": False,
+                "target_domain": "Safety Interlock Monitoring",
+                "evidence": "diagnostic comparison reveals the same constraint",
+                "solution_evidence": "redundant interlock logic suppresses actuation during mismatch faults",
+            },
+            "invalid_payload_missing_signal",
+        ),
+        (
+            {
+                "no_connection": False,
+                "target_domain": "Safety Interlock Monitoring",
+                "signal": "shared thresholded gating structure",
+                "solution_evidence": "redundant interlock logic suppresses actuation during mismatch faults",
+            },
+            "invalid_payload_missing_evidence",
+        ),
+    ],
+)
+def test_stage_one_detect_records_missing_required_field_subtype(
+    monkeypatch,
+    payload,
+    expected_subtype,
+) -> None:
+    monkeypatch.setattr(
+        jump,
+        "_generate_json_with_retry",
+        lambda *_args, **_kwargs: json.dumps(payload),
+    )
+
+    data, failure_hint = jump._stage_one_detect_with_diagnostics(
+        source_domain="Network Protocols",
+        abstract_structure="load compared against a queue threshold",
+        search_results=(
+            "Retrieved via: solution-biased\n"
+            "Title: Target paper\n"
+            "Snippet: redundant interlock logic suppresses actuation during mismatch faults"
+        ),
+    )
+
+    assert data is None
+    assert failure_hint == "invalid_payload"
+    assert (
+        getattr(jump._stage_one_detect_with_diagnostics, "last_failure_subtype", None)
+        == expected_subtype
+    )
 
 
 def test_dive_filters_weak_patterns_and_records_only_weak_diagnostics(
@@ -3408,6 +3550,46 @@ def test_lateral_jump_with_diagnostics_does_not_mislabel_stage1_generation_failu
     assert connection is None
     assert diagnostic["stage1_outcome"] == "no_results"
     assert diagnostic["stage1_failure_hint"] == "invalid_json"
+    assert diagnostic["stage1_failure_subtype"] == "invalid_json"
+    assert diagnostic["stage2_outcome"] is None
+
+
+def test_lateral_jump_with_diagnostics_records_stage1_generation_failed_subtype(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        jump._tavily,
+        "search",
+        lambda **_kwargs: {
+            "results": [
+                {
+                    "title": "Independent target paper",
+                    "content": "concrete signal in another field",
+                    "url": "https://target.test/paper",
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        jump,
+        "_generate_json_with_retry",
+        lambda *_args, **_kwargs: None,
+    )
+
+    connection, diagnostic = jump.lateral_jump_with_diagnostics(
+        {
+            "pattern_name": "Queue-threshold congestion gating",
+            "abstract_structure": "load compared against a queue threshold",
+            "search_query": "queue threshold throttling latency",
+        },
+        "Network Protocols",
+        "Technology",
+    )
+
+    assert connection is None
+    assert diagnostic["stage1_outcome"] == "no_results"
+    assert diagnostic["stage1_failure_hint"] == "generation_failed"
+    assert diagnostic["stage1_failure_subtype"] == "generation_failed"
     assert diagnostic["stage2_outcome"] is None
 
 
@@ -3454,6 +3636,57 @@ def test_lateral_jump_with_diagnostics_preserves_missing_solution_evidence_as_we
     assert diagnostic["stage1_outcome"] == "weak_signal"
     assert diagnostic["stage1_target_domain"] == "Wireless Scheduling"
     assert diagnostic["stage1_failure_hint"] == "missing_solution_evidence"
+    assert diagnostic["stage1_failure_subtype"] == "solution_evidence_missing"
+    assert diagnostic["stage1_soft_gate_attempted"] is True
+    assert diagnostic["stage1_soft_gate_recovered"] is False
+    assert diagnostic["stage2_outcome"] is None
+
+
+def test_lateral_jump_with_diagnostics_preserves_ungrounded_solution_evidence_as_weak_signal(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        jump._tavily,
+        "search",
+        lambda **_kwargs: {
+            "results": [
+                {
+                    "title": "Independent target paper",
+                    "content": "broad background context with no concrete workaround details",
+                    "url": "https://target.test/paper",
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        jump,
+        "_generate_json_with_retry",
+        lambda *_args, **_kwargs: json.dumps(
+            {
+                "no_connection": False,
+                "target_domain": "Wireless Scheduling",
+                "signal": "shared structural signal",
+                "evidence": "specific evidence",
+                "solution_evidence": "threshold gate lowers collision pressure",
+            }
+        ),
+    )
+
+    connection, diagnostic = jump.lateral_jump_with_diagnostics(
+        {
+            "pattern_name": "Queue-threshold congestion gating",
+            "abstract_structure": "load compared against a queue threshold",
+            "search_query": "queue threshold throttling latency",
+        },
+        "Network Protocols",
+        "Technology",
+    )
+
+    assert connection is None
+    assert diagnostic["stage1_outcome"] == "weak_signal"
+    assert diagnostic["stage1_target_domain"] == "Wireless Scheduling"
+    assert diagnostic["stage1_failure_hint"] == "missing_solution_evidence"
+    assert diagnostic["stage1_failure_subtype"] == "solution_evidence_ungrounded"
     assert diagnostic["stage1_soft_gate_attempted"] is True
     assert diagnostic["stage1_soft_gate_recovered"] is False
     assert diagnostic["stage2_outcome"] is None
@@ -6067,7 +6300,7 @@ def test_jump_diagnostics_report_prints_attempts_and_aggregate(temp_db, capsys) 
             "quality_profile": {"band": "high"},
         },
         pattern_diagnostics={
-            "summary": "patterns_ready: kept 2/2 patterns; jump_outcome=patterns_present_but_no_connection",
+            "summary": "patterns_ready: kept 3/3 patterns; jump_outcome=patterns_present_but_no_connection",
             "jump_attempts": [
                 {
                     "pattern_name": "Pattern A",
@@ -6075,8 +6308,8 @@ def test_jump_diagnostics_report_prints_attempts_and_aggregate(temp_db, capsys) 
                     "result_count": 0,
                     "top_result_titles": [],
                     "stage1_outcome": "no_results",
+                    "stage1_failure_hint": "no_usable_results",
                     "stage2_outcome": None,
-                    "stage2_failure_hint": "no_usable_results",
                 },
                 {
                     "pattern_name": "Pattern B",
@@ -6087,6 +6320,16 @@ def test_jump_diagnostics_report_prints_attempts_and_aggregate(temp_db, capsys) 
                     "stage1_target_domain": "Wireless Scheduling",
                     "stage2_outcome": "stage2_no_connection",
                     "stage2_failure_hint": "returned_no_connection",
+                },
+                {
+                    "pattern_name": "Pattern C",
+                    "built_jump_query": "query c",
+                    "result_count": 0,
+                    "top_result_titles": [],
+                    "stage1_outcome": "no_results",
+                    "stage1_failure_hint": "generation_failed",
+                    "stage1_failure_subtype": "generation_failed",
+                    "stage2_outcome": None,
                 },
             ],
         },
@@ -6099,10 +6342,140 @@ def test_jump_diagnostics_report_prints_attempts_and_aggregate(temp_db, capsys) 
     assert "[JumpDiagnostics] Recent 1 explorations" in output
     assert "pattern=Pattern A | query=query a | results=0 | stage1=no_results | stage2=—" in output
     assert "pattern=Pattern B | query=query b | results=2 | stage1=detect_signal | stage2=stage2_no_connection" in output
+    assert "pattern=Pattern C | query=query c | results=0 | stage1=no_results | stage2=— | attribution=stage1_failure" in output
+    assert "attribution=pre_stage1_failure" in output
+    assert "attribution=stage2_failure" in output
+    assert "stage1_subtype=generation_failed" in output
     assert "prestage1=" not in output
-    assert "total_attempted_patterns\t2" in output
-    assert "no_results\t1\t50.0%" in output
-    assert "stage2_no_connection\t1\t50.0%" in output
+    assert "total_attempted_patterns\t3" in output
+    assert "no_results\t2\t66.7%" in output
+    assert "stage2_no_connection\t1\t33.3%" in output
+    assert "pre_stage1_failure\t1\t33.3%" in output
+    assert "stage1_failure\t1\t33.3%" in output
+    assert "stage2_failure\t1\t33.3%" in output
+    assert "ambiguous_failure\t0\t0.0%" in output
+
+
+def test_run_jump_benchmark_prints_failure_attribution_review(
+    tmp_path,
+    capsys,
+    monkeypatch,
+) -> None:
+    benchmark_file = tmp_path / "jump_replay_benchmark.json"
+    benchmark_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "cases": [
+                    {
+                        "id": "jump-case-pre",
+                        "label": "jump case pre",
+                        "type": "jump_attempt",
+                        "source_domain": "Network Protocols",
+                        "pattern_name": "Pattern Pre",
+                        "abstract_structure": "upstream packet review",
+                        "search_results": "Candidate cluster 1:\nTitle: sparse result",
+                        "expected": {
+                            "stage1_outcome": "no_results",
+                            "stage2_outcome": None,
+                        },
+                    },
+                    {
+                        "id": "jump-case-stage1",
+                        "label": "jump case stage1",
+                        "type": "jump_attempt",
+                        "source_domain": "Network Protocols",
+                        "pattern_name": "Pattern Stage1",
+                        "abstract_structure": "stage1 review",
+                        "search_results": "Candidate cluster 1:\nTitle: ambiguous result",
+                        "expected": {
+                            "stage1_outcome": "detect_no_signal",
+                            "stage2_outcome": None,
+                        },
+                    },
+                    {
+                        "id": "jump-case-stage2",
+                        "label": "jump case stage2",
+                        "type": "jump_attempt",
+                        "source_domain": "Network Protocols",
+                        "pattern_name": "Pattern Stage2",
+                        "abstract_structure": "stage2 review",
+                        "search_results": "Candidate cluster 1:\nTitle: grounded result",
+                        "expected": {
+                            "stage1_outcome": "detect_signal",
+                            "stage2_outcome": "stage2_no_connection",
+                        },
+                    },
+                    {
+                        "id": "jump-case-success",
+                        "label": "jump case success",
+                        "type": "jump_attempt",
+                        "source_domain": "Network Protocols",
+                        "pattern_name": "Pattern Success",
+                        "abstract_structure": "successful review",
+                        "search_results": "Candidate cluster 1:\nTitle: strong result",
+                        "expected": {
+                            "stage1_outcome": "detect_signal",
+                            "stage2_outcome": "connection_found",
+                        },
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    def _fake_replay(snapshot):
+        diagnostic = main.JumpAttemptDiagnostic(
+            pattern_name=snapshot.pattern_name,
+            abstract_structure=snapshot.abstract_structure,
+            built_jump_query=snapshot.built_jump_query,
+            replay_snapshot=snapshot,
+        )
+        if snapshot.pattern_name == "Pattern Pre":
+            diagnostic["stage1_outcome"] = "no_results"
+            diagnostic["stage1_failure_hint"] = "no_usable_results"
+            diagnostic["stage1_failure_subtype"] = "generation_failed"
+            return None, diagnostic
+        if snapshot.pattern_name == "Pattern Stage1":
+            diagnostic["stage1_outcome"] = "detect_no_signal"
+            diagnostic["stage1_failure_hint"] = "no_connection"
+            diagnostic["stage1_failure_subtype"] = "explicit_no_connection"
+            return None, diagnostic
+        if snapshot.pattern_name == "Pattern Stage2":
+            diagnostic["stage1_outcome"] = "detect_signal"
+            diagnostic["stage1_target_domain"] = "Wireless Scheduling"
+            diagnostic["stage2_outcome"] = "stage2_no_connection"
+            diagnostic["stage2_failure_hint"] = "repair_incomplete"
+            diagnostic["stage2_incomplete_fields"] = ["edge_analysis.actionable_lever"]
+            return None, diagnostic
+        diagnostic["stage1_outcome"] = "detect_signal"
+        diagnostic["stage1_target_domain"] = "Wireless Scheduling"
+        diagnostic["stage2_outcome"] = "connection_found"
+        diagnostic["stage2_target_domain"] = "Wireless Scheduling"
+        return {"target_domain": "Wireless Scheduling"}, diagnostic
+
+    monkeypatch.setattr(main.jump_module, "replay_jump_attempt", _fake_replay)
+
+    assert main._run_jump_benchmark(benchmark_file, 0.6) is True
+    output = capsys.readouterr().out
+
+    assert "jump-case-pre" in output
+    assert "jump-case-stage1" in output
+    assert "jump-case-stage2" in output
+    assert "jump-case-success" in output
+    assert "attribution=pre_stage1_failure" in output
+    assert "attribution=stage1_failure" in output
+    assert "attribution=stage2_failure" in output
+    assert "attribution=successful_connection" in output
+    assert "stage1_failure_subtype=generation_failed" in output
+    assert "stage1_failure_subtype=explicit_no_connection" in output
+    assert "[JumpBenchmark] Failure attribution" in output
+    assert "pre_stage1_failure\t1" in output
+    assert "stage1_failure\t1" in output
+    assert "stage2_failure\t1" in output
+    assert "successful_connection\t1" in output
 
 
 def test_jump_diagnostics_report_prints_prestage1_observability_when_relevant(
