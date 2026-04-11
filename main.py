@@ -1864,7 +1864,10 @@ def _print_jump_diagnostics(limit: int = 20) -> None:
             stage1_failure_subtype = str(
                 attempt_view.get("stage1_failure_subtype") or "—"
             ).strip() or "—"
-            if stage1_failure_subtype != "—":
+            if (
+                stage1_failure_subtype != "—"
+                and stage1_outcome != "detect_signal"
+            ):
                 stage1_failure_subtype_counts[stage1_failure_subtype] = (
                     stage1_failure_subtype_counts.get(stage1_failure_subtype, 0) + 1
                 )

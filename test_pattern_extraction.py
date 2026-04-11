@@ -2684,7 +2684,7 @@ def test_stage_one_detect_prompt_prefers_solution_bearing_analogues(
     assert "If yes signal or borderline partial positive:" in captured["prompt"]
 
 
-def test_stage_one_detect_records_implicit_no_connection_default_subtype(
+def test_stage_one_detect_rescues_implicit_positive_payload_without_solution_evidence(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
@@ -2705,15 +2705,19 @@ def test_stage_one_detect_records_implicit_no_connection_default_subtype(
         search_results="Retrieved via: base\nTitle: Target paper\nresponse details",
     )
 
-    assert data is None
-    assert failure_hint == "no_connection"
+    assert data is not None
+    assert failure_hint == "missing_solution_evidence"
+    assert data["target_domain"] == "Wireless Scheduling"
+    assert data["signal"] == "shared structural signal"
+    assert data["evidence"] == "specific evidence"
+    assert "solution_evidence" not in data
     assert (
         getattr(jump._stage_one_detect_with_diagnostics, "last_failure_subtype", None)
-        == "implicit_no_connection_defaulted"
+        == "implicit_no_connection_rescued:solution_evidence_missing"
     )
 
 
-def test_stage_one_detect_requires_solution_evidence_field_on_positive_payload(
+def test_stage_one_detect_rescues_implicit_positive_payload_with_grounded_solution_evidence(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
@@ -2721,7 +2725,6 @@ def test_stage_one_detect_requires_solution_evidence_field_on_positive_payload(
         "_generate_json_with_retry",
         lambda *_args, **_kwargs: json.dumps(
             {
-                "no_connection": False,
                 "target_domain": "Safety Interlock Monitoring",
                 "signal": "shared thresholded gating structure",
                 "evidence": "diagnostic comparison reveals the same constraint",
@@ -2743,9 +2746,42 @@ def test_stage_one_detect_requires_solution_evidence_field_on_positive_payload(
     assert failure_hint is None
     assert data is not None
     assert data["target_domain"] == "Safety Interlock Monitoring"
-    assert getattr(jump._stage_one_detect_with_diagnostics, "last_failure_subtype", None) is None
+    assert (
+        getattr(jump._stage_one_detect_with_diagnostics, "last_failure_subtype", None)
+        == "implicit_no_connection_rescued"
+    )
     assert data["solution_evidence"] == (
         "redundant interlock logic suppresses actuation during mismatch faults"
+    )
+
+
+def test_stage_one_detect_keeps_explicit_no_connection_hard_rejection(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        jump,
+        "_generate_json_with_retry",
+        lambda *_args, **_kwargs: json.dumps(
+            {
+                "no_connection": True,
+                "target_domain": "Wireless Scheduling",
+                "signal": "shared structural signal",
+                "evidence": "specific evidence",
+            }
+        ),
+    )
+
+    data, failure_hint = jump._stage_one_detect_with_diagnostics(
+        source_domain="Network Protocols",
+        abstract_structure="load compared against a queue threshold",
+        search_results="Retrieved via: base\nTitle: Target paper\nresponse details",
+    )
+
+    assert data is None
+    assert failure_hint == "no_connection"
+    assert (
+        getattr(jump._stage_one_detect_with_diagnostics, "last_failure_subtype", None)
+        == "explicit_no_connection"
     )
 
 
@@ -2781,6 +2817,64 @@ def test_stage_one_detect_returns_partial_payload_without_solution_evidence(
         == "solution_evidence_missing"
     )
     assert "solution_evidence" not in data
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_subtype"),
+    [
+        (
+            {
+                "signal": "shared thresholded gating structure",
+                "evidence": "diagnostic comparison reveals the same constraint",
+                "solution_evidence": "redundant interlock logic suppresses actuation during mismatch faults",
+            },
+            "invalid_payload_missing_target",
+        ),
+        (
+            {
+                "target_domain": "Safety Interlock Monitoring",
+                "evidence": "diagnostic comparison reveals the same constraint",
+                "solution_evidence": "redundant interlock logic suppresses actuation during mismatch faults",
+            },
+            "invalid_payload_missing_signal",
+        ),
+        (
+            {
+                "target_domain": "Safety Interlock Monitoring",
+                "signal": "shared thresholded gating structure",
+                "solution_evidence": "redundant interlock logic suppresses actuation during mismatch faults",
+            },
+            "invalid_payload_missing_evidence",
+        ),
+    ],
+)
+def test_stage_one_detect_rejects_implicit_payload_missing_core_positive_field(
+    monkeypatch,
+    payload,
+    expected_subtype,
+) -> None:
+    monkeypatch.setattr(
+        jump,
+        "_generate_json_with_retry",
+        lambda *_args, **_kwargs: json.dumps(payload),
+    )
+
+    data, failure_hint = jump._stage_one_detect_with_diagnostics(
+        source_domain="Network Protocols",
+        abstract_structure="load compared against a queue threshold",
+        search_results=(
+            "Retrieved via: solution-biased\n"
+            "Title: Target paper\n"
+            "Snippet: redundant interlock logic suppresses actuation during mismatch faults"
+        ),
+    )
+
+    assert data is None
+    assert failure_hint == "invalid_payload"
+    assert (
+        getattr(jump._stage_one_detect_with_diagnostics, "last_failure_subtype", None)
+        == expected_subtype
+    )
 
 
 def test_stage_one_detect_rejects_placeholder_solution_evidence(
@@ -3614,7 +3708,6 @@ def test_lateral_jump_with_diagnostics_preserves_missing_solution_evidence_as_we
         "_generate_json_with_retry",
         lambda *_args, **_kwargs: json.dumps(
             {
-                "no_connection": False,
                 "target_domain": "Wireless Scheduling",
                 "signal": "shared structural signal",
                 "evidence": "specific evidence",
@@ -3636,7 +3729,10 @@ def test_lateral_jump_with_diagnostics_preserves_missing_solution_evidence_as_we
     assert diagnostic["stage1_outcome"] == "weak_signal"
     assert diagnostic["stage1_target_domain"] == "Wireless Scheduling"
     assert diagnostic["stage1_failure_hint"] == "missing_solution_evidence"
-    assert diagnostic["stage1_failure_subtype"] == "solution_evidence_missing"
+    assert (
+        diagnostic["stage1_failure_subtype"]
+        == "implicit_no_connection_rescued:solution_evidence_missing"
+    )
     assert diagnostic["stage1_soft_gate_attempted"] is True
     assert diagnostic["stage1_soft_gate_recovered"] is False
     assert diagnostic["stage2_outcome"] is None
@@ -6354,6 +6450,50 @@ def test_jump_diagnostics_report_prints_attempts_and_aggregate(temp_db, capsys) 
     assert "stage1_failure\t1\t33.3%" in output
     assert "stage2_failure\t1\t33.3%" in output
     assert "ambiguous_failure\t0\t0.0%" in output
+
+
+def test_jump_diagnostics_report_excludes_rescued_detect_signal_from_stage1_failure_subtypes(
+    temp_db,
+    capsys,
+) -> None:
+    store.save_exploration(
+        seed_domain="Network Protocols",
+        seed_category="Technology",
+        pattern_diagnostics={
+            "summary": "patterns_ready: kept 2/2 patterns; jump_outcome=patterns_present_but_no_connection",
+            "jump_attempts": [
+                {
+                    "pattern_name": "Pattern Rescued",
+                    "built_jump_query": "query rescued",
+                    "result_count": 3,
+                    "stage1_outcome": "detect_signal",
+                    "stage1_target_domain": "Wireless Scheduling",
+                    "stage1_failure_subtype": "implicit_no_connection_rescued",
+                    "stage2_outcome": "stage2_no_connection",
+                    "stage2_failure_hint": "returned_no_connection",
+                },
+                {
+                    "pattern_name": "Pattern Weak",
+                    "built_jump_query": "query weak",
+                    "result_count": 2,
+                    "stage1_outcome": "weak_signal",
+                    "stage1_target_domain": "Safety Interlock Monitoring",
+                    "stage1_failure_hint": "missing_solution_evidence",
+                    "stage1_failure_subtype": "solution_evidence_missing",
+                    "stage2_outcome": None,
+                },
+            ],
+        },
+        transmitted=False,
+    )
+
+    main._print_jump_diagnostics(limit=5)
+    output = capsys.readouterr().out
+    subtype_section = output.split("[JumpDiagnostics] Stage 1 failure subtypes", 1)[1]
+
+    assert "stage1_subtype=implicit_no_connection_rescued" in output
+    assert "solution_evidence_missing\t1\t50.0%" in subtype_section
+    assert "implicit_no_connection_rescued\t" not in subtype_section
 
 
 def test_run_jump_benchmark_prints_failure_attribution_review(

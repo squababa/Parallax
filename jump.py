@@ -6474,22 +6474,26 @@ def _stage_one_detect_with_diagnostics(
     if not isinstance(data, dict):
         setattr(_stage_one_detect_with_diagnostics, "last_failure_subtype", "invalid_payload_non_object")
         return None, "invalid_payload"
-    no_connection_defaulted = "no_connection" not in data
-    if data.get("no_connection", True):
-        setattr(
-            _stage_one_detect_with_diagnostics,
-            "last_failure_subtype",
-            (
-                "implicit_no_connection_defaulted"
-                if no_connection_defaulted
-                else "explicit_no_connection"
-            ),
-        )
-        return None, "no_connection"
     target_domain = str(data.get("target_domain", "")).strip()
     signal = str(data.get("signal", "")).strip()
     evidence = str(data.get("evidence", "")).strip()
     solution_evidence = str(data.get("solution_evidence", "")).strip()
+    implicit_no_connection_rescued = False
+    if "no_connection" in data:
+        if data.get("no_connection", True):
+            setattr(
+                _stage_one_detect_with_diagnostics,
+                "last_failure_subtype",
+                "explicit_no_connection",
+            )
+            return None, "no_connection"
+    elif target_domain and signal and evidence:
+        setattr(
+            _stage_one_detect_with_diagnostics,
+            "last_failure_subtype",
+            "implicit_no_connection_rescued",
+        )
+        implicit_no_connection_rescued = True
     if not target_domain:
         setattr(
             _stage_one_detect_with_diagnostics,
@@ -6519,13 +6523,25 @@ def _stage_one_detect_with_diagnostics(
         search_results,
     )
     if solution_evidence_failure_subtype is not None:
+        failure_subtype = solution_evidence_failure_subtype
+        if implicit_no_connection_rescued:
+            failure_subtype = (
+                "implicit_no_connection_rescued:"
+                f"{solution_evidence_failure_subtype}"
+            )
         setattr(
             _stage_one_detect_with_diagnostics,
             "last_failure_subtype",
-            solution_evidence_failure_subtype,
+            failure_subtype,
         )
         data.pop("solution_evidence", None)
         return data, "missing_solution_evidence"
+    if implicit_no_connection_rescued:
+        setattr(
+            _stage_one_detect_with_diagnostics,
+            "last_failure_subtype",
+            "implicit_no_connection_rescued",
+        )
     data["solution_evidence"] = solution_evidence
     return data, None
 
@@ -6921,6 +6937,11 @@ def _apply_stage_one_diagnostic(
     stage_one_failure_hint: str | None,
     stage_one_failure_subtype: str | None = None,
 ) -> None:
+    preserve_detect_signal_subtype = (
+        stage_one_outcome == "detect_signal"
+        and isinstance(stage_one_failure_subtype, str)
+        and stage_one_failure_subtype.startswith("implicit_no_connection_rescued")
+    )
     diagnostic["stage1_outcome"] = stage_one_outcome
     diagnostic["stage1_target_domain"] = (
         str(stage_one.get("target_domain", "") or "").strip()
@@ -6931,7 +6952,13 @@ def _apply_stage_one_diagnostic(
         None if stage_one_outcome == "detect_signal" else stage_one_failure_hint
     )
     diagnostic["stage1_failure_subtype"] = (
-        None if stage_one_outcome == "detect_signal" else stage_one_failure_subtype
+        (
+            stage_one_failure_subtype
+            if preserve_detect_signal_subtype
+            else None
+        )
+        if stage_one_outcome == "detect_signal"
+        else stage_one_failure_subtype
     )
 
 
