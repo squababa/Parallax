@@ -1,17 +1,28 @@
+import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
+from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 from urllib.parse import quote
 
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, render_template, request
 
 
 DEFAULT_EXPLORATION_LIMIT = 50
 DEFAULT_STATS_WINDOW = 200
 TOP_KILLED_LIMIT = 10
+FRONTIER_LAUNCHPAD_LIMIT = 10
+FRONTIER_STRONG_BRIDGE_LIMIT = 12
+FRONTIER_SALVAGE_LIMIT = 8
+FRONTIER_REGION_LIMIT = 3
+FRONTIER_SEED_LIMIT = 5
+FRONTIER_NEAR_MISS_SCORE = 0.75
+FRONTIER_FRESHNESS_FULL_DAYS = 7
+FRONTIER_FRESHNESS_DECAY_DAYS = 30
 VALID_GRADES = ("A", "B+", "B", "B-", "C+", "C", "D", "F")
 CLAUDE_SONNET_INPUT_RATE_PER_MTOK = 3.0
 CLAUDE_SONNET_OUTPUT_RATE_PER_MTOK = 15.0
@@ -303,6 +314,163 @@ def _coerce_int(value) -> int:
             return int(float(value))
         except (TypeError, ValueError):
             return 0
+
+
+def _coerce_float(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _clamp_float(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
+    return min(maximum, max(minimum, float(value)))
+
+
+def _safe_ratio(numerator, denominator) -> float:
+    safe_denominator = _coerce_float(denominator)
+    if safe_denominator <= 0:
+        return 0.0
+    return _coerce_float(numerator) / safe_denominator
+
+
+def _parse_timestamp(value) -> datetime | None:
+    text = _clean_optional_text(value)
+    if text is None:
+        return None
+    normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _timestamp_is_newer(candidate: str | None, current: str | None) -> bool:
+    if candidate is None:
+        return False
+    if current is None:
+        return True
+    return candidate > current
+
+
+def _normalized_log(value, max_value) -> float:
+    safe_max_value = _coerce_float(max_value)
+    if safe_max_value <= 0:
+        return 0.0
+    safe_value = max(0.0, _coerce_float(value))
+    return _clamp_float(math.log1p(safe_value) / math.log1p(safe_max_value))
+
+
+def _freshness_norm(timestamp_value: str | None, *, now: datetime | None = None) -> float:
+    timestamp = _parse_timestamp(timestamp_value)
+    if timestamp is None:
+        return 0.0
+    current_time = now or datetime.now(timezone.utc)
+    age_days = max(0.0, (current_time - timestamp).total_seconds() / 86400.0)
+    if age_days <= FRONTIER_FRESHNESS_FULL_DAYS:
+        return 1.0
+    if age_days >= FRONTIER_FRESHNESS_DECAY_DAYS:
+        return 0.0
+    decay_window = FRONTIER_FRESHNESS_DECAY_DAYS - FRONTIER_FRESHNESS_FULL_DAYS
+    return _clamp_float((FRONTIER_FRESHNESS_DECAY_DAYS - age_days) / decay_window)
+
+
+def _timestamp_sort_value(timestamp_value: str | None) -> float:
+    timestamp = _parse_timestamp(timestamp_value)
+    if timestamp is None:
+        return 0.0
+    return timestamp.timestamp()
+
+
+def _pluralize(count: int, singular: str, plural: str | None = None) -> str:
+    if count == 1:
+        return singular
+    return plural or f"{singular}s"
+
+
+def _domain_anchor_score(row: dict) -> int:
+    return (
+        _coerce_int(row.get("connection_count")) * 3
+        + _coerce_int(row.get("transmitted_count")) * 4
+        + _coerce_int(row.get("appearance_count"))
+    )
+
+
+def _cluster_id_for_domains(domain_ids: list[str]) -> str:
+    digest = hashlib.sha1(
+        "|".join(sorted(domain_ids, key=lambda value: str(value).lower())).encode(
+            "utf-8"
+        )
+    ).hexdigest()[:12]
+    return f"cluster-{digest}"
+
+
+def _frontier_region_why(entry: dict) -> list[str]:
+    reasons: list[str] = []
+    transmitted_link_count = _coerce_int(entry.get("transmitted_link_count"))
+    near_miss_count = _coerce_int(entry.get("near_miss_count"))
+    open_salvage_count = _coerce_int(entry.get("open_salvage_count"))
+    avg_score = entry.get("avg_score")
+    if transmitted_link_count > 0:
+        reasons.append(
+            f"{transmitted_link_count} "
+            f"{_pluralize(transmitted_link_count, 'transmitting bridge')}"
+        )
+    if near_miss_count > 0:
+        reasons.append(
+            f"{near_miss_count} { _pluralize(near_miss_count, 'near miss', 'near misses')}"
+        )
+    if open_salvage_count > 0:
+        reasons.append(
+            f"{open_salvage_count} {_pluralize(open_salvage_count, 'salvage lead')}"
+        )
+    if isinstance(avg_score, (int, float)) and avg_score >= FRONTIER_NEAR_MISS_SCORE:
+        reasons.append(f"avg score {avg_score:.3f}")
+    if _freshness_norm(entry.get("latest_timestamp")) >= 0.95:
+        reasons.append("fresh activity")
+    if not reasons:
+        link_count = _coerce_int(entry.get("link_count"))
+        reasons.append(f"{link_count} {_pluralize(link_count, 'mapped bridge')}")
+    return reasons[:3]
+
+
+def _frontier_seed_why(entry: dict) -> list[str]:
+    reasons: list[str] = []
+    transmitted_count = _coerce_int(entry.get("transmitted_count"))
+    near_miss_count = _coerce_int(entry.get("near_miss_count"))
+    open_salvage_count = _coerce_int(entry.get("open_salvage_count"))
+    transmitted_neighbor_count = _coerce_int(entry.get("transmitted_neighbor_count"))
+    avg_score = entry.get("avg_score")
+    if transmitted_count > 0:
+        reasons.append(
+            f"{transmitted_count} {_pluralize(transmitted_count, 'transmission')}"
+        )
+    if near_miss_count > 0:
+        reasons.append(
+            f"{near_miss_count} { _pluralize(near_miss_count, 'near miss', 'near misses')}"
+        )
+    if open_salvage_count > 0:
+        reasons.append(
+            f"{open_salvage_count} {_pluralize(open_salvage_count, 'salvage lead')}"
+        )
+    if transmitted_neighbor_count > 0:
+        reasons.append(
+            f"{transmitted_neighbor_count} "
+            f"{_pluralize(transmitted_neighbor_count, 'transmitting neighbor')}"
+        )
+    if isinstance(avg_score, (int, float)) and avg_score >= FRONTIER_NEAR_MISS_SCORE:
+        reasons.append(f"avg score {avg_score:.3f}")
+    if _freshness_norm(entry.get("latest_timestamp")) >= 0.95:
+        reasons.append("fresh activity")
+    if not reasons:
+        exploration_count = _coerce_int(entry.get("exploration_count"))
+        reasons.append(
+            f"{exploration_count} {_pluralize(exploration_count, 'exploration')}"
+        )
+    return reasons[:3]
 
 
 def _uses_sonnet_pricing(model_name) -> bool:
@@ -700,6 +868,753 @@ def _get_domain_stats() -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def _get_graph_exploration_rows() -> list[dict]:
+    conn = _connect()
+    rows = conn.execute(
+        """SELECT
+            seed_domain,
+            jump_target_domain,
+            total_score,
+            transmitted,
+            timestamp
+        FROM explorations
+        WHERE seed_domain IS NOT NULL
+          AND TRIM(seed_domain) <> ''
+          AND jump_target_domain IS NOT NULL
+          AND TRIM(jump_target_domain) <> ''
+        ORDER BY timestamp ASC, id ASC"""
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def _get_open_salvage_rows() -> list[dict]:
+    conn = None
+    try:
+        conn = _connect()
+        rows = conn.execute(
+            """SELECT
+                seed_domain AS source,
+                target_domain AS target,
+                total_score,
+                salvage_reason AS reason,
+                status,
+                timestamp
+            FROM strong_rejections
+            WHERE status = 'open'
+            ORDER BY total_score IS NULL ASC,
+                total_score DESC,
+                timestamp DESC,
+                id DESC"""
+        ).fetchall()
+        return [dict(row) for row in rows]
+    except sqlite3.Error:
+        return []
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _get_domain_graph() -> dict:
+    rows = _get_graph_exploration_rows()
+
+    node_map: dict[str, dict] = {}
+    link_map: dict[tuple[str, str], dict] = {}
+    unique_transmitted_domains: set[str] = set()
+    total_score = 0.0
+    scored_rows = 0
+    total_explorations = 0
+    total_transmissions = 0
+
+    for row in rows:
+        seed_domain = _clean_optional_text(row.get("seed_domain"))
+        target_domain = _clean_optional_text(row.get("jump_target_domain"))
+        if seed_domain is None or target_domain is None:
+            continue
+
+        total_explorations += 1
+        transmitted = 1 if _coerce_int(row.get("transmitted")) > 0 else 0
+        total_transmissions += transmitted
+        timestamp = _clean_optional_text(row.get("timestamp"))
+
+        raw_score = row.get("total_score")
+        if raw_score is None:
+            score = None
+        else:
+            try:
+                score = float(raw_score)
+            except (TypeError, ValueError):
+                score = None
+        if score is not None:
+            total_score += score
+            scored_rows += 1
+
+        for domain_name, is_seed in ((seed_domain, True), (target_domain, False)):
+            node = node_map.setdefault(
+                domain_name,
+                {
+                    "id": domain_name,
+                    "appearance_count": 0,
+                    "seed_count": 0,
+                    "target_count": 0,
+                    "transmitted_count": 0,
+                    "incoming_edges": 0,
+                    "outgoing_edges": 0,
+                    "connected_domains": set(),
+                    "score_total": 0.0,
+                    "score_count": 0,
+                    "max_score": None,
+                    "latest_timestamp": None,
+                },
+            )
+            node["appearance_count"] += 1
+            if is_seed:
+                node["seed_count"] += 1
+            else:
+                node["target_count"] += 1
+            node["transmitted_count"] += transmitted
+            if transmitted:
+                unique_transmitted_domains.add(domain_name)
+            if score is not None:
+                node["score_total"] += score
+                node["score_count"] += 1
+                if node["max_score"] is None or score > node["max_score"]:
+                    node["max_score"] = score
+            if _timestamp_is_newer(timestamp, node["latest_timestamp"]):
+                node["latest_timestamp"] = timestamp
+
+        link = link_map.setdefault(
+            (seed_domain, target_domain),
+            {
+                "source": seed_domain,
+                "target": target_domain,
+                "count": 0,
+                "transmitted_count": 0,
+                "score_total": 0.0,
+                "score_count": 0,
+                "max_score": None,
+                "latest_timestamp": None,
+            },
+        )
+        link["count"] += 1
+        link["transmitted_count"] += transmitted
+        if score is not None:
+            link["score_total"] += score
+            link["score_count"] += 1
+            if link["max_score"] is None or score > link["max_score"]:
+                link["max_score"] = score
+        if _timestamp_is_newer(timestamp, link["latest_timestamp"]):
+            link["latest_timestamp"] = timestamp
+
+    for source, target in link_map:
+        node_map[source]["outgoing_edges"] += 1
+        node_map[target]["incoming_edges"] += 1
+        node_map[source]["connected_domains"].add(target)
+        node_map[target]["connected_domains"].add(source)
+
+    nodes = []
+    node_lookup: dict[str, dict] = {}
+    for node in node_map.values():
+        if node["seed_count"] > 0 and node["target_count"] > 0:
+            role = "bridge"
+        elif node["seed_count"] > 0:
+            role = "seed"
+        else:
+            role = "target"
+        score_count = node["score_count"]
+        node_payload = {
+            "id": node["id"],
+            "label": node["id"],
+            "role": role,
+            "appearance_count": node["appearance_count"],
+            "seed_count": node["seed_count"],
+            "target_count": node["target_count"],
+            "transmitted_count": node["transmitted_count"],
+            "incoming_edges": node["incoming_edges"],
+            "outgoing_edges": node["outgoing_edges"],
+            "connection_count": len(node["connected_domains"]),
+            "avg_score": node["score_total"] / score_count if score_count > 0 else None,
+            "max_score": node["max_score"],
+            "latest_timestamp": node["latest_timestamp"],
+        }
+        nodes.append(node_payload)
+        node_lookup[node_payload["id"]] = node_payload
+
+    links = []
+    for link in link_map.values():
+        score_count = link["score_count"]
+        links.append(
+            {
+                "source": link["source"],
+                "target": link["target"],
+                "count": link["count"],
+                "transmitted_count": link["transmitted_count"],
+                "avg_score": link["score_total"] / score_count if score_count > 0 else None,
+                "max_score": link["max_score"],
+                "latest_timestamp": link["latest_timestamp"],
+            }
+        )
+
+    adjacency: dict[str, set[str]] = {node_id: set() for node_id in node_lookup}
+    for link in links:
+        adjacency.setdefault(link["source"], set()).add(link["target"])
+        adjacency.setdefault(link["target"], set()).add(link["source"])
+
+    clusters = []
+    visited: set[str] = set()
+    cluster_metric_map: dict[str, dict] = {}
+    for node_id in sorted(node_lookup, key=lambda value: str(value).lower()):
+        if node_id in visited:
+            continue
+        stack = [node_id]
+        component_ids: list[str] = []
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            component_ids.append(current)
+            neighbors = sorted(
+                adjacency.get(current, set()),
+                key=lambda value: str(value).lower(),
+                reverse=True,
+            )
+            stack.extend(neighbors)
+
+        component_set = set(component_ids)
+        component_nodes = [node_lookup[component_id] for component_id in component_ids]
+        component_links = [
+            link
+            for link in links
+            if link["source"] in component_set and link["target"] in component_set
+        ]
+        cluster_id = _cluster_id_for_domains(component_ids)
+        ranked_domains = sorted(
+            component_nodes,
+            key=lambda row: (
+                -_domain_anchor_score(row),
+                str(row.get("id") or "").lower(),
+            ),
+        )
+        top_domains = [row["id"] for row in ranked_domains[:5]]
+        label = " / ".join(top_domains[:2]) if len(top_domains) > 1 else top_domains[0]
+        if not label:
+            label = component_ids[0]
+        for component_id in component_ids:
+            node_lookup[component_id]["cluster_id"] = cluster_id
+        clusters.append(
+            {
+                "id": cluster_id,
+                "label": label,
+                "node_count": len(component_nodes),
+                "link_count": len(component_links),
+                "transmitted_link_count": sum(
+                    1
+                    for link in component_links
+                    if _coerce_int(link.get("transmitted_count")) > 0
+                ),
+                "avg_score": None,
+                "latest_timestamp": None,
+                "top_domains": top_domains,
+                "seed_count": sum(
+                    1 for row in component_nodes if row.get("role") == "seed"
+                ),
+                "target_count": sum(
+                    1 for row in component_nodes if row.get("role") == "target"
+                ),
+                "bridge_count": sum(
+                    1 for row in component_nodes if row.get("role") == "bridge"
+                ),
+                "exploration_count": 0,
+                "transmitted_exploration_count": 0,
+                "open_salvage_count": 0,
+            }
+        )
+        cluster_metric_map[cluster_id] = {
+            "score_total": 0.0,
+            "score_count": 0,
+            "latest_timestamp": None,
+            "exploration_count": 0,
+            "transmitted_exploration_count": 0,
+        }
+
+    cluster_lookup = {cluster["id"]: cluster for cluster in clusters}
+    for row in rows:
+        seed_domain = _clean_optional_text(row.get("seed_domain"))
+        target_domain = _clean_optional_text(row.get("jump_target_domain"))
+        cluster_id = None
+        if seed_domain is not None and seed_domain in node_lookup:
+            cluster_id = node_lookup[seed_domain].get("cluster_id")
+        if cluster_id is None and target_domain is not None and target_domain in node_lookup:
+            cluster_id = node_lookup[target_domain].get("cluster_id")
+        if cluster_id is None:
+            continue
+        metrics = cluster_metric_map[cluster_id]
+        metrics["exploration_count"] += 1
+        metrics["transmitted_exploration_count"] += (
+            1 if _coerce_int(row.get("transmitted")) > 0 else 0
+        )
+        raw_score = row.get("total_score")
+        if raw_score is not None:
+            try:
+                score = float(raw_score)
+            except (TypeError, ValueError):
+                score = None
+            if score is not None:
+                metrics["score_total"] += score
+                metrics["score_count"] += 1
+        timestamp = _clean_optional_text(row.get("timestamp"))
+        if _timestamp_is_newer(timestamp, metrics["latest_timestamp"]):
+            metrics["latest_timestamp"] = timestamp
+
+    for cluster_id, metrics in cluster_metric_map.items():
+        cluster = cluster_lookup[cluster_id]
+        cluster["avg_score"] = (
+            metrics["score_total"] / metrics["score_count"]
+            if metrics["score_count"] > 0
+            else None
+        )
+        cluster["latest_timestamp"] = metrics["latest_timestamp"]
+        cluster["exploration_count"] = metrics["exploration_count"]
+        cluster["transmitted_exploration_count"] = metrics[
+            "transmitted_exploration_count"
+        ]
+
+    for row in _get_open_salvage_rows():
+        affected_cluster_ids = {
+            cluster_id
+            for cluster_id in (
+                node_lookup.get(_clean_optional_text(row.get("source")) or "", {}).get(
+                    "cluster_id"
+                ),
+                node_lookup.get(_clean_optional_text(row.get("target")) or "", {}).get(
+                    "cluster_id"
+                ),
+            )
+            if cluster_id is not None
+        }
+        for cluster_id in affected_cluster_ids:
+            cluster_lookup[cluster_id]["open_salvage_count"] += 1
+
+    nodes.sort(
+        key=lambda row: (
+            -_coerce_int(row.get("connection_count")),
+            -_coerce_int(row.get("transmitted_count")),
+            -_coerce_int(row.get("appearance_count")),
+            str(row.get("id") or "").lower(),
+        )
+    )
+    links.sort(
+        key=lambda row: (
+            -_coerce_int(row.get("transmitted_count")),
+            -(float(row["max_score"]) if row.get("max_score") is not None else -1.0),
+            -_coerce_int(row.get("count")),
+            str(row.get("source") or "").lower(),
+            str(row.get("target") or "").lower(),
+        )
+    )
+    clusters.sort(
+        key=lambda row: (
+            -_coerce_int(row.get("node_count")),
+            -_coerce_int(row.get("transmitted_link_count")),
+            -_coerce_float(row.get("avg_score")),
+            str(row.get("label") or "").lower(),
+        )
+    )
+
+    return {
+        "stats": {
+            "unique_domains": len(nodes),
+            "unique_connections": len(links),
+            "transmitted_connections": sum(
+                1 for link in links if _coerce_int(link.get("transmitted_count")) > 0
+            ),
+            "successful_domains": len(unique_transmitted_domains),
+            "total_explorations": total_explorations,
+            "total_transmissions": total_transmissions,
+            "avg_score": total_score / scored_rows if scored_rows > 0 else None,
+            "cluster_count": len(clusters),
+            "largest_cluster_size": max(
+                (_coerce_int(cluster.get("node_count")) for cluster in clusters),
+                default=0,
+            ),
+        },
+        "nodes": nodes,
+        "links": links,
+        "clusters": clusters,
+    }
+
+
+def _get_frontier_snapshot() -> dict:
+    graph = _get_domain_graph()
+    exploration_rows = _get_graph_exploration_rows()
+    salvage_candidates = _get_open_salvage_rows()
+
+    node_cluster_map = {
+        row["id"]: row.get("cluster_id")
+        for row in graph.get("nodes", [])
+        if row.get("id")
+    }
+    cluster_lookup = {
+        row["id"]: row for row in graph.get("clusters", []) if row.get("id")
+    }
+
+    cluster_stats_map: dict[str, dict] = {}
+    for cluster in graph.get("clusters", []):
+        cluster_id = cluster.get("id")
+        if not cluster_id:
+            continue
+        cluster_stats_map[cluster_id] = {
+            "cluster_id": cluster_id,
+            "label": cluster.get("label") or "Unknown cluster",
+            "node_count": _coerce_int(cluster.get("node_count")),
+            "link_count": _coerce_int(cluster.get("link_count")),
+            "transmitted_link_count": _coerce_int(cluster.get("transmitted_link_count")),
+            "avg_score": cluster.get("avg_score"),
+            "near_miss_count": 0,
+            "open_salvage_count": 0,
+            "latest_timestamp": cluster.get("latest_timestamp"),
+            "top_domains": list(cluster.get("top_domains") or []),
+            "exploration_count": 0,
+            "transmitted_exploration_count": 0,
+        }
+
+    seed_stats_map: dict[str, dict] = {}
+    for row in exploration_rows:
+        seed_domain = _clean_optional_text(row.get("seed_domain"))
+        target_domain = _clean_optional_text(row.get("jump_target_domain"))
+        if seed_domain is None or target_domain is None:
+            continue
+
+        cluster_id = node_cluster_map.get(seed_domain) or node_cluster_map.get(target_domain)
+        if cluster_id is None:
+            continue
+
+        raw_score = row.get("total_score")
+        if raw_score is None:
+            score = None
+        else:
+            try:
+                score = float(raw_score)
+            except (TypeError, ValueError):
+                score = None
+        transmitted = 1 if _coerce_int(row.get("transmitted")) > 0 else 0
+        near_miss = 1 if score is not None and score >= FRONTIER_NEAR_MISS_SCORE and transmitted == 0 else 0
+        timestamp = _clean_optional_text(row.get("timestamp"))
+
+        cluster_entry = cluster_stats_map.setdefault(
+            cluster_id,
+            {
+                "cluster_id": cluster_id,
+                "label": cluster_lookup.get(cluster_id, {}).get("label") or "Unknown cluster",
+                "node_count": 0,
+                "link_count": 0,
+                "transmitted_link_count": 0,
+                "avg_score": None,
+                "near_miss_count": 0,
+                "open_salvage_count": 0,
+                "latest_timestamp": None,
+                "top_domains": [],
+                "exploration_count": 0,
+                "transmitted_exploration_count": 0,
+            },
+        )
+        cluster_entry["exploration_count"] += 1
+        cluster_entry["transmitted_exploration_count"] += transmitted
+        cluster_entry["near_miss_count"] += near_miss
+        if _timestamp_is_newer(timestamp, cluster_entry["latest_timestamp"]):
+            cluster_entry["latest_timestamp"] = timestamp
+
+        seed_entry = seed_stats_map.setdefault(
+            seed_domain,
+            {
+                "domain": seed_domain,
+                "cluster_id": cluster_id,
+                "exploration_count": 0,
+                "transmitted_count": 0,
+                "avg_score": None,
+                "near_miss_count": 0,
+                "open_salvage_count": 0,
+                "latest_timestamp": None,
+                "score_total": 0.0,
+                "score_count": 0,
+                "neighbor_ids": set(),
+                "transmitted_neighbor_ids": set(),
+                "frontier_score": 0.0,
+            },
+        )
+        seed_entry["exploration_count"] += 1
+        seed_entry["transmitted_count"] += transmitted
+        seed_entry["near_miss_count"] += near_miss
+        seed_entry["neighbor_ids"].add(target_domain)
+        if transmitted:
+            seed_entry["transmitted_neighbor_ids"].add(target_domain)
+        if _timestamp_is_newer(timestamp, seed_entry["latest_timestamp"]):
+            seed_entry["latest_timestamp"] = timestamp
+        if score is not None:
+            seed_entry["score_total"] += score
+            seed_entry["score_count"] += 1
+
+    for row in salvage_candidates:
+        source_domain = _clean_optional_text(row.get("source"))
+        target_domain = _clean_optional_text(row.get("target"))
+        affected_cluster_ids = {
+            cluster_id
+            for cluster_id in (
+                node_cluster_map.get(source_domain) if source_domain else None,
+                node_cluster_map.get(target_domain) if target_domain else None,
+            )
+            if cluster_id is not None
+        }
+        for cluster_id in affected_cluster_ids:
+            cluster_stats_map.setdefault(
+                cluster_id,
+                {
+                    "cluster_id": cluster_id,
+                    "label": cluster_lookup.get(cluster_id, {}).get("label")
+                    or "Unknown cluster",
+                    "node_count": 0,
+                    "link_count": 0,
+                    "transmitted_link_count": 0,
+                    "avg_score": None,
+                    "near_miss_count": 0,
+                    "open_salvage_count": 0,
+                    "latest_timestamp": None,
+                    "top_domains": [],
+                    "exploration_count": 0,
+                    "transmitted_exploration_count": 0,
+                },
+            )["open_salvage_count"] += 1
+        if source_domain is not None and source_domain in seed_stats_map:
+            seed_stats_map[source_domain]["open_salvage_count"] += 1
+
+    for seed_entry in seed_stats_map.values():
+        seed_entry["avg_score"] = (
+            seed_entry["score_total"] / seed_entry["score_count"]
+            if seed_entry["score_count"] > 0
+            else None
+        )
+        seed_entry["neighbor_count"] = len(seed_entry["neighbor_ids"])
+        seed_entry["transmitted_neighbor_count"] = len(
+            seed_entry["transmitted_neighbor_ids"]
+        )
+
+    max_region_activity = max(
+        (_coerce_int(row.get("exploration_count")) for row in cluster_stats_map.values()),
+        default=0,
+    )
+    max_seed_activity = max(
+        (_coerce_int(row.get("exploration_count")) for row in seed_stats_map.values()),
+        default=0,
+    )
+    max_seed_salvage = max(
+        (_coerce_int(row.get("open_salvage_count")) for row in seed_stats_map.values()),
+        default=0,
+    )
+
+    next_regions = []
+    for cluster_entry in cluster_stats_map.values():
+        avg_score = _clamp_float(_coerce_float(cluster_entry.get("avg_score")))
+        transmission_rate = _safe_ratio(
+            cluster_entry.get("transmitted_exploration_count"),
+            cluster_entry.get("exploration_count"),
+        )
+        near_miss_rate = _safe_ratio(
+            cluster_entry.get("near_miss_count"),
+            cluster_entry.get("exploration_count"),
+        )
+        salvage_density = _clamp_float(
+            _safe_ratio(
+                cluster_entry.get("open_salvage_count"),
+                cluster_entry.get("node_count"),
+            )
+        )
+        activity_norm = _normalized_log(
+            cluster_entry.get("exploration_count"),
+            max_region_activity,
+        )
+        freshness_norm = _freshness_norm(cluster_entry.get("latest_timestamp"))
+        frontier_score = 100.0 * (
+            0.30 * avg_score
+            + 0.20 * transmission_rate
+            + 0.20 * near_miss_rate
+            + 0.15 * salvage_density
+            + 0.10 * activity_norm
+            + 0.05 * freshness_norm
+        )
+        next_regions.append(
+            {
+                "cluster_id": cluster_entry.get("cluster_id"),
+                "label": cluster_entry.get("label") or "Unknown cluster",
+                "frontier_score": round(frontier_score, 2),
+                "node_count": _coerce_int(cluster_entry.get("node_count")),
+                "link_count": _coerce_int(cluster_entry.get("link_count")),
+                "transmitted_link_count": _coerce_int(
+                    cluster_entry.get("transmitted_link_count")
+                ),
+                "avg_score": cluster_entry.get("avg_score"),
+                "near_miss_count": _coerce_int(cluster_entry.get("near_miss_count")),
+                "open_salvage_count": _coerce_int(
+                    cluster_entry.get("open_salvage_count")
+                ),
+                "latest_timestamp": cluster_entry.get("latest_timestamp"),
+                "top_domains": list(cluster_entry.get("top_domains") or [])[:5],
+                "why": _frontier_region_why(cluster_entry),
+                "_transmitted_sort": _coerce_int(
+                    cluster_entry.get("transmitted_exploration_count")
+                ),
+            }
+        )
+
+    next_regions.sort(
+        key=lambda row: (
+            -_coerce_float(row.get("frontier_score")),
+            -_coerce_int(row.get("_transmitted_sort")),
+            -_coerce_float(row.get("avg_score")),
+            -_timestamp_sort_value(row.get("latest_timestamp")),
+            str(row.get("label") or "").lower(),
+        ),
+    )
+
+    next_seeds = []
+    for seed_entry in seed_stats_map.values():
+        avg_score = _clamp_float(_coerce_float(seed_entry.get("avg_score")))
+        transmission_rate = _safe_ratio(
+            seed_entry.get("transmitted_count"),
+            seed_entry.get("exploration_count"),
+        )
+        near_miss_rate = _safe_ratio(
+            seed_entry.get("near_miss_count"),
+            seed_entry.get("exploration_count"),
+        )
+        salvage_norm = _normalized_log(
+            seed_entry.get("open_salvage_count"),
+            max_seed_salvage,
+        )
+        transmitted_neighbor_rate = _safe_ratio(
+            seed_entry.get("transmitted_neighbor_count"),
+            seed_entry.get("neighbor_count"),
+        )
+        activity_norm = _normalized_log(
+            seed_entry.get("exploration_count"),
+            max_seed_activity,
+        )
+        freshness_norm = _freshness_norm(seed_entry.get("latest_timestamp"))
+        frontier_score = 100.0 * (
+            0.30 * avg_score
+            + 0.20 * transmission_rate
+            + 0.20 * near_miss_rate
+            + 0.15 * salvage_norm
+            + 0.10 * transmitted_neighbor_rate
+            + 0.05 * freshness_norm
+        )
+        seed_entry["frontier_score"] = round(frontier_score, 2)
+        next_seeds.append(
+            {
+                "domain": seed_entry.get("domain"),
+                "cluster_id": seed_entry.get("cluster_id"),
+                "frontier_score": seed_entry["frontier_score"],
+                "exploration_count": _coerce_int(seed_entry.get("exploration_count")),
+                "transmitted_count": _coerce_int(seed_entry.get("transmitted_count")),
+                "avg_score": seed_entry.get("avg_score"),
+                "near_miss_count": _coerce_int(seed_entry.get("near_miss_count")),
+                "open_salvage_count": _coerce_int(
+                    seed_entry.get("open_salvage_count")
+                ),
+                "latest_timestamp": seed_entry.get("latest_timestamp"),
+                "why": _frontier_seed_why(seed_entry),
+                "_transmitted_neighbor_count": _coerce_int(
+                    seed_entry.get("transmitted_neighbor_count")
+                ),
+            }
+        )
+
+    next_seeds.sort(
+        key=lambda row: (
+            -_coerce_float(row.get("frontier_score")),
+            -_coerce_int(row.get("transmitted_count")),
+            -_coerce_float(row.get("avg_score")),
+            -_timestamp_sort_value(row.get("latest_timestamp")),
+            str(row.get("domain") or "").lower(),
+        ),
+    )
+
+    launchpads = []
+    for seed_entry in seed_stats_map.values():
+        launchpads.append(
+            {
+                "domain": seed_entry.get("domain"),
+                "cluster_id": seed_entry.get("cluster_id"),
+                "exploration_count": _coerce_int(seed_entry.get("exploration_count")),
+                "transmitted_count": _coerce_int(seed_entry.get("transmitted_count")),
+                "avg_score": seed_entry.get("avg_score"),
+                "latest_timestamp": seed_entry.get("latest_timestamp"),
+                "frontier_score": seed_entry.get("frontier_score", 0.0),
+            }
+        )
+
+    launchpads.sort(
+        key=lambda row: (
+            -_coerce_int(row.get("transmitted_count")),
+            -_coerce_float(row.get("avg_score")),
+            -_coerce_int(row.get("exploration_count")),
+            str(row.get("domain") or "").lower(),
+        )
+    )
+
+    strong_bridges = []
+    for row in graph.get("links", []):
+        strong_bridges.append(
+            {
+                "source": row.get("source"),
+                "target": row.get("target"),
+                "count": _coerce_int(row.get("count")),
+                "transmitted_count": _coerce_int(row.get("transmitted_count")),
+                "avg_score": row.get("avg_score"),
+                "max_score": row.get("max_score"),
+                "latest_timestamp": row.get("latest_timestamp"),
+            }
+        )
+
+    strong_bridges.sort(
+        key=lambda row: (
+            -_coerce_int(row.get("transmitted_count")),
+            -_coerce_float(row.get("max_score")),
+            -_coerce_int(row.get("count")),
+            str(row.get("source") or "").lower(),
+            str(row.get("target") or "").lower(),
+        )
+    )
+
+    for row in next_regions:
+        row.pop("_transmitted_sort", None)
+    for row in next_seeds:
+        row.pop("_transmitted_neighbor_count", None)
+
+    return {
+        "stats": {
+            "high_signal_seeds": sum(
+                1
+                for row in launchpads
+                if _coerce_int(row.get("transmitted_count")) > 0
+                or _coerce_float(row.get("avg_score")) >= FRONTIER_NEAR_MISS_SCORE
+            ),
+            "high_signal_bridges": sum(
+                1
+                for row in strong_bridges
+                if _coerce_int(row.get("transmitted_count")) > 0
+                or _coerce_float(row.get("max_score")) >= 0.85
+            ),
+            "open_salvage_candidates": len(salvage_candidates),
+        },
+        "launchpads": launchpads[:FRONTIER_LAUNCHPAD_LIMIT],
+        "strong_bridges": strong_bridges[:FRONTIER_STRONG_BRIDGE_LIMIT],
+        "salvage_candidates": salvage_candidates[:FRONTIER_SALVAGE_LIMIT],
+        "next_regions": next_regions[:FRONTIER_REGION_LIMIT],
+        "next_seeds": next_seeds[:FRONTIER_SEED_LIMIT],
+    }
+
+
 def _extract_transmission_sections(formatted_output: str) -> dict[str, str]:
     section_names = {
         "1) PRIMARY CLAIM": "primary_claim",
@@ -897,6 +1812,16 @@ def api_transmission_timeline():
     return jsonify(_get_transmission_timeline())
 
 
+@app.get("/api/domain-graph")
+def api_domain_graph():
+    return jsonify(_get_domain_graph())
+
+
+@app.get("/api/frontier")
+def api_frontier():
+    return jsonify(_get_frontier_snapshot())
+
+
 @app.post("/api/transmissions/<int:transmission_id>/grade")
 def api_grade_transmission(transmission_id: int):
     payload = request.get_json(silent=True)
@@ -1081,8 +2006,40 @@ def api_operator_home():
     return jsonify(_build_operator_home_snapshot())
 
 
+def _render_observatory_page(template_name: str, page_key: str, page_title: str):
+    return render_template(
+        template_name,
+        page_key=page_key,
+        page_title=page_title,
+    )
+
+
 @app.get("/")
 def index():
+    return _render_observatory_page("home.html", "home", "BlackClaw Observatory")
+
+
+@app.get("/map")
+def map_page():
+    return _render_observatory_page("map.html", "map", "BlackClaw Map")
+
+
+@app.get("/frontier")
+def frontier_page():
+    return _render_observatory_page("frontier.html", "frontier", "BlackClaw Frontier")
+
+
+@app.get("/review")
+def review_page():
+    return _render_observatory_page("review.html", "review", "BlackClaw Review")
+
+
+@app.get("/archive")
+def archive_page():
+    return _render_observatory_page("archive.html", "archive", "BlackClaw Archive")
+
+
+def _legacy_dashboard_markup():
     return """<!doctype html>
 <html lang="en">
 <head>
@@ -1438,15 +2395,491 @@ def index():
       font-size: 13px;
       min-width: 56px;
     }
+    :root {
+      font-family: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
+      --font-sans: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
+      --font-display: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+      --font-mono: "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
+      --bg: #071317;
+      --panel-bg: rgba(9, 20, 26, 0.84);
+      --panel-alt: rgba(14, 31, 40, 0.9);
+      --text: #e5eef3;
+      --header-text: #f4fbff;
+      --link-color: #8fe7ff;
+      --border-color: rgba(151, 201, 220, 0.18);
+      --muted: #9ab2be;
+      --input-bg: rgba(6, 17, 22, 0.92);
+      --accent: #59d39a;
+      --kill-high: #ff7a59;
+      --kill-low: #b5f38a;
+      --row-hover: rgba(96, 167, 196, 0.12);
+      --shadow: 0 20px 60px rgba(0, 0, 0, 0.28);
+    }
+    [data-theme="light"] {
+      --bg: #eef3ef;
+      --panel-bg: rgba(255, 255, 255, 0.88);
+      --panel-alt: rgba(246, 250, 248, 0.95);
+      --text: #15222b;
+      --header-text: #102029;
+      --link-color: #0e7490;
+      --border-color: rgba(30, 65, 80, 0.14);
+      --muted: #59707b;
+      --input-bg: rgba(255, 255, 255, 0.96);
+      --accent: #1c8f67;
+      --kill-high: #cf5f42;
+      --kill-low: #4f8f3b;
+      --row-hover: rgba(52, 117, 145, 0.09);
+      --shadow: 0 22px 48px rgba(43, 70, 87, 0.08);
+    }
+    html {
+      scroll-behavior: smooth;
+    }
+    body {
+      max-width: 1500px;
+      margin: 0 auto;
+      padding: 32px 24px 96px;
+      background:
+        radial-gradient(circle at top left, rgba(96, 167, 196, 0.18), transparent 32%),
+        radial-gradient(circle at top right, rgba(89, 211, 154, 0.14), transparent 24%),
+        linear-gradient(180deg, rgba(7, 19, 23, 0.96), rgba(7, 19, 23, 1));
+      color: var(--text);
+      font-family: var(--font-sans);
+    }
+    [data-theme="light"] body {
+      background:
+        radial-gradient(circle at top left, rgba(110, 194, 220, 0.18), transparent 28%),
+        radial-gradient(circle at top right, rgba(94, 180, 128, 0.14), transparent 22%),
+        linear-gradient(180deg, rgba(244, 248, 245, 0.98), rgba(238, 243, 239, 1));
+    }
+    h1,
+    h2,
+    h3 {
+      font-family: var(--font-display);
+      letter-spacing: -0.03em;
+    }
+    h1 {
+      font-size: clamp(2.4rem, 5vw, 4.2rem);
+      line-height: 0.94;
+      max-width: 12ch;
+    }
+    h2 {
+      font-size: clamp(1.5rem, 2vw, 2rem);
+    }
+    th,
+    .stat-value,
+    .status-pill,
+    .theme-toggle,
+    .hero-link,
+    .section-nav a,
+    .control-field span,
+    .graph-detail-panel button,
+    pre {
+      font-family: var(--font-mono);
+    }
+    a {
+      text-underline-offset: 0.16em;
+    }
+    section {
+      margin-bottom: 18px;
+      padding: 20px;
+      border-radius: 22px;
+      background: var(--panel-bg);
+      border: 1px solid var(--border-color);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(12px);
+    }
+    .hero {
+      padding: 28px;
+      overflow: hidden;
+      background:
+        linear-gradient(135deg, rgba(11, 31, 38, 0.98), rgba(8, 22, 27, 0.9)),
+        var(--panel-bg);
+    }
+    [data-theme="light"] .hero {
+      background:
+        linear-gradient(135deg, rgba(251, 255, 253, 0.98), rgba(241, 248, 245, 0.95)),
+        var(--panel-bg);
+    }
+    .hero-header {
+      display: flex;
+      gap: 24px;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 20px;
+    }
+    .eyebrow {
+      margin: 0 0 10px;
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+    }
+    .hero-copy {
+      max-width: 62ch;
+      font-size: 1rem;
+      line-height: 1.6;
+      color: var(--muted);
+    }
+    .hero-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: flex-end;
+      min-width: 240px;
+    }
+    .hero-link,
+    .graph-detail-panel button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 10px 14px;
+      border-radius: 999px;
+      border: 1px solid var(--border-color);
+      background: var(--panel-alt);
+      color: var(--header-text);
+      text-decoration: none;
+      cursor: pointer;
+    }
+    .section-nav {
+      position: sticky;
+      top: 14px;
+      z-index: 8;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 0 0 18px;
+      padding: 10px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--border-color);
+      background: rgba(7, 19, 23, 0.75);
+      backdrop-filter: blur(12px);
+    }
+    [data-theme="light"] .section-nav {
+      background: rgba(255, 255, 255, 0.78);
+    }
+    .section-nav a {
+      padding: 8px 12px;
+      border-radius: 999px;
+      color: var(--muted);
+      text-decoration: none;
+    }
+    .section-nav a:hover {
+      background: var(--panel-alt);
+      color: var(--header-text);
+    }
+    .theme-toggle {
+      top: 22px;
+      right: 24px;
+      background: rgba(7, 19, 23, 0.82);
+      backdrop-filter: blur(12px);
+      box-shadow: var(--shadow);
+    }
+    [data-theme="light"] .theme-toggle {
+      background: rgba(255, 255, 255, 0.9);
+    }
+    .stat,
+    .transmission-item,
+    .triage-panel,
+    .detail-panel,
+    .detail-card,
+    .detail-item,
+    details,
+    .timeline-shell {
+      border-radius: 16px;
+    }
+    .stat {
+      padding: 14px;
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.01), transparent), var(--panel-alt);
+    }
+    .stat-value {
+      margin-top: 6px;
+      font-size: 1.1rem;
+      letter-spacing: -0.02em;
+    }
+    .muted {
+      line-height: 1.5;
+    }
+    .section-heading {
+      display: flex;
+      gap: 16px;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 14px;
+    }
+    .graph-controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: flex-end;
+      align-items: flex-end;
+      max-width: 560px;
+    }
+    .control-field {
+      display: grid;
+      gap: 6px;
+      min-width: 160px;
+    }
+    .control-field span {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .control-field input,
+    .control-field select,
+    #graph-reset {
+      font: inherit;
+      padding: 10px 12px;
+      color: var(--text);
+      background: var(--input-bg);
+      border: 1px solid var(--border-color);
+      border-radius: 14px;
+    }
+    .control-search {
+      min-width: min(320px, 100%);
+      flex: 1 1 240px;
+    }
+    .control-range {
+      min-width: 210px;
+    }
+    .graph-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.8fr) minmax(280px, 0.8fr);
+      gap: 14px;
+      align-items: stretch;
+    }
+    .graph-stage,
+    .graph-detail-panel {
+      border: 1px solid var(--border-color);
+      background: var(--panel-alt);
+      border-radius: 18px;
+    }
+    .graph-stage {
+      position: relative;
+      min-height: 580px;
+      overflow: hidden;
+    }
+    .domain-web-canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      cursor: default;
+    }
+    .graph-empty {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      text-align: center;
+      color: var(--muted);
+      background: linear-gradient(180deg, rgba(7, 19, 23, 0.18), rgba(7, 19, 23, 0.58));
+    }
+    .graph-caption,
+    .graph-legend {
+      position: absolute;
+      left: 18px;
+      right: 18px;
+      z-index: 1;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 16px;
+      align-items: center;
+      pointer-events: none;
+    }
+    .graph-caption {
+      top: 14px;
+    }
+    .graph-legend {
+      bottom: 14px;
+    }
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(7, 19, 23, 0.62);
+      border: 1px solid var(--border-color);
+      font-size: 12px;
+      color: var(--muted);
+    }
+    [data-theme="light"] .legend-item {
+      background: rgba(255, 255, 255, 0.78);
+    }
+    .legend-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      display: inline-block;
+    }
+    .legend-dot-seed {
+      background: #ffb74d;
+    }
+    .legend-dot-target {
+      background: #67d5ff;
+    }
+    .legend-dot-bridge {
+      background: #59d39a;
+    }
+    .legend-line {
+      width: 18px;
+      height: 2px;
+      display: inline-block;
+      background: linear-gradient(90deg, rgba(154, 178, 190, 0.3), rgba(89, 211, 154, 0.9));
+    }
+    .graph-detail-panel {
+      padding: 16px;
+      display: grid;
+      align-content: start;
+      gap: 12px;
+    }
+    .graph-detail-panel h3 {
+      margin: 0;
+    }
+    .graph-detail-panel p,
+    .graph-detail-panel ul {
+      margin: 0;
+    }
+    .graph-neighbors {
+      display: grid;
+      gap: 8px;
+    }
+    .graph-neighbor {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 10px;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 12px;
+      border-radius: 14px;
+      border: 1px solid var(--border-color);
+      background: var(--panel-bg);
+    }
+    .graph-neighbor strong {
+      font-size: 14px;
+    }
+    #graph-reset {
+      cursor: pointer;
+    }
+    @media (max-width: 1024px) {
+      .graph-layout {
+        grid-template-columns: 1fr;
+      }
+      .graph-stage {
+        min-height: 500px;
+      }
+      .hero-header,
+      .section-heading {
+        flex-direction: column;
+      }
+      .hero-actions,
+      .graph-controls {
+        justify-content: flex-start;
+        width: 100%;
+      }
+    }
+    @media (max-width: 720px) {
+      body {
+        padding: 18px 14px 80px;
+      }
+      section,
+      .hero {
+        padding: 16px;
+      }
+      .section-nav {
+        top: 8px;
+        border-radius: 20px;
+      }
+      .graph-stage {
+        min-height: 420px;
+      }
+      .theme-toggle {
+        position: static;
+        margin-bottom: 12px;
+      }
+    }
   </style>
 </head>
 <body>
   <button id="theme-toggle" class="theme-toggle" type="button">Light Mode</button>
-  <h1>BlackClaw Dashboard</h1>
-  <p class="muted">Local dashboard over transmissions, evidence review, outcome review, and kill stats.</p>
-  <p><a href="/domains">Browse domains</a></p>
+  <section class="hero">
+    <div class="hero-header">
+      <div>
+        <p class="eyebrow">BlackClaw Observatory</p>
+        <h1>Map the search space, not just the backlog.</h1>
+        <p class="hero-copy">
+          BlackClaw is already exploring a real web of domains. This dashboard now leads with that map so we can see what it has touched, where it keeps jumping, and which bridges are actually surviving.
+        </p>
+      </div>
+      <div class="hero-actions">
+        <a class="hero-link" href="#domain-web-section">Open Exploration Web</a>
+        <a class="hero-link" href="/domains">Browse Domain Table</a>
+      </div>
+    </div>
+    <div id="hero-summary" class="grid"><p class="muted">Loading live snapshot…</p></div>
+  </section>
 
-  <section>
+  <nav class="section-nav" aria-label="Dashboard sections">
+    <a href="#domain-web-section">Exploration Web</a>
+    <a href="#operator-home-section">Operator Home</a>
+    <a href="#evidence-section">Evidence</a>
+    <a href="#outcome-review-section">Outcomes</a>
+    <a href="#strong-rejection-section">Rejections</a>
+    <a href="#transmissions-section">Transmissions</a>
+  </nav>
+
+  <section id="domain-web-section">
+    <div class="section-heading">
+      <div>
+        <p class="eyebrow">Exploration Web</p>
+        <h2>Where BlackClaw Has Been</h2>
+        <p class="muted">Each node is a domain BlackClaw has touched. Links represent real seed-to-target jumps. Brighter edges mean stronger or transmitted connections. Search a domain to isolate its local neighborhood.</p>
+      </div>
+      <div class="graph-controls">
+        <label class="control-field">
+          <span>View</span>
+          <select id="graph-mode">
+            <option value="all">All explored</option>
+            <option value="successful">Transmitted only</option>
+            <option value="strong">High signal</option>
+          </select>
+        </label>
+        <label class="control-field control-search">
+          <span>Focus</span>
+          <input id="graph-search" type="text" placeholder="Try Locksmithing or Neuroscience">
+        </label>
+        <label class="control-field control-range">
+          <span>Min score <strong id="graph-score-value">0.00</strong></span>
+          <input id="graph-score" type="range" min="0" max="1" step="0.05" value="0">
+        </label>
+        <button id="graph-reset" type="button">Reset view</button>
+      </div>
+    </div>
+    <div id="domain-web-summary" class="grid"><p class="muted">Loading graph…</p></div>
+    <div class="graph-layout">
+      <div class="graph-stage">
+        <div class="graph-caption muted">Click a node to inspect a domain. Click a line to inspect a specific jump.</div>
+        <canvas id="domain-web-canvas" class="domain-web-canvas"></canvas>
+        <div id="domain-web-empty" class="graph-empty" hidden>No domains match the current filters.</div>
+        <div class="graph-legend" aria-hidden="true">
+          <span class="legend-item"><span class="legend-dot legend-dot-seed"></span>Seed-heavy</span>
+          <span class="legend-item"><span class="legend-dot legend-dot-target"></span>Target-heavy</span>
+          <span class="legend-item"><span class="legend-dot legend-dot-bridge"></span>Acts as both</span>
+          <span class="legend-item"><span class="legend-line"></span>Stronger or transmitted jump</span>
+        </div>
+      </div>
+      <div id="domain-web-detail" class="graph-detail-panel">
+        <h3>Select Something In The Web</h3>
+        <p class="muted">The old dashboard told you counts. This panel tells you where those counts live in the network. Pick a domain or edge to inspect it.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="operator-home-section">
     <h2>Operator Home</h2>
     <p class="muted">Local triage snapshot of what needs attention now. Click any row to load the existing detail panel in the relevant review section below.</p>
     <div id="operator-home-summary" class="grid"><p class="muted">Loading…</p></div>
@@ -1469,27 +2902,27 @@ def index():
     </div>
   </section>
 
-  <section>
+  <section id="stats-section">
     <h2>Kill Stats</h2>
     <div id="stats" class="grid"></div>
   </section>
 
-  <section>
+  <section id="cost-section">
     <h2>Cost</h2>
     <div id="costs" class="grid"></div>
   </section>
 
-  <section>
+  <section id="timeline-section">
     <h2>Transmission Timeline</h2>
     <div id="transmission-timeline"><p class="muted">Loading…</p></div>
   </section>
 
-  <section>
+  <section id="top-killed-section">
     <h2>Top Killed Connections</h2>
     <div id="top-killed"></div>
   </section>
 
-  <section>
+  <section id="evidence-section">
     <h2>Evidence Review</h2>
     <p class="muted">SQLite-only review queue for evidence hits. Click a row to inspect one hit and optionally mark it accepted or dismissed.</p>
     <div id="evidence-review-stats" class="grid"><p class="muted">Loading…</p></div>
@@ -1498,21 +2931,21 @@ def index():
     <div id="evidence-detail" class="detail-panel"><p class="muted">Select an evidence hit to inspect details.</p></div>
   </section>
 
-  <section>
+  <section id="outcome-stats-section">
     <h2>Outcome Suggestion Stats</h2>
     <p class="muted">Open-prediction suggestion buckets computed from accepted and unreviewed local evidence only.</p>
     <div id="outcome-suggestion-buckets" class="grid"><p class="muted">Loading…</p></div>
     <div id="outcome-review-backlog" class="grid"></div>
   </section>
 
-  <section>
+  <section id="outcome-review-section">
     <h2>Outcome Review</h2>
     <p class="muted">Manual outcome-review queue driven by local evidence counts. Click a row to inspect the current recommendation and example hits.</p>
     <div id="outcome-review-queue"></div>
     <div id="outcome-review-detail" class="detail-panel"><p class="muted">Select a prediction to inspect outcome review detail.</p></div>
   </section>
 
-  <section>
+  <section id="strong-rejection-section">
     <h2>Strong Rejections</h2>
     <p class="muted">Salvage queue for locally stored high-scoring rejects. Open items are shown first by default; click a row to inspect and optionally mark it salvaged or dismissed.</p>
     <div id="strong-rejection-stats" class="grid"><p class="muted">Loading…</p></div>
@@ -1520,7 +2953,7 @@ def index():
     <div id="strong-rejection-detail" class="detail-panel"><p class="muted">Select a strong rejection to inspect details.</p></div>
   </section>
 
-  <section>
+  <section id="transmissions-section">
     <h2>Transmissions</h2>
     <div id="grade-summary" class="grade-summary muted" hidden></div>
     <p id="transmission-count" class="muted">Loading…</p>
@@ -1551,10 +2984,27 @@ def index():
     let selectedEvidenceId = null;
     let selectedOutcomePredictionId = null;
     let selectedStrongRejectionId = null;
+    let dashboardStatsPayload = null;
+    let dashboardCostsPayload = null;
+    let operatorHomeSnapshot = null;
+    let domainGraphPayload = null;
+    let currentDomainGraph = null;
+    let currentDomainGraphLayout = null;
+    let selectedGraphNodeId = null;
+    let selectedGraphLinkKey = null;
+    let hoveredGraphNodeId = null;
+    let hoveredGraphLinkKey = null;
+    let domainGraphControlsInitialized = false;
+    let domainGraphSearchTimer = null;
+    let domainGraphResizeTimer = null;
+    const domainGraphLayoutCache = new Map();
 
     function applyTheme() {
       document.documentElement.dataset.theme = isDarkMode ? "dark" : "light";
       document.getElementById("theme-toggle").textContent = isDarkMode ? "Light Mode" : "Dark Mode";
+      if (domainGraphPayload) {
+        updateDomainGraph();
+      }
     }
 
     async function fetchJson(url) {
@@ -1604,6 +3054,10 @@ def index():
       return typeof value === "number" ? value.toFixed(2) : "n/a";
     }
 
+    function formatPercent(value) {
+      return typeof value === "number" ? `${value.toFixed(1)}%` : "n/a";
+    }
+
     function formatTimelineDate(date, includeYear = false) {
       return date.toLocaleString(undefined, {
         ...(includeYear ? { year: "numeric" } : {}),
@@ -1645,6 +3099,19 @@ def index():
       return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
     }
 
+    function clamp(value, min, max) {
+      return Math.min(max, Math.max(min, value));
+    }
+
+    function hashString(value) {
+      let hash = 0;
+      const text = String(value ?? "");
+      for (let index = 0; index < text.length; index += 1) {
+        hash = ((hash << 5) - hash + text.charCodeAt(index)) | 0;
+      }
+      return Math.abs(hash);
+    }
+
     function predictionSummary(row) {
       const predictionJson = row && typeof row.prediction_json === "object" ? row.prediction_json : null;
       const statement = predictionJson && typeof predictionJson.statement === "string"
@@ -1655,7 +3122,8 @@ def index():
 
     function safeHttpUrl(value) {
       const text = String(value ?? "").trim();
-      return /^https?:\\/\\//i.test(text) ? text : "";
+      const lower = text.toLowerCase();
+      return lower.startsWith("http://") || lower.startsWith("https://") ? text : "";
     }
 
     function renderExternalLink(value) {
@@ -1708,7 +3176,7 @@ def index():
         return "";
       }
       return `
-        <details open>
+        <details>
           <summary>${escapeHtml(title)}</summary>
           <pre>${escapeHtml(text)}</pre>
         </details>
@@ -1742,7 +3210,61 @@ def index():
       return rate >= 0.5 ? "kill-high" : "kill-low";
     }
 
+    function renderHeroSummary() {
+      const container = document.getElementById("hero-summary");
+      if (!container) {
+        return;
+      }
+      if (!dashboardStatsPayload && !dashboardCostsPayload && !operatorHomeSnapshot && !domainGraphPayload) {
+        container.innerHTML = "<p class=\\"muted\\">Loading live snapshot…</p>";
+        return;
+      }
+
+      const graphStats = domainGraphPayload ? domainGraphPayload.stats || {} : {};
+      const operatorCounts = operatorHomeSnapshot ? operatorHomeSnapshot.counts || {} : {};
+      const items = [
+        {
+          label: "Mapped domains",
+          value: graphStats.unique_domains != null ? formatInteger(graphStats.unique_domains) : "…",
+          valueClass: "score-accent",
+        },
+        {
+          label: "Mapped jumps",
+          value: graphStats.unique_connections != null ? formatInteger(graphStats.unique_connections) : "…",
+        },
+        {
+          label: "Recent transmission rate",
+          value: dashboardStatsPayload ? formatPercent(dashboardStatsPayload.transmission_rate) : "…",
+          valueClass: "score-accent",
+        },
+        {
+          label: "Unreviewed evidence",
+          value: operatorHomeSnapshot ? formatInteger(operatorCounts.unreviewed_evidence_hits || 0) : "…",
+        },
+        {
+          label: "Open strong rejections",
+          value: operatorHomeSnapshot ? formatInteger(operatorCounts.open_strong_rejections || 0) : "…",
+        },
+        {
+          label: "Cost per transmission",
+          value: dashboardCostsPayload && dashboardCostsPayload.available
+            ? formatCurrency(dashboardCostsPayload.cost_per_transmission)
+            : "n/a",
+          valueClass: "score-accent",
+        },
+      ];
+
+      container.innerHTML = items.map((item) => `
+        <div class="stat">
+          <div class="muted">${escapeHtml(item.label)}</div>
+          <div class="stat-value ${item.valueClass || ""}">${escapeHtml(item.value)}</div>
+        </div>
+      `).join("");
+    }
+
     function renderStats(stats) {
+      dashboardStatsPayload = stats;
+      renderHeroSummary();
       const items = [
         { label: "Window", value: stats.window_requested },
         { label: "Total explorations", value: stats.total_explorations },
@@ -1766,6 +3288,8 @@ def index():
     }
 
     function renderCosts(costs) {
+      dashboardCostsPayload = costs;
+      renderHeroSummary();
       const container = document.getElementById("costs");
       if (!costs.available) {
         container.innerHTML = "<p class=\\"muted\\">No cost data available</p>";
@@ -1787,6 +3311,842 @@ def index():
           <div class="stat-value ${item.valueClass || ""}">${escapeHtml(item.value)}</div>
         </div>
       `).join("");
+    }
+
+    function domainRoleLabel(role) {
+      if (role === "seed") {
+        return "seed-heavy";
+      }
+      if (role === "target") {
+        return "target-heavy";
+      }
+      return "bridge";
+    }
+
+    function graphLinkKey(link) {
+      return `${link.source}→${link.target}`;
+    }
+
+    function graphNodeColor(role, alpha = 1) {
+      const palette = document.documentElement.dataset.theme === "light"
+        ? {
+            seed: `rgba(221, 134, 41, ${alpha})`,
+            target: `rgba(34, 151, 201, ${alpha})`,
+            bridge: `rgba(28, 143, 103, ${alpha})`,
+          }
+        : {
+            seed: `rgba(255, 183, 77, ${alpha})`,
+            target: `rgba(103, 213, 255, ${alpha})`,
+            bridge: `rgba(89, 211, 154, ${alpha})`,
+          };
+      return palette[role] || palette.bridge;
+    }
+
+    function renderDomainGraph(payload) {
+      domainGraphPayload = payload;
+      renderHeroSummary();
+      initializeDomainGraphControls();
+      updateDomainGraph();
+    }
+
+    function initializeDomainGraphControls() {
+      if (domainGraphControlsInitialized) {
+        return;
+      }
+      const modeInput = document.getElementById("graph-mode");
+      const scoreInput = document.getElementById("graph-score");
+      const scoreValue = document.getElementById("graph-score-value");
+      const searchInput = document.getElementById("graph-search");
+      const resetButton = document.getElementById("graph-reset");
+      const canvas = document.getElementById("domain-web-canvas");
+      if (!modeInput || !scoreInput || !scoreValue || !searchInput || !resetButton || !canvas) {
+        return;
+      }
+
+      scoreValue.textContent = Number(scoreInput.value || 0).toFixed(2);
+
+      modeInput.addEventListener("change", () => {
+        selectedGraphNodeId = null;
+        selectedGraphLinkKey = null;
+        updateDomainGraph();
+      });
+      scoreInput.addEventListener("input", () => {
+        scoreValue.textContent = Number(scoreInput.value || 0).toFixed(2);
+        selectedGraphLinkKey = null;
+        updateDomainGraph();
+      });
+      searchInput.addEventListener("input", () => {
+        window.clearTimeout(domainGraphSearchTimer);
+        domainGraphSearchTimer = window.setTimeout(() => {
+          selectedGraphNodeId = null;
+          selectedGraphLinkKey = null;
+          updateDomainGraph();
+        }, 120);
+      });
+      resetButton.addEventListener("click", () => {
+        modeInput.value = "all";
+        scoreInput.value = "0";
+        scoreValue.textContent = "0.00";
+        searchInput.value = "";
+        selectedGraphNodeId = null;
+        selectedGraphLinkKey = null;
+        hoveredGraphNodeId = null;
+        hoveredGraphLinkKey = null;
+        updateDomainGraph();
+      });
+      canvas.addEventListener("mousemove", handleDomainGraphCanvasMove);
+      canvas.addEventListener("mouseleave", () => {
+        hoveredGraphNodeId = null;
+        hoveredGraphLinkKey = null;
+        renderDomainGraphCanvas();
+      });
+      canvas.addEventListener("click", handleDomainGraphCanvasClick);
+      window.addEventListener("resize", () => {
+        window.clearTimeout(domainGraphResizeTimer);
+        domainGraphResizeTimer = window.setTimeout(() => {
+          updateDomainGraph();
+        }, 120);
+      });
+      domainGraphControlsInitialized = true;
+    }
+
+    function buildFilteredDomainGraph(payload) {
+      const mode = document.getElementById("graph-mode")?.value || "all";
+      const minScore = Number(document.getElementById("graph-score")?.value || 0);
+      const query = (document.getElementById("graph-search")?.value || "").trim().toLowerCase();
+      const baseNodes = Array.isArray(payload?.nodes) ? payload.nodes : [];
+      const baseLinks = Array.isArray(payload?.links) ? payload.links : [];
+
+      let filteredLinks = baseLinks.filter((link) => {
+        const maxScore = Number(link.max_score ?? link.avg_score ?? 0);
+        if (maxScore < minScore) {
+          return false;
+        }
+        if (mode === "successful") {
+          return Number(link.transmitted_count || 0) > 0;
+        }
+        if (mode === "strong") {
+          return Number(link.transmitted_count || 0) > 0 || maxScore >= Math.max(minScore, 0.8);
+        }
+        return true;
+      });
+
+      const matchedIds = new Set();
+      if (query) {
+        baseNodes.forEach((node) => {
+          if (String(node.id || "").toLowerCase().includes(query)) {
+            matchedIds.add(node.id);
+          }
+        });
+        if (!matchedIds.size) {
+          return {
+            nodes: [],
+            links: [],
+            matchedIds,
+            query,
+            stats: {
+              visible_domains: 0,
+              visible_connections: 0,
+              visible_transmitted_connections: 0,
+              visible_explorations: 0,
+              avg_score: null,
+            },
+          };
+        }
+        const focusIds = new Set(matchedIds);
+        filteredLinks.forEach((link) => {
+          if (matchedIds.has(link.source) || matchedIds.has(link.target)) {
+            focusIds.add(link.source);
+            focusIds.add(link.target);
+          }
+        });
+        filteredLinks = filteredLinks.filter(
+          (link) => focusIds.has(link.source) && focusIds.has(link.target)
+        );
+        if (!filteredLinks.length) {
+          matchedIds.forEach((id) => focusIds.add(id));
+        }
+        const standaloneNodes = baseNodes
+          .filter((node) => focusIds.has(node.id))
+          .map((node) => ({
+            ...node,
+            degree: 0,
+            radius: 8,
+            isMatch: matchedIds.has(node.id),
+          }));
+        if (!filteredLinks.length) {
+          return {
+            nodes: standaloneNodes,
+            links: [],
+            matchedIds,
+            query,
+            stats: {
+              visible_domains: standaloneNodes.length,
+              visible_connections: 0,
+              visible_transmitted_connections: 0,
+              visible_explorations: 0,
+              avg_score: null,
+            },
+          };
+        }
+      }
+
+      const includedIds = new Set();
+      filteredLinks.forEach((link) => {
+        includedIds.add(link.source);
+        includedIds.add(link.target);
+      });
+      const nodes = baseNodes
+        .filter((node) => includedIds.has(node.id))
+        .map((node) => ({
+          ...node,
+          degree: 0,
+          radius: 7,
+          isMatch: matchedIds.has(node.id),
+        }));
+      const nodeById = new Map(nodes.map((node) => [node.id, node]));
+      const links = filteredLinks.filter(
+        (link) => nodeById.has(link.source) && nodeById.has(link.target)
+      );
+
+      let totalScoredConnections = 0;
+      let scoreSum = 0;
+      let visibleExplorations = 0;
+      links.forEach((link) => {
+        visibleExplorations += Number(link.count || 0);
+        const sourceNode = nodeById.get(link.source);
+        const targetNode = nodeById.get(link.target);
+        if (sourceNode) {
+          sourceNode.degree += Number(link.count || 0);
+        }
+        if (targetNode) {
+          targetNode.degree += Number(link.count || 0);
+        }
+        const score = Number(link.max_score ?? link.avg_score);
+        if (Number.isFinite(score)) {
+          totalScoredConnections += 1;
+          scoreSum += score;
+        }
+      });
+      nodes.forEach((node) => {
+        node.radius = clamp(
+          4 + Math.sqrt(Math.max(1, node.degree || node.connection_count || 1)) * 1.6
+            + (Number(node.transmitted_count || 0) > 0 ? 1.5 : 0),
+          5,
+          18
+        );
+      });
+
+      return {
+        nodes,
+        links,
+        matchedIds,
+        query,
+        stats: {
+          visible_domains: nodes.length,
+          visible_connections: links.length,
+          visible_transmitted_connections: links.filter(
+            (link) => Number(link.transmitted_count || 0) > 0
+          ).length,
+          visible_explorations: visibleExplorations,
+          avg_score: totalScoredConnections > 0 ? scoreSum / totalScoredConnections : null,
+        },
+      };
+    }
+
+    function renderDomainGraphSummary(graph) {
+      const container = document.getElementById("domain-web-summary");
+      if (!container) {
+        return;
+      }
+      const overall = domainGraphPayload ? domainGraphPayload.stats || {} : {};
+      const items = [
+        {
+          label: graph.query ? "Visible domains" : "Mapped domains",
+          value: formatInteger(graph.query ? graph.stats.visible_domains : (overall.unique_domains || 0)),
+          valueClass: "score-accent",
+        },
+        {
+          label: graph.query ? "Visible connections" : "Mapped jumps",
+          value: formatInteger(graph.query ? graph.stats.visible_connections : (overall.unique_connections || 0)),
+        },
+        {
+          label: "Transmitted connections",
+          value: formatInteger(
+            graph.query
+              ? graph.stats.visible_transmitted_connections
+              : (overall.transmitted_connections || 0)
+          ),
+          valueClass: "score-accent",
+        },
+        {
+          label: "Visible explorations",
+          value: formatInteger(graph.query ? graph.stats.visible_explorations : (overall.total_explorations || 0)),
+        },
+        {
+          label: "Average visible score",
+          value: formatScore(graph.stats.avg_score ?? overall.avg_score),
+          valueClass: "score-accent",
+        },
+        {
+          label: "Search focus",
+          value: graph.query ? truncateText(graph.query, 28) : "entire map",
+        },
+      ];
+
+      container.innerHTML = items.map((item) => `
+        <div class="stat">
+          <div class="muted">${escapeHtml(item.label)}</div>
+          <div class="stat-value ${item.valueClass || ""}">${escapeHtml(item.value)}</div>
+        </div>
+      `).join("");
+    }
+
+    function prepareDomainGraphCanvas() {
+      const canvas = document.getElementById("domain-web-canvas");
+      if (!canvas) {
+        return null;
+      }
+      const rect = canvas.getBoundingClientRect();
+      const width = Math.max(320, Math.round(rect.width || 0));
+      const height = Math.max(360, Math.round(rect.height || 0));
+      const dpr = window.devicePixelRatio || 1;
+      if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
+        canvas.width = Math.round(width * dpr);
+        canvas.height = Math.round(height * dpr);
+      }
+      const context = canvas.getContext("2d");
+      context.setTransform(dpr, 0, 0, dpr, 0, 0);
+      return { canvas, context, width, height };
+    }
+
+    function computeDomainGraphLayout(graph, width, height) {
+      const centerX = width / 2;
+      const centerY = height / 2;
+      const spread = Math.min(width, height) * 0.36;
+      const nodes = graph.nodes.map((node) => {
+        const cached = domainGraphLayoutCache.get(node.id);
+        if (cached && Number.isFinite(cached.x) && Number.isFinite(cached.y)) {
+          return {
+            ...node,
+            x: clamp(cached.x, 26, width - 26),
+            y: clamp(cached.y, 26, height - 26),
+            vx: 0,
+            vy: 0,
+          };
+        }
+        const seed = hashString(node.id);
+        const angle = ((seed % 3600) / 3600) * Math.PI * 2;
+        const ring = 0.18 + (((seed >> 3) % 1000) / 1000) * 0.82;
+        const degreeBias = 1 - Math.min(0.62, Math.log1p(node.degree || 1) / 9);
+        return {
+          ...node,
+          x: centerX + Math.cos(angle) * spread * ring * degreeBias,
+          y: centerY + Math.sin(angle) * spread * ring * degreeBias,
+          vx: 0,
+          vy: 0,
+        };
+      });
+      const nodeById = new Map(nodes.map((node) => [node.id, node]));
+      const links = graph.links
+        .map((link) => ({
+          ...link,
+          sourceNode: nodeById.get(link.source),
+          targetNode: nodeById.get(link.target),
+        }))
+        .filter((link) => link.sourceNode && link.targetNode);
+
+      if (nodes.length > 1) {
+        const repulsionSamples = Math.min(
+          24,
+          Math.max(8, Math.round(Math.sqrt(nodes.length) * 1.4))
+        );
+        const ticks = Math.min(220, Math.max(90, 90 + Math.round(nodes.length / 5)));
+
+        for (let tick = 0; tick < ticks; tick += 1) {
+          const alpha = 1 - tick / ticks;
+
+          links.forEach((link) => {
+            const source = link.sourceNode;
+            const target = link.targetNode;
+            const dx = target.x - source.x;
+            const dy = target.y - source.y;
+            const distance = Math.sqrt(dx * dx + dy * dy) || 0.001;
+            const desiredDistance = clamp(
+              78 - Math.min(22, Number(link.transmitted_count || 0) * 8) - Math.min(16, Number(link.count || 0) * 3),
+              28,
+              92
+            );
+            const springForce = (distance - desiredDistance) * 0.0022;
+            const forceX = (dx / distance) * springForce;
+            const forceY = (dy / distance) * springForce;
+            source.vx += forceX;
+            source.vy += forceY;
+            target.vx -= forceX;
+            target.vy -= forceY;
+          });
+
+          nodes.forEach((node, index) => {
+            node.vx += (centerX - node.x) * 0.0007 * alpha;
+            node.vy += (centerY - node.y) * 0.0007 * alpha;
+
+            for (let sample = 1; sample <= repulsionSamples; sample += 1) {
+              const other = nodes[(index + sample * 17 + tick * 13) % nodes.length];
+              if (!other || other === node) {
+                continue;
+              }
+              let dx = node.x - other.x;
+              let dy = node.y - other.y;
+              let distanceSquared = dx * dx + dy * dy;
+              if (distanceSquared < 0.5) {
+                dx = 0.1 + ((index + sample) % 3) * 0.07;
+                dy = 0.1 + ((index + tick) % 3) * 0.07;
+                distanceSquared = dx * dx + dy * dy;
+              }
+
+              const minDistance = node.radius + other.radius + 10;
+              if (distanceSquared < minDistance * minDistance) {
+                const distance = Math.sqrt(distanceSquared);
+                const overlap = (minDistance - distance) / Math.max(distance, 0.001);
+                const pushX = dx * overlap * 0.02;
+                const pushY = dy * overlap * 0.02;
+                node.vx += pushX;
+                node.vy += pushY;
+                other.vx -= pushX;
+                other.vy -= pushY;
+              }
+
+              const repulsion = (1800 + (node.degree + other.degree) * 10) / (distanceSquared + 120);
+              node.vx += dx * repulsion * 0.00045;
+              node.vy += dy * repulsion * 0.00045;
+            }
+          });
+
+          nodes.forEach((node) => {
+            node.vx *= 0.84;
+            node.vy *= 0.84;
+            node.x = clamp(node.x + node.vx, 24, width - 24);
+            node.y = clamp(node.y + node.vy, 24, height - 24);
+          });
+        }
+      }
+
+      nodes.forEach((node) => {
+        domainGraphLayoutCache.set(node.id, { x: node.x, y: node.y });
+      });
+
+      return { nodes, links, width, height };
+    }
+
+    function distanceToSegment(pointX, pointY, x1, y1, x2, y2) {
+      const dx = x2 - x1;
+      const dy = y2 - y1;
+      if (dx === 0 && dy === 0) {
+        return Math.hypot(pointX - x1, pointY - y1);
+      }
+      const t = clamp(
+        ((pointX - x1) * dx + (pointY - y1) * dy) / (dx * dx + dy * dy),
+        0,
+        1
+      );
+      const closestX = x1 + dx * t;
+      const closestY = y1 + dy * t;
+      return Math.hypot(pointX - closestX, pointY - closestY);
+    }
+
+    function findDomainGraphHit(pointX, pointY) {
+      if (!currentDomainGraphLayout) {
+        return null;
+      }
+
+      const nodeHit = [...currentDomainGraphLayout.nodes]
+        .sort((left, right) => right.radius - left.radius)
+        .find((node) => Math.hypot(pointX - node.x, pointY - node.y) <= node.radius + 3);
+      if (nodeHit) {
+        return { type: "node", item: nodeHit };
+      }
+
+      const linkHit = currentDomainGraphLayout.links.find((link) => {
+        const threshold = 4 + Math.min(4, Number(link.count || 0));
+        return distanceToSegment(
+          pointX,
+          pointY,
+          link.sourceNode.x,
+          link.sourceNode.y,
+          link.targetNode.x,
+          link.targetNode.y
+        ) <= threshold;
+      });
+      if (linkHit) {
+        return { type: "link", item: linkHit };
+      }
+      return null;
+    }
+
+    function renderDomainGraphCanvas() {
+      const prepared = prepareDomainGraphCanvas();
+      if (!prepared) {
+        return;
+      }
+      const { context, width, height } = prepared;
+      const emptyState = document.getElementById("domain-web-empty");
+
+      if (!currentDomainGraph || !currentDomainGraph.nodes.length) {
+        context.clearRect(0, 0, width, height);
+        if (emptyState) {
+          emptyState.hidden = false;
+        }
+        return;
+      }
+
+      if (emptyState) {
+        emptyState.hidden = true;
+      }
+
+      const layoutNeedsRefresh =
+        !currentDomainGraphLayout
+        || currentDomainGraphLayout.width !== width
+        || currentDomainGraphLayout.height !== height
+        || currentDomainGraphLayout.nodes.length !== currentDomainGraph.nodes.length
+        || currentDomainGraphLayout.links.length !== currentDomainGraph.links.length;
+
+      if (layoutNeedsRefresh) {
+        currentDomainGraphLayout = computeDomainGraphLayout(currentDomainGraph, width, height);
+      }
+
+      const isLight = document.documentElement.dataset.theme === "light";
+      const background = context.createLinearGradient(0, 0, width, height);
+      background.addColorStop(0, isLight ? "rgba(252, 255, 253, 0.96)" : "rgba(6, 19, 24, 0.96)");
+      background.addColorStop(1, isLight ? "rgba(242, 247, 244, 0.96)" : "rgba(7, 16, 21, 0.99)");
+      context.clearRect(0, 0, width, height);
+      context.fillStyle = background;
+      context.fillRect(0, 0, width, height);
+
+      const activeNodeIds = new Set();
+      if (selectedGraphNodeId) {
+        activeNodeIds.add(selectedGraphNodeId);
+        currentDomainGraph.links.forEach((link) => {
+          if (link.source === selectedGraphNodeId || link.target === selectedGraphNodeId) {
+            activeNodeIds.add(link.source);
+            activeNodeIds.add(link.target);
+          }
+        });
+      }
+      if (selectedGraphLinkKey) {
+        const selectedLink = currentDomainGraph.links.find(
+          (link) => graphLinkKey(link) === selectedGraphLinkKey
+        );
+        if (selectedLink) {
+          activeNodeIds.add(selectedLink.source);
+          activeNodeIds.add(selectedLink.target);
+        }
+      }
+
+      currentDomainGraphLayout.links.forEach((link) => {
+        const key = graphLinkKey(link);
+        const isSelected = key === selectedGraphLinkKey;
+        const isHovered = key === hoveredGraphLinkKey;
+        const touchesSelectedNode = selectedGraphNodeId
+          && (link.source === selectedGraphNodeId || link.target === selectedGraphNodeId);
+        const isDimmed = (
+          (selectedGraphNodeId && !touchesSelectedNode)
+          || (selectedGraphLinkKey && !isSelected)
+        );
+        const score = Number(link.max_score ?? link.avg_score ?? 0);
+        const baseAlpha = clamp(
+          0.16 + score * 0.36 + Number(link.transmitted_count || 0) * 0.18,
+          0.12,
+          0.88
+        );
+        const alpha = isSelected || isHovered ? 0.95 : isDimmed ? 0.08 : baseAlpha;
+        context.beginPath();
+        context.moveTo(link.sourceNode.x, link.sourceNode.y);
+        context.lineTo(link.targetNode.x, link.targetNode.y);
+        context.lineWidth = isSelected || isHovered
+          ? 3.4
+          : clamp(0.8 + Number(link.count || 0) * 0.55 + Number(link.transmitted_count || 0) * 0.7, 0.8, 4.2);
+        if (Number(link.transmitted_count || 0) > 0) {
+          context.strokeStyle = isLight
+            ? `rgba(28, 143, 103, ${alpha})`
+            : `rgba(89, 211, 154, ${alpha})`;
+        } else if (score >= 0.85) {
+          context.strokeStyle = isLight
+            ? `rgba(41, 138, 176, ${alpha})`
+            : `rgba(103, 213, 255, ${alpha})`;
+        } else {
+          context.strokeStyle = isLight
+            ? `rgba(89, 112, 123, ${alpha})`
+            : `rgba(154, 178, 190, ${alpha})`;
+        }
+        context.stroke();
+      });
+
+      const emphasizedNodes = new Set(activeNodeIds);
+      if (hoveredGraphNodeId) {
+        emphasizedNodes.add(hoveredGraphNodeId);
+      }
+      currentDomainGraphLayout.nodes
+        .slice()
+        .sort((left, right) => left.radius - right.radius)
+        .forEach((node) => {
+          const isSelected = node.id === selectedGraphNodeId;
+          const isHovered = node.id === hoveredGraphNodeId;
+          const isActive = !selectedGraphNodeId && !selectedGraphLinkKey
+            ? true
+            : emphasizedNodes.has(node.id);
+          const alpha = isSelected || isHovered ? 1 : isActive ? 0.92 : 0.24;
+
+          context.beginPath();
+          context.arc(node.x, node.y, node.radius, 0, Math.PI * 2);
+          context.fillStyle = graphNodeColor(node.role, alpha);
+          context.fill();
+          context.lineWidth = isSelected || isHovered ? 2.4 : 1.2;
+          context.strokeStyle = Number(node.transmitted_count || 0) > 0
+            ? (isLight ? "rgba(16, 39, 49, 0.92)" : "rgba(244, 251, 255, 0.82)")
+            : (isLight ? "rgba(16, 39, 49, 0.42)" : "rgba(244, 251, 255, 0.26)");
+          context.stroke();
+        });
+
+      const labelCandidates = currentDomainGraphLayout.nodes
+        .filter((node) => (
+          node.isMatch
+          || node.id === selectedGraphNodeId
+          || node.id === hoveredGraphNodeId
+          || Number(node.transmitted_count || 0) > 0
+          || Number(node.connection_count || 0) >= 4
+        ))
+        .sort((left, right) => (
+          Number(right.isMatch) - Number(left.isMatch)
+          || Number(right.transmitted_count || 0) - Number(left.transmitted_count || 0)
+          || Number(right.connection_count || 0) - Number(left.connection_count || 0)
+        ))
+        .slice(0, currentDomainGraph.query ? 28 : 18);
+
+      context.font = '12px "SFMono-Regular", Menlo, Monaco, Consolas, monospace';
+      context.textBaseline = "middle";
+      labelCandidates.forEach((node) => {
+        const label = truncateText(node.id, 34);
+        const textX = node.x + node.radius + 8;
+        const textY = node.y;
+        const labelWidth = context.measureText(label).width + 10;
+        context.fillStyle = isLight ? "rgba(255, 255, 255, 0.82)" : "rgba(7, 19, 23, 0.72)";
+        context.fillRect(textX - 4, textY - 10, labelWidth, 20);
+        context.fillStyle = isLight ? "rgba(16, 32, 41, 0.92)" : "rgba(244, 251, 255, 0.92)";
+        context.fillText(label, textX, textY);
+      });
+    }
+
+    function renderGraphNeighbors(neighbors) {
+      if (!neighbors.length) {
+        return "<p class=\\"muted\\">No adjacent domains under the current filters.</p>";
+      }
+      return `
+        <div class="graph-neighbors">
+          ${neighbors.map((item) => `
+            <div class="graph-neighbor">
+              <div>
+                <strong>${escapeHtml(item.domain)}</strong>
+                <div class="muted">
+                  ${escapeHtml(formatInteger(item.count))} explorations
+                  • ${escapeHtml(formatInteger(item.transmitted_count))} transmitted
+                  • best ${escapeHtml(formatScore(item.max_score))}
+                </div>
+              </div>
+              <button type="button" class="graph-focus-button" data-domain-id="${escapeHtml(item.domain)}">Focus</button>
+            </div>
+          `).join("")}
+        </div>
+      `;
+    }
+
+    function attachGraphDetailHandlers() {
+      document.querySelectorAll(".graph-focus-button").forEach((button) => {
+        button.addEventListener("click", () => {
+          const domainId = button.dataset.domainId;
+          const searchInput = document.getElementById("graph-search");
+          if (!searchInput || !domainId) {
+            return;
+          }
+          searchInput.value = domainId;
+          selectedGraphNodeId = domainId;
+          selectedGraphLinkKey = null;
+          updateDomainGraph();
+        });
+      });
+    }
+
+    function renderDomainGraphDetail() {
+      const panel = document.getElementById("domain-web-detail");
+      if (!panel) {
+        return;
+      }
+      if (!currentDomainGraph || !currentDomainGraph.nodes.length) {
+        panel.innerHTML = `
+          <h3>No Visible Domains</h3>
+          <p class="muted">Reset the filters or lower the score threshold to bring the graph back.</p>
+        `;
+        return;
+      }
+
+      if (selectedGraphLinkKey) {
+        const link = currentDomainGraph.links.find(
+          (item) => graphLinkKey(item) === selectedGraphLinkKey
+        );
+        if (link) {
+          panel.innerHTML = `
+            <h3>${escapeHtml(link.source)} → ${escapeHtml(link.target)}</h3>
+            <p class="muted">A directed BlackClaw jump from seed domain to target domain.</p>
+            ${renderDetailGrid([
+              { label: "Explorations", value: formatInteger(link.count) },
+              { label: "Transmitted", value: formatInteger(link.transmitted_count) },
+              { label: "Average score", value: formatScore(link.avg_score) },
+              { label: "Best score", value: formatScore(link.max_score) },
+              { label: "Last explored", value: formatTimestamp(link.latest_timestamp) },
+            ])}
+            <p>This edge survived filtering because BlackClaw actually made this jump. Stronger line weight means repeated passes; greener lines mean transmitted output made it through.</p>
+            <div class="review-actions">
+              <button type="button" class="graph-focus-button" data-domain-id="${escapeHtml(link.source)}">Focus source</button>
+              <button type="button" class="graph-focus-button" data-domain-id="${escapeHtml(link.target)}">Focus target</button>
+            </div>
+          `;
+          attachGraphDetailHandlers();
+          return;
+        }
+      }
+
+      if (selectedGraphNodeId) {
+        const node = currentDomainGraph.nodes.find((item) => item.id === selectedGraphNodeId);
+        if (node) {
+          const neighbors = currentDomainGraph.links
+            .filter((link) => link.source === node.id || link.target === node.id)
+            .map((link) => ({
+              domain: link.source === node.id ? link.target : link.source,
+              count: Number(link.count || 0),
+              transmitted_count: Number(link.transmitted_count || 0),
+              max_score: link.max_score,
+            }))
+            .sort((left, right) => (
+              right.transmitted_count - left.transmitted_count
+              || (Number(right.max_score || 0) - Number(left.max_score || 0))
+              || right.count - left.count
+            ))
+            .slice(0, 8);
+
+          panel.innerHTML = `
+            <h3>${escapeHtml(node.id)}</h3>
+            <p class="muted">This domain appears as ${escapeHtml(domainRoleLabel(node.role))} in the current map.</p>
+            ${renderDetailGrid([
+              { label: "Connections", value: formatInteger(node.connection_count) },
+              { label: "Outgoing jumps", value: formatInteger(node.outgoing_edges) },
+              { label: "Incoming jumps", value: formatInteger(node.incoming_edges) },
+              { label: "Exploration touches", value: formatInteger(node.appearance_count) },
+              { label: "Transmitted touches", value: formatInteger(node.transmitted_count) },
+              { label: "Average score", value: formatScore(node.avg_score) },
+              { label: "Best score", value: formatScore(node.max_score) },
+              { label: "Last seen", value: formatTimestamp(node.latest_timestamp) },
+            ])}
+            <p>Use this as a frontier read: domains with lots of outgoing edges are acting like launch pads, domains with lots of incoming edges are where BlackClaw keeps landing, and bridge nodes do both.</p>
+            <h3>Strongest Adjacent Domains</h3>
+            ${renderGraphNeighbors(neighbors)}
+          `;
+          attachGraphDetailHandlers();
+          return;
+        }
+      }
+
+      const topNodes = currentDomainGraph.nodes
+        .slice()
+        .sort((left, right) => (
+          Number(right.transmitted_count || 0) - Number(left.transmitted_count || 0)
+          || Number(right.connection_count || 0) - Number(left.connection_count || 0)
+        ))
+        .slice(0, 6)
+        .map((node) => ({
+          domain: node.id,
+          count: Number(node.appearance_count || 0),
+          transmitted_count: Number(node.transmitted_count || 0),
+          max_score: node.max_score,
+        }));
+
+      panel.innerHTML = `
+        <h3>Graph Snapshot</h3>
+        <p class="muted">Pick a domain or a jump to inspect it directly. Until then, here are the most connected visible domains under the current filters.</p>
+        ${renderGraphNeighbors(topNodes)}
+      `;
+      attachGraphDetailHandlers();
+    }
+
+    function updateDomainGraph() {
+      if (!domainGraphPayload) {
+        return;
+      }
+      currentDomainGraph = buildFilteredDomainGraph(domainGraphPayload);
+      renderDomainGraphSummary(currentDomainGraph);
+
+      if (
+        selectedGraphNodeId
+        && !currentDomainGraph.nodes.some((node) => node.id === selectedGraphNodeId)
+      ) {
+        selectedGraphNodeId = null;
+      }
+      if (
+        selectedGraphLinkKey
+        && !currentDomainGraph.links.some((link) => graphLinkKey(link) === selectedGraphLinkKey)
+      ) {
+        selectedGraphLinkKey = null;
+      }
+
+      currentDomainGraphLayout = null;
+      renderDomainGraphCanvas();
+      renderDomainGraphDetail();
+    }
+
+    function handleDomainGraphCanvasMove(event) {
+      const prepared = prepareDomainGraphCanvas();
+      if (!prepared || !currentDomainGraphLayout) {
+        return;
+      }
+      const rect = prepared.canvas.getBoundingClientRect();
+      const pointX = event.clientX - rect.left;
+      const pointY = event.clientY - rect.top;
+      const hit = findDomainGraphHit(pointX, pointY);
+      prepared.canvas.style.cursor = hit ? "pointer" : "default";
+      const nextHoveredNodeId = hit && hit.type === "node" ? hit.item.id : null;
+      const nextHoveredLinkKey = hit && hit.type === "link" ? graphLinkKey(hit.item) : null;
+      if (hoveredGraphNodeId === nextHoveredNodeId && hoveredGraphLinkKey === nextHoveredLinkKey) {
+        return;
+      }
+      hoveredGraphNodeId = nextHoveredNodeId;
+      hoveredGraphLinkKey = nextHoveredLinkKey;
+      renderDomainGraphCanvas();
+    }
+
+    function handleDomainGraphCanvasClick(event) {
+      const prepared = prepareDomainGraphCanvas();
+      if (!prepared) {
+        return;
+      }
+      const rect = prepared.canvas.getBoundingClientRect();
+      const pointX = event.clientX - rect.left;
+      const pointY = event.clientY - rect.top;
+      const hit = findDomainGraphHit(pointX, pointY);
+      if (!hit) {
+        selectedGraphNodeId = null;
+        selectedGraphLinkKey = null;
+        renderDomainGraphCanvas();
+        renderDomainGraphDetail();
+        return;
+      }
+      if (hit.type === "node") {
+        selectedGraphNodeId = selectedGraphNodeId === hit.item.id ? null : hit.item.id;
+        selectedGraphLinkKey = null;
+      } else {
+        const key = graphLinkKey(hit.item);
+        selectedGraphLinkKey = selectedGraphLinkKey === key ? null : key;
+        selectedGraphNodeId = null;
+      }
+      renderDomainGraphCanvas();
+      renderDomainGraphDetail();
     }
 
     function renderTransmissionTimeline(rows) {
@@ -2053,6 +4413,8 @@ def index():
     }
 
     function renderOperatorHome(snapshot) {
+      operatorHomeSnapshot = snapshot;
+      renderHeroSummary();
       const counts = snapshot.counts || {};
       const summaryItems = [
         { label: "Unreviewed evidence", value: counts.unreviewed_evidence_hits || 0, valueClass: "score-accent" },
@@ -2864,15 +5226,17 @@ def index():
     applyTheme();
 
     async function loadDashboard() {
-      const [stats, costs, timeline, topKilled, transmissions] = await Promise.all([
+      const [stats, costs, timeline, topKilled, transmissions, domainGraph] = await Promise.all([
         fetchJson("/api/stats"),
         fetchJson("/api/costs"),
         fetchJson("/api/transmission-timeline"),
         fetchJson("/api/top-killed"),
         fetchJson("/api/transmissions"),
+        fetchJson("/api/domain-graph"),
       ]);
       renderStats(stats);
       renderCosts(costs);
+      renderDomainGraph(domainGraph);
       renderTransmissionTimeline(timeline);
       renderTopKilled(topKilled);
       renderTransmissions(transmissions);

@@ -92,6 +92,11 @@ from store import (
     resolve_convergence_lineage_metadata,
 )
 from seed import describe_seed_quality, pick_seed, resolve_seed_choice
+from jump_types import (
+    JumpAttemptDiagnostic,
+    JumpReplaySnapshot,
+    classify_jump_attempt_attribution,
+)
 
 CLAUDE_SONNET_INPUT_RATE_PER_MTOK = 3.0
 CLAUDE_SONNET_OUTPUT_RATE_PER_MTOK = 15.0
@@ -1750,6 +1755,14 @@ _JUMP_ATTEMPT_MARKER_KEYS = {
     "benchmark_snapshot",
 }
 
+_JUMP_FAILURE_ATTRIBUTION_ORDER = (
+    "pre_stage1_failure",
+    "stage1_failure",
+    "stage2_failure",
+    "successful_connection",
+    "ambiguous_failure",
+)
+
 
 def _hydrate_jump_attempt_diagnostic(payload: object) -> JumpAttemptDiagnostic | None:
     if isinstance(payload, JumpAttemptDiagnostic):
@@ -1789,6 +1802,10 @@ def _print_jump_diagnostics(limit: int = 20) -> None:
         "stage2_no_connection": 0,
         "connection_found": 0,
     }
+    attribution_counts = {
+        label: 0 for label in _JUMP_FAILURE_ATTRIBUTION_ORDER
+    }
+    stage1_failure_subtype_counts: dict[str, int] = {}
 
     for row in rows:
         pattern_diagnostics = row.get("pattern_diagnostics") or {}
@@ -1838,6 +1855,22 @@ def _print_jump_diagnostics(limit: int = 20) -> None:
                 outcome_counts["stage2_no_connection"] += 1
             elif stage2_outcome == "connection_found":
                 outcome_counts["connection_found"] += 1
+            failure_attribution = classify_jump_attempt_attribution(
+                hydrated_attempt if hydrated_attempt is not None else attempt_view
+            )
+            attribution_counts[failure_attribution] = (
+                attribution_counts.get(failure_attribution, 0) + 1
+            )
+            stage1_failure_subtype = str(
+                attempt_view.get("stage1_failure_subtype") or "—"
+            ).strip() or "—"
+            if (
+                stage1_failure_subtype != "—"
+                and stage1_outcome != "detect_signal"
+            ):
+                stage1_failure_subtype_counts[stage1_failure_subtype] = (
+                    stage1_failure_subtype_counts.get(stage1_failure_subtype, 0) + 1
+                )
 
             pattern_name = _truncate_text(
                 (
@@ -1879,10 +1912,18 @@ def _print_jump_diagnostics(limit: int = 20) -> None:
             )
             print(
                 f"  pattern={pattern_name} | query={built_query} | "
-                f"results={result_count} | stage1={stage1_outcome} | stage2={stage2_outcome}"
+                f"results={result_count} | stage1={stage1_outcome} | "
+                f"stage2={stage2_outcome} | attribution={failure_attribution}"
             )
-            if target_domain != "—" or failure_hint != "—":
-                print(f"    target={target_domain} | failure_hint={failure_hint}")
+            if (
+                target_domain != "—"
+                or failure_hint != "—"
+                or stage1_failure_subtype != "—"
+            ):
+                print(
+                    f"    target={target_domain} | failure_hint={failure_hint} | "
+                    f"stage1_subtype={stage1_failure_subtype}"
+                )
             adjacent_result_count = (
                 hydrated_attempt.adjacent_result_count
                 if hydrated_attempt is not None
@@ -2036,6 +2077,15 @@ def _print_jump_diagnostics(limit: int = 20) -> None:
     ):
         count = outcome_counts.get(label, 0)
         print(f"{label}\t{count}\t{_share(count)}")
+    print("[JumpDiagnostics] Failure attribution")
+    for label in _JUMP_FAILURE_ATTRIBUTION_ORDER:
+        count = attribution_counts.get(label, 0)
+        print(f"{label}\t{count}\t{_share(count)}")
+    if stage1_failure_subtype_counts:
+        print("[JumpDiagnostics] Stage 1 failure subtypes")
+        for label in sorted(stage1_failure_subtype_counts):
+            count = stage1_failure_subtype_counts.get(label, 0)
+            print(f"{label}\t{count}\t{_share(count)}")
 
 
 def _benchmark_case_id(label: object, fallback: str) -> str:
@@ -2487,6 +2537,10 @@ def _run_jump_attempt_benchmark_case(case: dict) -> dict:
     )
     replay_mode = "stage2_only" if snapshot.stage_one_success is not None else "full"
     connection, diagnostic = jump_module.replay_jump_attempt(snapshot)
+    failure_attribution = classify_jump_attempt_attribution(diagnostic)
+    actual_stage1_failure_subtype = (
+        str(diagnostic.get("stage1_failure_subtype") or "").strip() or None
+    )
     actual_stage1_outcome = (
         str(diagnostic.get("stage1_outcome") or "").strip() or None
     )
@@ -2524,6 +2578,8 @@ def _run_jump_attempt_benchmark_case(case: dict) -> dict:
             "status": "ERROR",
             "message": "stage1_detect generation failed during benchmark replay",
             "actual_stage1_failure_hint": actual_stage1_failure_hint,
+            "actual_stage1_failure_subtype": actual_stage1_failure_subtype,
+            "failure_attribution": failure_attribution,
             "pattern_name": pattern_name,
             "replay_mode": replay_mode,
         }
@@ -2536,7 +2592,9 @@ def _run_jump_attempt_benchmark_case(case: dict) -> dict:
             "message": "stage2_hypothesize generation failed during benchmark replay",
             "actual_stage1_outcome": actual_stage1_outcome,
             "actual_stage1_target_domain": actual_stage1_target_domain,
+            "actual_stage1_failure_subtype": actual_stage1_failure_subtype,
             "actual_stage2_failure_hint": actual_stage2_failure_hint,
+            "failure_attribution": failure_attribution,
             "pattern_name": pattern_name,
             "replay_mode": replay_mode,
         }
@@ -2564,8 +2622,10 @@ def _run_jump_attempt_benchmark_case(case: dict) -> dict:
         "status": status,
         "expected_stage1_outcome": expected_stage1_outcome,
         "expected_stage2_outcome": expected_stage2_outcome,
+        "failure_attribution": failure_attribution,
         "actual_stage1_outcome": actual_stage1_outcome,
         "actual_stage1_failure_hint": actual_stage1_failure_hint,
+        "actual_stage1_failure_subtype": actual_stage1_failure_subtype,
         "actual_stage1_target_domain": actual_stage1_target_domain,
         "actual_stage2_outcome": actual_stage2_outcome,
         "actual_stage2_failure_hint": actual_stage2_failure_hint,
@@ -2679,6 +2739,10 @@ def _run_jump_benchmark(
 
     print(f"[JumpBenchmark] Running {len(cases)} case(s) from {Path(benchmark_file)}")
     counts = {"MATCH": 0, "IMPROVED": 0, "REGRESSED": 0, "ERROR": 0}
+    attribution_counts = {
+        label: 0 for label in _JUMP_FAILURE_ATTRIBUTION_ORDER
+    }
+    jump_attempt_count = 0
     for case in cases:
         case_type = str(case.get("type") or "").strip()
         if case_type == "jump_attempt":
@@ -2702,11 +2766,31 @@ def _run_jump_benchmark(
         if status == "ERROR":
             if result.get("type") == "jump_attempt" and result.get("replay_mode"):
                 print(f"  replay_mode={result.get('replay_mode')}")
+            if result.get("type") == "jump_attempt" and result.get("failure_attribution"):
+                print(f"  attribution={result.get('failure_attribution')}")
+            if result.get("type") == "jump_attempt" and result.get("actual_stage1_failure_subtype"):
+                print(
+                    "  stage1_failure_subtype="
+                    f"{result.get('actual_stage1_failure_subtype')}"
+                )
             print(f"  message={result.get('message') or 'unknown error'}")
             continue
         if result.get("type") == "jump_attempt":
+            jump_attempt_count += 1
+            failure_attribution = str(result.get("failure_attribution") or "").strip()
+            if failure_attribution:
+                attribution_counts[failure_attribution] = (
+                    attribution_counts.get(failure_attribution, 0) + 1
+                )
             if result.get("replay_mode"):
                 print(f"  replay_mode={result.get('replay_mode')}")
+            if failure_attribution:
+                print(f"  attribution={failure_attribution}")
+            if result.get("actual_stage1_failure_subtype"):
+                print(
+                    "  stage1_failure_subtype="
+                    f"{result.get('actual_stage1_failure_subtype')}"
+                )
             print(
                 f"  expected={result.get('expected_stage1_outcome') or '—'} -> "
                 f"{result.get('expected_stage2_outcome') or '—'} | "
@@ -2748,6 +2832,10 @@ def _run_jump_benchmark(
     print(f"total\t{total}")
     for key in ("MATCH", "IMPROVED", "REGRESSED", "ERROR"):
         print(f"{key.lower()}\t{counts.get(key, 0)}")
+    if jump_attempt_count > 0:
+        print("[JumpBenchmark] Failure attribution")
+        for label in _JUMP_FAILURE_ATTRIBUTION_ORDER:
+            print(f"{label}\t{attribution_counts.get(label, 0)}")
     return counts.get("ERROR", 0) == 0 and counts.get("REGRESSED", 0) == 0
 
 
@@ -5851,7 +5939,11 @@ from cycle_budget import CycleBudget
 from explore import append_jump_attempt_diagnostic, dive, finalize_pattern_diagnostics
 import jump as jump_module
 from jump import lateral_jump, lateral_jump_with_diagnostics, salvage_high_value_candidate
-from jump_types import JumpAttemptDiagnostic, JumpReplaySnapshot
+from jump_types import (
+    JumpAttemptDiagnostic,
+    JumpReplaySnapshot,
+    classify_jump_attempt_attribution,
+)
 from score import (
     score_connection,
     deep_dive_convergence,
